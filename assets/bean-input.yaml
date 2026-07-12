@@ -1,0 +1,14 @@
+name: ""
+origin: ""
+producer_or_station: ""
+variety: ""
+process: ""
+altitude_m: null
+roast_level: ""
+roast_date: ""
+tasting_notes: []
+water: "filtered"
+water_tds_mg_l: null
+preference: "balanced"
+serving_style: "hot"
+previous_result: null

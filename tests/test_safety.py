@@ -1,0 +1,78 @@
+from pathlib import Path
+
+import pytest
+import yaml
+
+from xbloom_safety import SafetyError, load_strict_recipe, recipe_summary
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize("asset", ["hot-template.yaml", "flash-brew-template.yaml"])
+def test_bundled_templates_pass_strict_validation(asset):
+    path = ROOT / "assets" / asset
+    recipe = load_strict_recipe(path)
+    summary = recipe_summary(recipe, path)
+    assert summary["load_opcodes"]
+    assert not ({"0x42", "0x46", "0x47"} & set(summary["load_opcodes"]))
+
+
+def _hot_mapping():
+    return yaml.safe_load((ROOT / "assets" / "hot-template.yaml").read_text(encoding="utf-8"))
+
+
+def _write(tmp_path, data):
+    path = tmp_path / "recipe.yaml"
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    return path
+
+
+def test_raw_protocol_override_is_rejected(tmp_path):
+    data = _hot_mapping()
+    data["opcode"] = "0x46"
+    with pytest.raises(SafetyError, match="raw protocol overrides"):
+        load_strict_recipe(_write(tmp_path, data))
+
+
+def test_large_pour_is_rejected_even_if_upstream_can_split(tmp_path):
+    data = _hot_mapping()
+    data["pours"] = [
+        {**data["pours"][0], "ml": 45},
+        {**data["pours"][1], "ml": 135},
+        {**data["pours"][2], "ml": 60},
+    ]
+    with pytest.raises(SafetyError, match="10-127 ml"):
+        load_strict_recipe(_write(tmp_path, data))
+
+
+def test_inconsistent_recipe_rpm_is_rejected(tmp_path):
+    data = _hot_mapping()
+    data["pours"][1]["rpm"] = 100
+    with pytest.raises(SafetyError, match="repeat one grinder rpm"):
+        load_strict_recipe(_write(tmp_path, data))
+
+
+def test_center_first_pour_is_rejected(tmp_path):
+    data = _hot_mapping()
+    data["pours"][0]["pattern"] = "center"
+    data["pours"][0]["agitation"] = False
+    data["pours"][0]["rpm"] = 0
+    with pytest.raises(SafetyError, match="first pour cannot use center"):
+        load_strict_recipe(_write(tmp_path, data))
+
+
+def test_flash_metadata_must_balance(tmp_path):
+    data = yaml.safe_load(
+        (ROOT / "assets" / "flash-brew-template.yaml").read_text(encoding="utf-8")
+    )
+    data["ice_g"] = 80
+    with pytest.raises(SafetyError, match="water_ml must equal"):
+        load_strict_recipe(_write(tmp_path, data))
+
+
+def test_unknown_recipe_key_is_rejected(tmp_path):
+    data = _hot_mapping()
+    data["download_from"] = "https://example.invalid/recipe.yaml"
+    with pytest.raises(SafetyError, match="unknown top-level"):
+        load_strict_recipe(_write(tmp_path, data))
