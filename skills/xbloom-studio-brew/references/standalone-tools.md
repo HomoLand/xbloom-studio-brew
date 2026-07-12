@@ -67,6 +67,7 @@ The guarded FreeSolo brewer range is narrower than the app's published 500 ml ma
 - `RT` room-temperature/pass-through mode, or numeric 40-98 C.
 - 3.0-3.5 ml/s in 0.1 steps.
 - `center`, `spiral`, or `ring` pattern.
+- `tank` or `tap` water source.
 
 This physical hot-water action uses the same deployment opt-in as coffee/tea remote start, plus its
 own readiness phrase:
@@ -74,14 +75,14 @@ own readiness phrase:
 ```text
 XBLOOM_ENABLE_REMOTE_START=I_UNDERSTAND_REMOTE_HOT_WATER
 python scripts/xbloom.py water --volume 250 --temp 85 --flow 3.5 --pattern center \
-  --confirm-ready vessel-water-clear
+  --water-source auto --confirm-ready vessel-water-clear
 ```
 
 For unheated room-temperature water, use the explicit app token:
 
 ```text
 python scripts/xbloom.py water --volume 250 --temp RT --flow 3.5 --pattern center \
-  --confirm-ready vessel-water-clear
+  --water-source auto --confirm-ready vessel-water-clear
 ```
 
 The Android app maps RT to the J15 constant `20.0` and sends `200.0` in the temperature float field.
@@ -89,8 +90,14 @@ This selects pass-through/unheated water; Studio does not cool warmer tank water
 The water-action owner gate and readiness confirmation still apply because the machine physically
 dispenses water even when heating is off.
 
-Confirm the tank contains water, a sufficiently large heat-safe vessel is centered below the
-spout, the brewer/dripper path is appropriate for the intended action, and people/objects are clear.
+The app includes the current J15 water source in machine info and passes it into command `4506`.
+`--water-source auto` mirrors that behavior. If the setting cannot be decoded, the wrapper stops
+and asks for `--water-source tank` or `--water-source tap`; it never silently guesses a path. This
+selects the source for the bounded dispense and does not rewrite the machine's persistent setting.
+
+Confirm the selected source is actually available (filled tank or live tap feed), a sufficiently
+large heat-safe vessel is centered below the spout, the brewer/dripper path is appropriate for the
+intended action, and people/objects are clear.
 The machine meters the requested volume. The wrapper retains the latest water-volume report and
 accepts the firmware stop only when it is within a small tolerance of the target; an early stop,
 missing meter value, timeout, or interruption triggers STOP/QUIT cleanup and a failure instead of a

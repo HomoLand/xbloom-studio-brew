@@ -48,6 +48,8 @@ Read `references/recipe-design.md` when creating or adjusting a recipe. Read
    240 g final water, Omni Dripper 2, and filtered water; never assume unknown water is RO.
 4. Choose the smallest useful pour count and a conservative first-cup profile.
 5. For flash brew, separate hot machine water from ice and label the hot and final ratios.
+   For an intentional bypass recipe, keep extraction pours and final bypass explicit; bypass is
+   machine water, not display-only metadata. Use `RT`/`BP` only when that mode is intentional.
 6. Copy `assets/hot-template.yaml` or `assets/flash-brew-template.yaml` to a user/workspace path.
    Never modify the installed template in place.
 7. Fill every field with a concrete value. Preserve `stage_temps: [110.0, 90.0]`.
@@ -189,11 +191,13 @@ correct water path, and clear surroundings in the current interaction:
 
 ```text
 python <skill-dir>/scripts/xbloom.py water --volume 250 --temp 85 --flow 3.5 \
-  --pattern center --confirm-ready vessel-water-clear
+  --pattern center --water-source auto --confirm-ready vessel-water-clear
 ```
 
 Use `--temp RT` for the official room-temperature/pass-through setting. RT does not actively cool
-the tank water to an exact 20 C, and it remains a guarded physical water-dispense action.
+the source water to an exact 20 C, and it remains a guarded physical water-dispense action.
+`--water-source auto` follows the source reported by the machine; if that report is unavailable,
+require the user to select `tank` or `tap` explicitly instead of guessing.
 
 Never claim a grind or dispense completed unless its command reports success. On uncertainty, use
 the machine's physical stop/cancel after the wrapper's automatic STOP/QUIT cleanup.
@@ -230,7 +234,7 @@ as a substitute for loading one temporary recipe.
 Match the user's language. Keep the response compact but include:
 
 - Bean assumptions and flavor target.
-- For coffee: dose, hot water, ice/final water where applicable, grind, RPM, and expected time.
+- For coffee: dose, extraction water, bypass/final water where applicable, grind, RPM, and expected time.
 - For tea: leaf mass, each steep's programmed water/temperature/pause, expected siphon output, and
   whether the recipe is official or adapted.
 - Every pour: ml, temperature, pattern, agitation, pause, and flow.
@@ -254,4 +258,5 @@ state support it. Distinguish `loaded/armed` from `started/brewing`.
 - Read `references/standalone-tools.md` for FreeSolo scale, grinder, and brewer commands.
 - Read `references/tea-brewing.md` for tea requirements, official templates, schema, and workflow.
 - Read `references/deployment.md` for Codex/Hermes installation, publication, and environment setup.
+- Read `references/apk-capability-matrix.md` before claiming app parity or adding decoded commands.
 - Read `references/sources.md` when checking provenance or making hardware/protocol claims.

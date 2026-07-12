@@ -27,6 +27,7 @@ def test_skill_references_and_assets_exist():
         "references/tea-brewing.md",
         "references/deployment.md",
         "references/sources.md",
+        "references/apk-capability-matrix.md",
         "assets/hot-template.yaml",
         "assets/flash-brew-template.yaml",
         "assets/tea-green-official.yaml",

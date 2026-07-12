@@ -60,6 +60,7 @@ __all__ = [
     "TERMINAL_STATES",
     "StatusEvent",
     "parse_notification",
+    "parse_machine_info_payload",
     "is_idle_or_complete",
 ]
 
@@ -93,6 +94,7 @@ COFFEE_TYPE = 0x15         # TYPE 0x15: coffee/cup weight — float32 LE already
 # the same stream historically exposed as ``COFFEE_TYPE``; 10507 is used by the
 # dedicated scale screen on other firmware/UI paths.
 CURRENT_WEIGHT_COMMANDS = frozenset({10507, 20501})
+MACHINE_INFO_COMMAND = 40521
 # Heartbeat state sentinels (0x15/0x4b as *states*) — kept for the is_heartbeat property
 # and back-compat; the live streams above are keyed by TYPE, not state.
 IGNORED_STATES = frozenset({0x15, 0x4B})
@@ -122,6 +124,8 @@ class StatusEvent:
     coffee_g: float | None = None
     #: Standalone electronic-scale reading in grams (FreeSolo scale mode).
     scale_g: float | None = None
+    #: Read-only Studio/J15 machine details from report 40521.
+    machine_info: dict[str, object] | None = None
 
     @property
     def is_heartbeat(self) -> bool:
@@ -153,7 +157,9 @@ def _marker_idx(data: bytes) -> int:
     return data.find(STATE_MARKER, 5)
 
 
-def _decode_scale_grams(data: bytes, *, scale: float) -> float | None:
+def _decode_scale_grams(
+    data: bytes, *, scale: float, allow_negative: bool = False
+) -> float | None:
     """Decode a scale frame's float32 (LE) weight, in grams.
 
     The value sits immediately after the 0xc1 marker. ``scale`` converts the raw
@@ -170,9 +176,67 @@ def _decode_scale_grams(data: bytes, *, scale: float) -> float | None:
     except struct.error:
         return None
     grams = raw * scale
-    if grams != grams or grams < 0.0 or grams > 2000.0:  # NaN or out of range
+    minimum = -2000.0 if allow_negative else 0.0
+    if grams != grams or grams < minimum or grams > 2000.0:  # NaN or out of range
         return None
     return round(grams, 2)
+
+
+def parse_machine_info_payload(payload: bytes) -> dict[str, object] | None:
+    """Decode the app's fixed-width Studio/J15 report-40521 payload.
+
+    This mirrors ``MachineInfoBleModel`` from the audited Android app. Optional
+    tail fields were added by later firmware, so short legacy reports still
+    return the stable identity/settings prefix.
+    """
+    payload = bytes(payload)
+    if len(payload) < 42:
+        return None
+
+    def ascii_field(start: int, end: int) -> str:
+        return payload[start:end].decode("ascii", errors="replace").rstrip("\x00 ")
+
+    try:
+        area_ap = struct.unpack_from("<f", payload, 29)[0]
+    except struct.error:
+        return None
+    if area_ap != area_ap:  # NaN
+        area_ap = 0.0
+
+    water_source_raw = payload[36]
+    led_raw = payload[38]
+    temp_unit_raw = payload[40]
+    weight_unit_raw = payload[41]
+    info: dict[str, object] = {
+        "serial_number": ascii_field(0, 13),
+        "model": ascii_field(13, 19),
+        "firmware": ascii_field(19, 29),
+        "area_ap": round(float(area_ap), 3),
+        "water_enough": bool(payload[33]),
+        "system_status": payload[34],
+        "user_count": payload[35],
+        "water_source": {0: "tank", 1: "tap"}.get(
+            water_source_raw, f"unknown_{water_source_raw}"
+        ),
+        "grind_setting": max(payload[37] - 30, 1),
+        "display": {1: "low", 8: "medium", 15: "high"}.get(
+            led_raw, f"unknown_{led_raw}"
+        ),
+        "voltage_raw": payload[39],
+        "temperature_unit": {0: "F", 1: "C"}.get(
+            temp_unit_raw, f"unknown_{temp_unit_raw}"
+        ),
+        "weight_unit": {0: "ml", 1: "g", 2: "oz"}.get(
+            weight_unit_raw, f"unknown_{weight_unit_raw}"
+        ),
+    }
+    if len(payload) >= 55:
+        info["mode"] = "auto" if payload[51:55].hex() == "91327856" else "pro"
+    if len(payload) >= 59:
+        info["pouring_radius_init"] = struct.unpack_from("<I", payload, 55)[0]
+    if len(payload) >= 63:
+        info["vibration_init"] = struct.unpack_from("<I", payload, 59)[0]
+    return info
 
 
 def parse_notification(data: bytes) -> StatusEvent | None:
@@ -207,7 +271,11 @@ def parse_notification(data: bytes) -> StatusEvent | None:
             water_g=g,
         )
     if ftype == COFFEE_TYPE:
-        g = _decode_scale_grams(data, scale=1.0)
+        g = _decode_scale_grams(
+            data,
+            scale=1.0,
+            allow_negative=command_code in CURRENT_WEIGHT_COMMANDS,
+        )
         return StatusEvent(
             state=None,
             state_name="scale",
@@ -217,7 +285,7 @@ def parse_notification(data: bytes) -> StatusEvent | None:
             scale_g=g if command_code in CURRENT_WEIGHT_COMMANDS else None,
         )
     if command_code in CURRENT_WEIGHT_COMMANDS:
-        g = _decode_scale_grams(data, scale=1.0)
+        g = _decode_scale_grams(data, scale=1.0, allow_negative=True)
         return StatusEvent(
             state=None,
             state_name="scale",
@@ -228,6 +296,15 @@ def parse_notification(data: bytes) -> StatusEvent | None:
 
     marker = _marker_idx(data)
     payload = data[marker + 1 : -2] if marker >= 0 else b""
+
+    if command_code == MACHINE_INFO_COMMAND:
+        return StatusEvent(
+            state=None,
+            state_name="machine_info",
+            raw=data,
+            command_code=command_code,
+            machine_info=parse_machine_info_payload(payload),
+        )
 
     # Status frame: the state code is the first byte after the 0xc1 marker.
     if ftype == STATUS_CMD and payload:

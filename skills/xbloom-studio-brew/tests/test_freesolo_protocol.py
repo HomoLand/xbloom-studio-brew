@@ -92,6 +92,13 @@ def test_brewer_rt_uses_official_room_temperature_sentinel():
     assert struct.unpack("<f", struct.pack("<I", start_temp_bits))[0] == 200.0
 
 
+def test_brewer_start_supports_both_studio_water_sources():
+    tank = _words(build_brewer_start(120, 85, water_feed=0))
+    tap = _words(build_brewer_start(120, 85, water_feed=1))
+    assert tank[-2] == 0
+    assert tap[-2] == 1
+
+
 def test_official_green_tea_blob_is_byte_exact():
     # Port of GetRecipeCodeManager + native TeaRecipeCreate for the public
     # official green-tea recipe. Suffix 32 c2 = grinderSize 50 and

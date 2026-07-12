@@ -76,3 +76,23 @@ def test_unknown_recipe_key_is_rejected(tmp_path):
     data["download_from"] = "https://example.invalid/recipe.yaml"
     with pytest.raises(SafetyError, match="unknown top-level"):
         load_strict_recipe(_write(tmp_path, data))
+
+
+def test_guard_accepts_app_bypass_rt_and_pre_ground(tmp_path):
+    data = _hot_mapping()
+    data["grind"] = 0
+    data["bypass_ml"] = 30
+    data["bypass_temp_c"] = "RT"
+    data["water_ml"] = int(data["hot_water_ml"]) + 30
+    recipe = load_strict_recipe(_write(tmp_path, data))
+    assert recipe.no_grind
+    assert recipe.bypass_temp_c == 20
+
+
+def test_guard_rejects_low_numeric_bypass_temperature(tmp_path):
+    data = _hot_mapping()
+    data["bypass_ml"] = 30
+    data["bypass_temp_c"] = 60
+    data["water_ml"] = int(data["hot_water_ml"]) + 30
+    with pytest.raises(SafetyError, match="bypass temperature"):
+        load_strict_recipe(_write(tmp_path, data))

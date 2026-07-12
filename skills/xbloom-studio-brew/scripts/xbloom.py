@@ -175,6 +175,13 @@ async def resolve_address(explicit: str | None, timeout: float) -> tuple[str, st
     return device.address, getattr(device, "name", None) or "xBloom"
 
 
+def redact_machine_info(machine_info: dict[str, object]) -> dict[str, object]:
+    """Return the diagnostic subset safe to place in normal Agent output."""
+    return {
+        key: value for key, value in machine_info.items() if key != "serial_number"
+    }
+
+
 async def inspect_machine(address: str, *, duration: float = 4.0) -> dict[str, Any]:
     """Read the vendor service, firmware, and state without sending brew control."""
     from bleak import BleakClient
@@ -185,6 +192,7 @@ async def inspect_machine(address: str, *, duration: float = 4.0) -> dict[str, A
     seen_types: set[int] = set()
     states: list[str] = []
     firmware: set[str] = set()
+    machine_info: dict[str, object] = {}
 
     def on_status(_sender: object, data: bytearray) -> None:
         raw = bytes(data)
@@ -192,8 +200,14 @@ async def inspect_machine(address: str, *, duration: float = 4.0) -> dict[str, A
             seen_types.add(raw[3])
         firmware.update(x.decode("ascii", errors="replace") for x in FIRMWARE_RE.findall(raw))
         event = parse_notification(raw)
-        if event is not None and event.state is not None:
-            states.append(event.state_name)
+        if event is not None:
+            if event.state is not None:
+                states.append(event.state_name)
+            if event.machine_info:
+                machine_info.update(event.machine_info)
+                value = event.machine_info.get("firmware")
+                if isinstance(value, str) and value:
+                    firmware.add(value)
 
     session = build_session_start()
     status = build_status_query()
@@ -210,11 +224,16 @@ async def inspect_machine(address: str, *, duration: float = 4.0) -> dict[str, A
         await asyncio.sleep(duration)
         await client.stop_notify(CHAR_STATUS)
 
+    # A serial number is useful internally for app account/device binding, but
+    # probe output is routinely copied into Agent transcripts and bug reports.
+    # Keep the useful read-only settings while deliberately redacting identity.
+    public_machine_info = redact_machine_info(machine_info)
     return {
         "vendor_service": True,
         "firmware": sorted(firmware),
         "states": list(dict.fromkeys(states)),
         "notification_types": [f"0x{x:02x}" for x in sorted(seen_types)],
+        "machine_info": public_machine_info or None,
         "brew_control_sent": False,
     }
 
@@ -257,10 +276,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "vendored_protocol": (ROOT / "scripts" / "xbloom_ble" / "protocol.py").exists(),
         "capabilities": {
             "coffee_recipe": True,
+            "coffee_bypass": True,
+            "coffee_temperature_modes": ["RT", "40-95 C", "BP"],
             "tea_recipe": (ROOT / "scripts" / "xbloom_ble" / "tea.py").exists(),
             "scale": True,
             "grinder": True,
             "temperature_water": True,
+            "temperature_water_modes": ["RT", "40-98 C"],
+            "water_sources": ["tank", "tap"],
+            "machine_info": True,
         },
         "physical_actions_enabled": {
             "hot_water": os.environ.get(REMOTE_START_ENV) == REMOTE_START_SENTINEL,
@@ -520,12 +544,22 @@ async def async_water(args: argparse.Namespace) -> int:
     address, name = await resolve_address(args.address, args.scan_timeout)
     preflight = await inspect_machine(address)
     firmware = require_write_preflight(preflight)
+    water_source = args.water_source
+    if water_source == "auto":
+        info = preflight.get("machine_info") or {}
+        water_source = info.get("water_source")
+        if water_source not in {"tank", "tap"}:
+            raise RuntimeError(
+                "could not read the machine water source; pass --water-source tank or tap"
+            )
+    water_feed = {"tank": 0, "tap": 1}[water_source]
     async with XBloomClient(address) as client:
         event = await client.dispense_water(
             args.volume,
             args.temp,
             flow_ml_s=args.flow,
             pattern=args.pattern,
+            water_feed=water_feed,
             timeout=args.timeout,
         )
     emit(
@@ -550,6 +584,7 @@ async def async_water(args: argparse.Namespace) -> int:
             ),
             "flow_ml_s": args.flow,
             "pattern": args.pattern,
+            "water_source": water_source,
         }
     )
     return 0
@@ -786,6 +821,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     water.add_argument("--flow", type=float, default=3.5, help="3.0-3.5 ml/s")
     water.add_argument("--pattern", choices=("center", "spiral", "ring"), default="center")
+    water.add_argument(
+        "--water-source",
+        choices=("auto", "tank", "tap"),
+        default="auto",
+        help="auto uses the machine's current setting; otherwise select tank or tap",
+    )
     water.add_argument("--timeout", type=float, default=None, help="completion timeout (5-600 s)")
     water.add_argument("--confirm-ready", default="")
     tea_validate = sub.add_parser("tea-validate", help="strictly validate an Omni Tea Brewer recipe")

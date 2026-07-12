@@ -13,6 +13,8 @@ YAML schema
     grind: 62
     stage_temps: [110.0, 90.0]   # optional; defaults to [110.0, 90.0]
     ratio: 15                    # optional; if given, Σpours must equal dose_g*ratio
+    bypass_ml: 40                # optional machine bypass, 5-100 ml
+    bypass_temp_c: RT            # RT, BP, or a numeric brew temperature
     # optional brew-level metadata (informational — NOT sent to the machine):
     dripper: Omni
     kind: custom
@@ -24,7 +26,9 @@ YAML schema
       - {label: Pour 1, ml: 115, temp_c: 90, pattern: spiral, pause_s: 5,  rpm: 100, flow_ml_s: 3.0}
 
 Patterns: ``spiral``, ``ring``, ``center``. Set ``agitation: true`` (only valid
-with ``spiral``) for an agitated bloom. The metadata fields (``dripper``, ``kind``,
+with ``spiral``) for an agitated bloom. Pour and bypass temperatures accept the
+official ``RT`` (room-temperature pass-through) and ``BP`` (boiling-point) tokens.
+The metadata fields (``dripper``, ``kind``,
 ``water_ml``, ``hot_water_ml``, ``ice_g``, ``time``, ``note``, and per-pour
 ``label``) are optional context that round-trips through YAML but never reaches
 the machine.
@@ -40,11 +44,49 @@ import yaml
 
 from .protocol import PATTERN_CODES
 
-__all__ = ["Pour", "Recipe", "RecipeError"]
+__all__ = ["Pour", "Recipe", "RecipeError", "parse_temperature_setting"]
+
+ROOM_TEMPERATURE_C = 20
+BOILING_POINT_C = 98
 
 
 class RecipeError(ValueError):
     """Raised when a recipe is malformed or fails validation."""
+
+
+def parse_temperature_setting(value: Any, *, field: str = "temperature") -> int:
+    """Normalize an app-style recipe temperature to its Studio/J15 token.
+
+    ``RT`` and ``BP`` are protocol mode values (20 and 98 respectively), not
+    promises of active cooling or a universal physical boiling point.
+    """
+    if isinstance(value, str):
+        token = value.strip().upper()
+        if token == "RT":
+            return ROOM_TEMPERATURE_C
+        if token == "BP":
+            return BOILING_POINT_C
+        try:
+            value = int(token)
+        except ValueError as exc:
+            raise RecipeError(f"{field} must be RT, BP, or an integer Celsius value") from exc
+    if isinstance(value, bool):
+        raise RecipeError(f"{field} must be RT, BP, or an integer Celsius value")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RecipeError(f"{field} must be RT, BP, or an integer Celsius value") from exc
+    if isinstance(value, float) and not value.is_integer():
+        raise RecipeError(f"{field} must use whole Celsius degrees")
+    return parsed
+
+
+def _temperature_to_yaml(value: int) -> int | str:
+    if int(value) == ROOM_TEMPERATURE_C:
+        return "RT"
+    if int(value) == BOILING_POINT_C:
+        return "BP"
+    return int(value)
 
 
 @dataclass
@@ -81,7 +123,7 @@ class Pour:
             d["label"] = self.label
         d.update(
             ml=int(self.ml),
-            temp_c=int(self.temp_c),
+            temp_c=_temperature_to_yaml(self.temp_c),
             pattern=self.pattern,
             pause_s=int(self.pause_s),
             rpm=int(self.rpm),
@@ -95,8 +137,9 @@ class Pour:
 class Recipe:
     """A full xBloom Studio recipe.
 
-    The core fields (``dose_g``/``grind``/``stage_temps``/``pours``) are what the
-    machine brews. The remaining fields are **optional brew-level metadata** —
+    The core fields (``dose_g``/``grind``/``stage_temps``/``pours`` and optional
+    ``bypass_ml``/``bypass_temp_c``) are what the machine brews. The remaining
+    fields are **optional brew-level metadata** —
     informational context a UI or recipe site can render, but which is *never*
     sent to the machine and *not* range-checked against hardware limits:
 
@@ -115,6 +158,9 @@ class Recipe:
     stage_temps: tuple[float, float] = (110.0, 90.0)
     ratio: float | None = None
     tail: int = 0xA0
+    # Machine-executed post-brew bypass. Zero/None means disabled.
+    bypass_ml: float = 0.0
+    bypass_temp_c: int | None = None
     # Optional brew-level metadata (informational — never sent to the machine).
     dripper: str | None = None
     kind: str | None = None
@@ -146,7 +192,9 @@ class Recipe:
                 pours.append(
                     Pour(
                         ml=rp["ml"],
-                        temp_c=rp["temp_c"],
+                        temp_c=parse_temperature_setting(
+                            rp["temp_c"], field=f"pour #{i + 1} temp_c"
+                        ),
                         pattern=rp.get("pattern", "spiral"),
                         agitation=bool(rp.get("agitation", False)),
                         pause_s=rp.get("pause_s", 0),
@@ -174,6 +222,14 @@ class Recipe:
             stage_temps=(float(stage_temps[0]), float(stage_temps[1])),
             ratio=data.get("ratio"),
             tail=data.get("tail", 0xA0),
+            bypass_ml=float(data.get("bypass_ml", 0.0) or 0.0),
+            bypass_temp_c=(
+                parse_temperature_setting(
+                    data["bypass_temp_c"], field="bypass_temp_c"
+                )
+                if data.get("bypass_temp_c") is not None
+                else None
+            ),
             # Optional brew-level metadata (informational — not sent to the machine).
             dripper=data.get("dripper"),
             kind=data.get("kind"),
@@ -264,13 +320,14 @@ class Recipe:
             # not an error. ml just needs to be ≥1 and fit a sane upper bound.
             if not (1 <= int(p.ml) <= 4000):
                 errors.append(f"pour #{i}: ml {p.ml} out of range (1–4000)")
-            # temp: settable 40–95 °C in 1 °C steps (xBloom Studio published spec).
-            # The app also offers two special non-numeric settings, RT (room temp)
-            # and BP (boiling point). FreeSolo RT is supported by the standalone
-            # water command, but coffee recipe-wire support remains outside this
-            # numeric recipe schema, so its validator stays at 40–95.
-            if not (40 <= int(p.temp_c) <= 95):
-                errors.append(f"pour #{i}: temp_c {p.temp_c} out of range (40–95°C)")
+            # App recipe editor: RT sentinel, 40–95 °C, or BP sentinel.
+            if int(p.temp_c) not in {ROOM_TEMPERATURE_C, BOILING_POINT_C} and not (
+                40 <= int(p.temp_c) <= 95
+            ):
+                errors.append(
+                    f"pour #{i}: temp_c {p.temp_c} out of range "
+                    "(RT, 40–95°C, or BP)"
+                )
             # rpm: agitation speed, 60–120 in 10-RPM steps — EXCEPT a `center` pour
             # has no agitation, where rpm must be 0. (xBloom Studio published spec.)
             if p.pattern == "center":
@@ -300,6 +357,21 @@ class Recipe:
                     f"{self.dose_g}*{self.ratio} = {expected} ml"
                 )
 
+        if self.bypass_ml:
+            if not 5 <= float(self.bypass_ml) <= 100:
+                errors.append("bypass_ml must be 5-100 ml when enabled")
+            elif not float(self.bypass_ml).is_integer():
+                errors.append("bypass_ml must use whole millilitres")
+            if self.bypass_temp_c is None:
+                errors.append("bypass_temp_c is required when bypass_ml is enabled")
+            elif int(self.bypass_temp_c) not in {
+                ROOM_TEMPERATURE_C,
+                BOILING_POINT_C,
+            } and not (40 <= int(self.bypass_temp_c) <= 95):
+                errors.append("bypass_temp_c must be RT, 40-95 C, or BP")
+        elif self.bypass_temp_c is not None:
+            errors.append("bypass_temp_c requires bypass_ml")
+
         # Optional metadata: only sanity-check the numeric ones (not hardware
         # limits — these never reach the machine). Deliberately lenient so
         # informational context can't break a valid, brewable recipe.
@@ -328,6 +400,11 @@ class Recipe:
         return sum(int(p.ml) for p in self.pours)
 
     @property
+    def total_machine_water_ml(self) -> float:
+        """Extraction pours plus optional post-brew bypass water."""
+        return float(self.total_water_ml) + float(self.bypass_ml or 0.0)
+
+    @property
     def effective_ratio(self) -> float:
         """Brew ratio (water : coffee). Uses the explicit ``ratio`` if given,
         else derives it from ``Σ pour ml / dose_g`` (one decimal). Used by the
@@ -347,6 +424,8 @@ class Recipe:
             "dose": int(self.dose_g),
             "grind": int(self.grind),
             "stage_temps": tuple(self.stage_temps),
+            "bypass_ml": float(self.bypass_ml or 0.0),
+            "bypass_temp_c": float(self.bypass_temp_c or 0.0),
             "pours": [p.to_protocol_dict() for p in self.pours],
         }
 
@@ -361,6 +440,9 @@ class Recipe:
         if self.ratio is not None:
             d["ratio"] = self.ratio
         d["stage_temps"] = [float(self.stage_temps[0]), float(self.stage_temps[1])]
+        if self.bypass_ml:
+            d["bypass_ml"] = float(self.bypass_ml)
+            d["bypass_temp_c"] = _temperature_to_yaml(self.bypass_temp_c)
         # optional metadata, in a stable, readable order (only when present)
         for key in ("kind", "dripper", "water_ml", "hot_water_ml", "ice_g", "time", "note"):
             val = getattr(self, key)

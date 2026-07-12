@@ -13,6 +13,7 @@ reference is not present, the comparison tests are skipped (the rest still run).
 
 import importlib.util
 import os
+import struct
 import sys
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from xbloom_ble.protocol import (
     NO_GRIND_WIRE,
     START_OPCODE,
     build_41,
+    build_a6,
     build_cancel,
     build_commit,
     build_load_frames,
@@ -132,6 +134,24 @@ def test_load_frames_opcode_order():
     """The four frames are exactly a4, a6, a8, 41 in order."""
     frames = build_load_frames(RECIPES["simple"])
     assert [f[3] for f in frames] == [0xA4, 0xA6, 0xA8, 0x41]
+
+
+def test_command_8102_no_bypass_bytes_remain_backwards_compatible():
+    assert build_a6(16).hex() == "01000000000000000010000000"
+
+
+def test_command_8102_encodes_app_bypass_volume_temperature_and_dose():
+    payload = build_a6(15, bypass_ml=40, bypass_temp_c=20)
+    assert payload[0] == 1
+    assert struct.unpack_from("<f", payload, 1)[0] == 40.0
+    assert struct.unpack_from("<f", payload, 5)[0] == 200.0
+    assert struct.unpack_from("<I", payload, 9)[0] == 15
+
+    recipe = {**RECIPES["simple"], "bypass_ml": 40, "bypass_temp_c": 98}
+    frame = build_load_frames(recipe)[1]
+    assert frame[3] == 0xA6
+    assert struct.unpack_from("<f", frame, 10)[0] == 40.0
+    assert struct.unpack_from("<f", frame, 14)[0] == 980.0
 
 
 def test_pours_opcode_and_ratio_byte():

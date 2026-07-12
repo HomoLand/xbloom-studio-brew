@@ -9,7 +9,7 @@ so the decoder is pinned to real hardware output.
 
 import struct
 
-from xbloom_ble.telemetry import parse_notification
+from xbloom_ble.telemetry import parse_machine_info_payload, parse_notification
 
 
 def _notif(ftype: int, state: int | None = None, sub: int = 0x1F) -> bytes:
@@ -97,12 +97,56 @@ def test_scale_end_of_brew_values():
     assert parse_notification("580207155010000000c12d7262430000").coffee_g == 226.45
 
 
-def test_scale_zero_reading_kept_but_noise_dropped():
+def test_scale_zero_and_negative_readings_are_kept():
     # A genuine 0.0 g reading (empty scale at brew start) is kept…
     assert parse_notification("5802074b9e10000000c100000000fd32").water_g == 0.0
-    # …but untared/idle drift decoding to an implausible value is dropped to None.
-    noise = parse_notification("580207155010000000c1d7a319c20000")
-    assert noise.water_g is None and noise.coffee_g is None
+    # …and cup removal after the mandatory entry auto-zero remains visible.
+    negative = parse_notification("580207155010000000c1d7a319c20000")
+    assert negative.coffee_g == negative.scale_g == -38.41
+
+    dedicated = bytearray.fromhex("5802070b2910000000c1000000000000")
+    struct.pack_into("<f", dedicated, 10, -12.5)
+    assert parse_notification(dedicated).scale_g == -12.5
+
+
+def test_machine_info_report_matches_app_fixed_width_layout():
+    payload = bytearray(63)
+    payload[0:13] = b"SN12345678901"
+    payload[13:19] = b"J15   "
+    payload[19:29] = b"V12.0D.500"
+    struct.pack_into("<f", payload, 29, 42.5)
+    payload[33:42] = bytes([1, 2, 3, 1, 92, 8, 24, 1, 1])
+    payload[51:55] = bytes.fromhex("91327856")
+    struct.pack_into("<I", payload, 55, 7)
+    struct.pack_into("<I", payload, 59, 9)
+
+    info = parse_machine_info_payload(payload)
+    assert info == {
+        "serial_number": "SN12345678901",
+        "model": "J15",
+        "firmware": "V12.0D.500",
+        "area_ap": 42.5,
+        "water_enough": True,
+        "system_status": 2,
+        "user_count": 3,
+        "water_source": "tap",
+        "grind_setting": 62,
+        "display": "medium",
+        "voltage_raw": 24,
+        "temperature_unit": "C",
+        "weight_unit": "g",
+        "mode": "auto",
+        "pouring_radius_init": 7,
+        "vibration_init": 9,
+    }
+
+    head = bytes([0x58, 0x02, 0x07]) + struct.pack("<H", 40521)
+    total = len(head) + 4 + 1 + len(payload) + 2
+    report = head + struct.pack("<I", total) + b"\xc1" + payload + b"\x00\x00"
+    event = parse_notification(report)
+    assert event.command_code == 40521
+    assert event.state_name == "machine_info"
+    assert event.machine_info == info
 
 
 def test_command_echo_is_ack():

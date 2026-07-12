@@ -606,6 +606,7 @@ class XBloomClient:
         *,
         flow_ml_s: float = 3.5,
         pattern: str = "center",
+        water_feed: int = 0,
         timeout: float | None = None,
     ) -> StatusEvent:
         """Dispense a firmware-limited volume of water in FreeSolo brewer mode.
@@ -624,6 +625,8 @@ class XBloomClient:
             raise XBloomError("water flow must be 3.0-3.5 ml/s in 0.1 steps")
         if pattern not in {"center", "spiral", "ring"}:
             raise XBloomError("water pattern must be center, spiral, or ring")
+        if int(water_feed) not in {0, 1}:
+            raise XBloomError("water source must be 0 (tank) or 1 (tap)")
         wait_timeout = (
             float(timeout)
             if timeout is not None
@@ -644,7 +647,13 @@ class XBloomClient:
             await asyncio.sleep(0.4)
             await self._client.write_gatt_char(
                 CHAR_COMMAND,
-                build_brewer_start(volume_ml, temp_c, flow_ml_s, pattern),
+                build_brewer_start(
+                    volume_ml,
+                    temp_c,
+                    flow_ml_s,
+                    pattern,
+                    water_feed=int(water_feed),
+                ),
                 response=False,
             )
             started = True

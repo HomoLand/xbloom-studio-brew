@@ -21,6 +21,8 @@ ALLOWED_TOP_LEVEL = frozenset(
         "grind",
         "ratio",
         "stage_temps",
+        "bypass_ml",
+        "bypass_temp_c",
         "dripper",
         "kind",
         "water_ml",
@@ -88,8 +90,8 @@ def strict_validate(recipe: Recipe) -> None:
 
     if not 5 <= int(recipe.dose_g) <= 18:
         errors.append("dose_g must be 5-18 g")
-    if not 35 <= int(recipe.grind) <= 75:
-        errors.append("grind must be 35-75 for guarded pour-over operation")
+    if int(recipe.grind) != 0 and not 35 <= int(recipe.grind) <= 75:
+        errors.append("grind must be 35-75, or 0 for pre-ground/grinder-off")
     if not 2 <= len(recipe.pours) <= 5:
         errors.append("pour count must be 2-5")
     if tuple(recipe.stage_temps) != (110.0, 90.0):
@@ -98,17 +100,23 @@ def strict_validate(recipe: Recipe) -> None:
         errors.append("the guarded controller currently supports an Omni Dripper only")
 
     total_hot = recipe.total_water_ml
+    bypass_ml = float(recipe.bypass_ml or 0.0)
+    total_machine_water = total_hot + bypass_ml
     machine_ratio = total_hot / float(recipe.dose_g)
-    if not 60 <= total_hot <= 360:
-        errors.append("total machine hot water must be 60-360 ml")
+    if not 60 <= total_machine_water <= 360:
+        errors.append("total machine water (pours + bypass) must be 60-360 ml")
+    if bypass_ml and int(recipe.bypass_temp_c) not in {20, 98} and not (
+        80 <= int(recipe.bypass_temp_c) <= 95
+    ):
+        errors.append("bypass temperature must be RT, 80-95 C, or BP")
 
     agitation_count = 0
     non_center_rpms: set[int] = set()
     for index, pour in enumerate(recipe.pours, start=1):
         if not 10 <= int(pour.ml) <= 127:
             errors.append(f"pour {index} must be 10-127 ml; protocol auto-splitting is disabled")
-        if not 80 <= int(pour.temp_c) <= 95:
-            errors.append(f"pour {index} temperature must be 80-95 C")
+        if int(pour.temp_c) not in {20, 98} and not 80 <= int(pour.temp_c) <= 95:
+            errors.append(f"pour {index} temperature must be RT, 80-95 C, or BP")
         if not 0 <= int(pour.pause_s) <= 60:
             errors.append(f"pour {index} pause must be 0-60 s")
         flow10 = round(float(pour.flow_ml_s) * 10)
@@ -134,14 +142,19 @@ def strict_validate(recipe: Recipe) -> None:
         errors.append("repeat one grinder rpm across every non-center pour")
 
     if kind == "hot":
-        if not 12 <= machine_ratio <= 20:
+        if bypass_ml:
+            if not 8 <= machine_ratio <= 20:
+                errors.append("hot bypass extraction ratio must be 1:8 through 1:20")
+            if not 12 <= total_machine_water / float(recipe.dose_g) <= 20:
+                errors.append("hot bypass final water ratio must be 1:12 through 1:20")
+        elif not 12 <= machine_ratio <= 20:
             errors.append("hot recipe ratio must be 1:12 through 1:20")
         if recipe.ice_g not in (None, 0):
             errors.append("hot recipes cannot declare ice_g")
         if recipe.hot_water_ml is not None and int(recipe.hot_water_ml) != total_hot:
-            errors.append("hot_water_ml must equal the sum of pours")
-        if recipe.water_ml is not None and int(recipe.water_ml) != total_hot:
-            errors.append("water_ml must equal the sum of pours for hot recipes")
+            errors.append("hot_water_ml must equal the extraction-pour total")
+        if recipe.water_ml is not None and int(recipe.water_ml) != total_machine_water:
+            errors.append("water_ml must equal pours + bypass for hot recipes")
 
     if kind == "flash-brew":
         if not 8 <= machine_ratio <= 14:
@@ -152,8 +165,8 @@ def strict_validate(recipe: Recipe) -> None:
             errors.append("flash-brew ice_g must be 40-180 g")
         if recipe.water_ml is None or recipe.ice_g is None:
             errors.append("flash-brew requires water_ml, hot_water_ml, and ice_g")
-        elif int(recipe.water_ml) != total_hot + int(recipe.ice_g):
-            errors.append("flash-brew water_ml must equal hot_water_ml + ice_g")
+        elif int(recipe.water_ml) != total_machine_water + int(recipe.ice_g):
+            errors.append("flash-brew water_ml must equal pours + bypass + ice_g")
         elif not 12 <= int(recipe.water_ml) / float(recipe.dose_g) <= 20:
             errors.append("flash-brew final water ratio must be 1:12 through 1:20")
 
@@ -175,7 +188,12 @@ def recipe_summary(recipe: Recipe, path: str | Path) -> dict[str, Any]:
         "dose_g": int(recipe.dose_g),
         "grind": int(recipe.grind),
         "hot_water_ml": recipe.total_water_ml,
-        "final_water_ml": int(recipe.water_ml or recipe.total_water_ml),
+        "bypass_ml": float(recipe.bypass_ml or 0.0),
+        "bypass_temp_c": recipe.bypass_temp_c,
+        "final_water_ml": int(
+            recipe.water_ml
+            or (recipe.total_machine_water_ml + int(recipe.ice_g or 0))
+        ),
         "ice_g": int(recipe.ice_g or 0),
         "pours": len(recipe.pours),
         "recipe_sha256": recipe_sha256(path),

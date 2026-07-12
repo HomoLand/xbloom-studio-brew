@@ -21,7 +21,16 @@ def test_freesolo_and_tea_parsers_expose_guarded_parameters():
     )
     assert (grind.size, grind.rpm, grind.seconds, grind.confirm_ready) == (62, 100, 10, "")
     water = parser.parse_args(["water", "--volume", "250", "--temp", "85"])
-    assert (water.volume, water.temp, water.pattern) == (250, 85, "center")
+    assert (water.volume, water.temp, water.pattern, water.water_source) == (
+        250,
+        85,
+        "center",
+        "auto",
+    )
+    water_tap = parser.parse_args(
+        ["water", "--volume", "250", "--temp", "85", "--water-source", "tap"]
+    )
+    assert water_tap.water_source == "tap"
     water_rt = parser.parse_args(["water", "--volume", "250", "--temp", "RT"])
     assert water_rt.temp == xbloom.ROOM_TEMPERATURE_C == 20
     water_rt_lower = parser.parse_args(["water", "--volume", "250", "--temp", "rt"])
@@ -73,6 +82,18 @@ def test_supported_firmware_passes_preflight(monkeypatch):
     assert xbloom.require_write_preflight(
         {"firmware": ["V12.0D.500"], "states": ["loading", "idle"]}
     ) == "V12.0D.500"
+
+
+def test_machine_info_redacts_serial_but_keeps_operational_settings():
+    public = xbloom.redact_machine_info(
+        {
+            "serial_number": "private",
+            "firmware": "V12.0D.500",
+            "water_source": "tank",
+        }
+    )
+    assert "serial_number" not in public
+    assert public == {"firmware": "V12.0D.500", "water_source": "tank"}
 
 
 @pytest.mark.parametrize("firmware", [[], ["V99.0A.1"]])

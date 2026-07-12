@@ -39,7 +39,7 @@ The coffee LOAD sequence
 Sent frame-by-frame, waiting for each ACK on ``ffe2``:
 
 1. command 8100 (legacy ``a4 1f``) — session start.
-2. command 8102 (``a6 1f``) — dose.
+2. command 8102 (``a6 1f``) — optional bypass water + dose.
 3. command 8104 (``a8 1f``) — staging/cup float values.
 4. command 8001 (``41 1f``), or 8004 for no-grind — pours + grind.
 
@@ -354,6 +354,8 @@ def build_brewer_start(
     source and machine pattern. ``ROOM_TEMPERATURE_C`` selects the app's RT
     pass-through setting; it is a mode token, not an active cooling target.
     """
+    if int(water_feed) not in {0, 1}:
+        raise ValueError("water_feed must be 0 (tank) or 1 (tap)")
     return j15_frame(
         CMD_BREWER_START,
         [
@@ -493,12 +495,25 @@ def build_a4() -> bytes:
     return bytes.fromhex("01b900000001000000")
 
 
-def build_a6(dose_g: int) -> bytes:
-    """0xa6 dose payload: dose grams as ``u8`` at offset 9."""
-    pl = bytearray(13)
-    pl[0] = 0x01
-    pl[9] = int(dose_g) & 0xFF
-    return bytes(pl)
+def build_a6(
+    dose_g: int,
+    bypass_ml: float = 0.0,
+    bypass_temp_c: float = 0.0,
+) -> bytes:
+    """Build command-8102's bypass/dose payload.
+
+    The official Studio/J15 app sends three 32-bit values after the payload
+    marker: bypass volume as float bits, bypass temperature multiplied by ten
+    as float bits, and dose as an integer. A disabled bypass is represented by
+    two zero floats. This preserves the historic no-bypass bytes while making
+    the app's 5-100 ml bypass feature available to recipes.
+    """
+    return (
+        b"\x01"
+        + struct.pack("<I", _float_bits(float(bypass_ml)))
+        + struct.pack("<I", _float_bits(float(bypass_temp_c) * 10.0))
+        + struct.pack("<I", int(dose_g))
+    )
 
 
 def build_a8(temp1: float = 110.0, temp2: float = 90.0) -> bytes:
@@ -609,7 +624,15 @@ def build_load_frames(recipe: Mapping) -> list[bytes]:
     pours_cmd = POURS_CMD_NO_GRIND if int(recipe["grind"]) == 0 else POURS_CMD_GRIND
     frames = [
         xbloom_frame(0xA4, seq, build_a4()),
-        xbloom_frame(0xA6, seq, build_a6(recipe["dose"])),
+        xbloom_frame(
+            0xA6,
+            seq,
+            build_a6(
+                recipe["dose"],
+                recipe.get("bypass_ml", 0.0),
+                recipe.get("bypass_temp_c", 0.0),
+            ),
+        ),
         xbloom_frame(0xA8, seq, build_a8(t1, t2)),
         xbloom_frame(pours_cmd, seq, build_41(recipe["pours"], recipe["grind"], tail)),
     ]

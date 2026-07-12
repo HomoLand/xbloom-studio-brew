@@ -15,6 +15,7 @@ import struct
 import pytest
 
 from xbloom_ble.client import CHAR_STATUS, XBloomClient, XBloomError, scan
+from xbloom_ble.protocol import frame_command
 from xbloom_ble.recipe import Recipe
 from xbloom_ble.tea import TeaRecipe
 
@@ -328,6 +329,19 @@ def test_water_accepts_official_rt_sentinel():
     event = run(c.dispense_water(120, 20, timeout=5))
     assert event.command_code == 40511
     assert _commands(fake) == [8007, 4506, 8013]
+
+
+def test_water_passes_selected_tap_source_to_start_frame():
+    fake = FakeBleak()
+    fake.script_full[4506] = [
+        _water_volume_notification(120),
+        _command_notification(40511),
+    ]
+    c = _client(fake)
+    run(c.dispense_water(120, 85, water_feed=1, timeout=5))
+    start = next(frame for frame in fake.writes if frame_command(frame) == 4506)
+    words = struct.unpack(f"<{(len(start[10:-2]) // 4)}I", start[10:-2])
+    assert words[-2] == 1
 
 
 @pytest.mark.parametrize("temp_c", [19, 21, 39, 99])

@@ -87,6 +87,54 @@ def test_temp_below_range_raises():
         ]))
 
 
+@pytest.mark.parametrize("token, expected", [("RT", 20), ("rt", 20), ("BP", 98)])
+def test_app_temperature_tokens_roundtrip(token, expected):
+    data = _with(
+        pours=[
+            {**VALID["pours"][0], "temp_c": token},
+            {**VALID["pours"][1], "temp_c": 90},
+        ]
+    )
+    recipe = Recipe.from_dict(data)
+    assert recipe.pours[0].temp_c == expected
+    assert Recipe.from_dict(recipe.to_dict()).pours[0].temp_c == expected
+
+
+def test_invalid_temperature_token_raises():
+    data = _with(
+        pours=[
+            {**VALID["pours"][0], "temp_c": "room"},
+            VALID["pours"][1],
+        ]
+    )
+    with pytest.raises(RecipeError, match="RT, BP"):
+        Recipe.from_dict(data)
+
+
+def test_bypass_roundtrip_and_protocol_shape():
+    recipe = Recipe.from_dict(_with(bypass_ml=40, bypass_temp_c="RT"))
+    assert recipe.bypass_ml == 40
+    assert recipe.bypass_temp_c == 20
+    assert recipe.total_machine_water_ml == 190
+    assert recipe.to_dict()["bypass_temp_c"] == "RT"
+    assert recipe.to_protocol_dict()["bypass_temp_c"] == 20.0
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"bypass_ml": 4, "bypass_temp_c": 90}, "5-100"),
+        ({"bypass_ml": 101, "bypass_temp_c": 90}, "5-100"),
+        ({"bypass_ml": 20.5, "bypass_temp_c": 90}, "whole millilitres"),
+        ({"bypass_ml": 40}, "bypass_temp_c is required"),
+        ({"bypass_temp_c": 90}, "requires bypass_ml"),
+    ],
+)
+def test_bypass_pair_and_range_validation(overrides, message):
+    with pytest.raises(RecipeError, match=message):
+        Recipe.from_dict(_with(**overrides))
+
+
 def test_grind_above_range_raises():
     # grind range is 1–80; 81 must be rejected.
     with pytest.raises(RecipeError, match="grind"):
@@ -257,7 +305,15 @@ def test_enriched_fields_parse():
 def test_enriched_metadata_ignored_by_protocol():
     """Metadata must never leak into the machine payload."""
     proto = Recipe.from_dict(ENRICHED).to_protocol_dict()
-    assert set(proto) == {"dose", "grind", "stage_temps", "pours"}
+    assert set(proto) == {
+        "dose",
+        "grind",
+        "stage_temps",
+        "bypass_ml",
+        "bypass_temp_c",
+        "pours",
+    }
+    assert proto["bypass_ml"] == proto["bypass_temp_c"] == 0.0
     for p in proto["pours"]:
         assert "label" not in p          # pour labels are informational only
 

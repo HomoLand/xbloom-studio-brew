@@ -22,10 +22,12 @@ validation, and bundled BLE control. It works with Hermes and other Agent Skills
   explicitly for loose-bean Omni brews.
 - Includes five xBloom-published Omni Tea Brewer templates and a dedicated guarded tea protocol.
 - Shows a conservative Skill baseline plus cited adaptations for the user to compare.
-- Validates dose, ratio, water totals, grind, temperature, flow, RPM, and BLE opcodes before writes.
+- Validates dose, extraction/final ratios, bypass, water totals, grind, temperature modes, flow,
+  RPM, and BLE opcodes before writes.
 - Scans, probes, loads, monitors, cancels, saves A/B/C presets, and supports gated remote start.
 - Uses the FreeSolo scale with explicit entry auto-zero semantics, the standalone grinder, and
-  volume-controlled water at RT or 40-98 C.
+  volume-controlled tank/tap water at RT or 40-98 C.
+- Reads a redacted Studio machine-info/settings snapshot during diagnostics.
 - Runs locally without xBloom cloud credentials or an app account.
 
 ## How recipes are produced
@@ -110,7 +112,8 @@ python scripts/xbloom.py tea-load assets/tea-green-official.yaml
 Scale entry automatically zeros the load already present. Start with an empty platform for an
 object's absolute weight, or pre-position an empty vessel when measuring net contents; `--tare`
 sends an additional re-tare. FreeSolo room-temperature water uses `water --temp RT` and remains
-behind the same physical water-action gates as heated water.
+behind the same physical water-action gates as heated water. `--water-source auto` follows the
+machine's current tank/tap setting; an explicit source is required if it cannot be read.
 
 `grind`, `water`, coffee `start`, and `tea-start` are included but disabled until the deployment
 owner enables their documented safety gate. See [standalone tools](skills/xbloom-studio-brew/references/standalone-tools.md)
@@ -132,6 +135,14 @@ and [tea brewing](skills/xbloom-studio-brew/references/tea-brewing.md).
 
 Read the complete [device safety policy](skills/xbloom-studio-brew/references/device-safety.md).
 
+## APK capability coverage
+
+The audited Android app contains more than Studio BLE control: it also includes cloud/account UI,
+NFC lookup, store content, high-risk maintenance, and xBloom Original (`J20`) paths. The
+[command-by-command APK capability matrix](skills/xbloom-studio-brew/references/apk-capability-matrix.md)
+separates what is shipped, what needs a long-lived BLE bridge, what is deliberately excluded, and
+what is not a Studio device feature.
+
 ## Development
 
 ```text
@@ -139,7 +150,7 @@ cd skills/xbloom-studio-brew
 python scripts/bootstrap.py --dev
 ```
 
-The current suite contains 149 passing tests and 4 hardware/platform skips. Release tests never
+The current suite contains 167 passing tests and 4 hardware/platform skips. Release tests never
 activate the grinder or dispense hot water; the scale enter/read/exit path is hardware-verified on
 firmware `V12.0D.500`.
 

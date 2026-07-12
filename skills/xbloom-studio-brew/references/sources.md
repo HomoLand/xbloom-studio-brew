@@ -37,15 +37,22 @@ redistribute the APK or decompiled sources.
 The port is pinned by tests for:
 
 - Generic J15 frame layout and CRC.
-- Scale enter/tare/exit and both weight-report identifiers.
+- Scale enter/tare/exit, signed readings, and both weight-report identifiers.
 - Grinder enter/start/stop/quit arguments and cleanup ordering.
-- Brewer enter/start argument encoding, `TemperatureConstant.RT = 20.0`, and completion cleanup.
+- Brewer enter/start argument encoding, tank/tap source, `TemperatureConstant.RT = 20.0`, and
+  completion cleanup.
+- Coffee bypass volume/temperature/dose encoding and recipe-stage RT/BP tokens.
+- Fixed-width Studio machine-info decoding with serial redaction at the CLI boundary.
 - Tea cup setup, recipe upload, execute separation, official green-tea blob, and native minute-pause
   transformation.
 
 These are decoded, firmware-dependent behaviors, not an official xBloom API. Scale enter/read/exit
 has also been verified on `V12.0D.500`; a follow-up hardware observation confirmed that the entry
 command zeros a load already present. Unattended tests do not run the grinder or dispense water.
+
+See `apk-capability-matrix.md` for the complete Studio command inventory, feature classification,
+known cup-geometry/vibration uncertainties, and the distinction between J15 BLE, J20 cloud code,
+NFC lookup, and mobile-only features.
 
 ## Public official tea templates
 

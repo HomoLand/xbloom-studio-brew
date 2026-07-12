@@ -10,7 +10,7 @@ skill also completed its initial hardware validation on that firmware.
 | --- | --- | --- |
 | `doctor` | Local dependency check; optional passive scan. | None |
 | `scan` | Discovers nearby advertisements. | None |
-| `probe` | Opens an app-style session and asks for status/firmware. | None (`0xA4`, `0x56`) |
+| `probe` | Opens an app-style session and asks for status, firmware, and redacted machine settings. | None (`0xA4`, `0x56`) |
 | `validate` | Parses and validates a local recipe. | None |
 | `load` | Writes guarded recipe frames and leaves the machine armed. Does not brew. | None |
 | `tea-validate` | Parses a local Omni Tea Brewer recipe. | None |
@@ -21,7 +21,7 @@ skill also completed its initial hardware validation on that firmware.
 | `cancel` | Cancels/exits an armed or active operation. | `0x47` cancel |
 | `start` | Commits and starts an armed recipe; can grind and dispense near-boiling water. | `0x42`, sometimes `0x46` |
 | `grind` | Runs the standalone grinder for a bounded interval. | Motor command; owner + per-run gates |
-| `water` | Dispenses a requested volume at a requested temperature. | Hot-water command; owner + per-run gates |
+| `water` | Dispenses a requested volume at a requested temperature from tank/tap. | Hot-water command; owner + per-run gates |
 | `tea-start` | Executes a loaded siphon-tea recipe. | Hot-water command; owner + per-run gates |
 
 ## Mandatory operating rules
@@ -59,7 +59,8 @@ Before a physical or remote start, require all of the following:
 - User aware that the machine can dispense near-boiling water.
 
 For standalone water, beans/filter/dripper are not intrinsically required; instead require a
-sufficiently large heat-safe vessel under the correct outlet and a clear water path. For tea,
+sufficiently large heat-safe vessel under the correct outlet, the selected tank/tap source, and a
+clear water path. For tea,
 require the Omni Tea Brewer, leaves, and receiving vessel. For grinding, require beans, a receiving
 cup, a clear chute, and hands clear of the motor path. Read `standalone-tools.md` and
 `tea-brewing.md` for the exact command-specific checks.
