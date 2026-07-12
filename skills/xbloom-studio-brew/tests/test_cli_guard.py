@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 import xbloom
@@ -6,6 +8,52 @@ import xbloom
 def test_save_slots_parser_accepts_exactly_three_recipes():
     args = xbloom.build_parser().parse_args(["save-slots", "a.yaml", "b.yaml", "c.yaml"])
     assert args.recipes == ["a.yaml", "b.yaml", "c.yaml"]
+
+
+def test_freesolo_and_tea_parsers_expose_guarded_parameters():
+    parser = xbloom.build_parser()
+    scale = parser.parse_args(["scale", "--tare", "--duration", "5"])
+    assert scale.tare and scale.duration == 5
+    grind = parser.parse_args(
+        ["grind", "--size", "62", "--rpm", "100", "--seconds", "10"]
+    )
+    assert (grind.size, grind.rpm, grind.seconds, grind.confirm_ready) == (62, 100, 10, "")
+    water = parser.parse_args(["water", "--volume", "250", "--temp", "85"])
+    assert (water.volume, water.temp, water.pattern) == (250, 85, "center")
+    tea = parser.parse_args(["tea-start", "green.yaml"])
+    assert tea.recipe == "green.yaml" and tea.confirm_ready == ""
+
+
+def test_physical_tools_are_disabled_before_any_ble_resolution(monkeypatch):
+    monkeypatch.delenv(xbloom.REMOTE_GRINDER_ENV, raising=False)
+    grind = xbloom.build_parser().parse_args(
+        ["grind", "--size", "62", "--seconds", "10", "--confirm-ready", xbloom.GRINDER_READY_SENTINEL]
+    )
+    with pytest.raises(RuntimeError, match="remote grinder disabled"):
+        asyncio.run(xbloom.async_grind(grind))
+
+    monkeypatch.delenv(xbloom.REMOTE_START_ENV, raising=False)
+    water = xbloom.build_parser().parse_args(
+        ["water", "--volume", "250", "--temp", "85", "--confirm-ready", xbloom.WATER_READY_SENTINEL]
+    )
+    with pytest.raises(RuntimeError, match="hot-water actions disabled"):
+        asyncio.run(xbloom.async_water(water))
+
+
+def test_grinder_rest_interval_is_persisted(monkeypatch, tmp_path):
+    path = tmp_path / "grinder.json"
+    monkeypatch.setattr(xbloom, "GRINDER_STATE_FILE", path)
+    xbloom.reserve_grinder_rest(10)
+    with pytest.raises(RuntimeError, match="rest interval active"):
+        xbloom.require_grinder_rest()
+
+
+def test_corrupt_grinder_rest_record_blocks_motor(monkeypatch, tmp_path):
+    path = tmp_path / "grinder.json"
+    path.write_text("{not-json", encoding="utf-8")
+    monkeypatch.setattr(xbloom, "GRINDER_STATE_FILE", path)
+    with pytest.raises(RuntimeError, match="rest record is unreadable"):
+        xbloom.require_grinder_rest()
 
 
 def test_supported_firmware_passes_preflight(monkeypatch):

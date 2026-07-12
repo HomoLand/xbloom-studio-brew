@@ -30,6 +30,24 @@ Web recipe enrichment is optional and uses the host Agent's own web-search tool.
 backend in Hermes or the target Agent when this feature is wanted; keep using the bundled offline
 recipe model when none is available. Do not store search-provider credentials inside the Skill.
 
+For Hermes, DDGS is a credential-free search backend:
+
+```text
+hermes config set web.search_backend ddgs
+```
+
+Restart a running Hermes gateway after changing its configuration. Validate the complete Agent
+tool path (not merely the Python import) with a short forced-search query:
+
+```text
+hermes chat -Q -t web -s xbloom-studio-brew --max-turns 4 \
+  -q "Use web_search to find the official xBloom Omni Tea Brewer page; return its title and URL."
+```
+
+Some Hermes installations lazily install the `ddgs` package on first use; managed deployments may
+preinstall it into Hermes' own virtual environment. The package belongs to the host Agent, not this
+Skill's BLE runtime.
+
 ## Bootstrap
 
 From the skill directory, create its isolated runtime:
@@ -86,6 +104,7 @@ All variables are optional; do not declare the two safety overrides as automatic
 | `XBLOOM_ADDRESS` | Select one machine without scanning; useful when more than one is nearby. |
 | `XBLOOM_SKILL_STATE_DIR` | Relocate the short-lived armed-state record. |
 | `XBLOOM_ENABLE_REMOTE_START` | Owner opt-in for remote hot-water start; exact sentinel in `device-safety.md`. |
+| `XBLOOM_ENABLE_REMOTE_GRINDER` | Separate owner opt-in for the standalone grinder; exact sentinel in `device-safety.md`. |
 | `XBLOOM_ALLOW_UNTESTED_FIRMWARE` | Owner acceptance for an unknown firmware; exact sentinel in `device-safety.md`. |
 
 For Hermes sandboxed execution, explicitly pass through only the variables the deployment needs.
@@ -108,11 +127,13 @@ recipes containing private purchase/account data.
 1. Run `python scripts/bootstrap.py --dev` on a clean checkout.
 2. Run the Agent Skills structural validator.
 3. Inspect `git diff` for addresses, serials, tokens, and packet captures.
-4. Confirm all generated load frames exclude `0x42`, `0x46`, and `0x47`.
+4. Confirm coffee and tea load frames exclude their execute/start commands.
 5. Test `doctor`, `scan`, and `probe` on each supported OS when available.
-6. For a supported firmware, load a conservative recipe and then cancel without starting.
-7. Never add firmware to the allowlist based only on a successful scan.
-8. Tag the release and record the vendored upstream commit in `THIRD_PARTY_NOTICES.md`.
+6. Test `scale` briefly without tare and confirm the command exits cleanly.
+7. For a supported firmware, load a conservative recipe and then cancel without starting.
+8. Keep grinder, water, coffee start, and tea start out of unattended release tests.
+9. Never add firmware to the allowlist based only on a successful scan.
+10. Tag the release and record the vendored upstream commit in `THIRD_PARTY_NOTICES.md`.
 
 ## Architecture boundary
 

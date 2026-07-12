@@ -1,7 +1,7 @@
 """Async Bluetooth LE client for the xBloom Studio (via ``bleak``).
 
 This is the only module that touches hardware. It discovers the machine,
-connects, writes the LOAD frames, and streams status telemetry.
+connects, writes guarded coffee/tea and FreeSolo frames, and streams telemetry.
 
 Safety model: loading and starting are **separate, explicit** operations.
 :meth:`XBloomClient.load_recipe` only *loads* (writes ``a4, a6, a8, 41`` and
@@ -11,8 +11,9 @@ a load can never brew by accident. :meth:`XBloomClient.start` is the deliberate
 exactly like the app's Brew button. :meth:`XBloomClient.brew` is the convenience
 that loads then starts. :meth:`XBloomClient.cancel_brew` aborts (``0x47``).
 
-⚠️ Starting a brew physically dispenses near-boiling water — only call
-:meth:`start`/:meth:`brew` when the machine is ready and someone intends to brew.
+⚠️ Starting coffee/tea or standalone water physically dispenses hot water, and
+standalone grinding runs a motor. Public Agent workflows must use the gated CLI,
+not call these client methods directly.
 """
 
 from __future__ import annotations
@@ -22,16 +23,34 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 from .protocol import (
+    CMD_TEA_RECIPE_CODE,
+    CMD_TEA_RECIPE_MAKE,
+    build_brewer_enter,
+    build_brewer_quit,
+    build_brewer_start,
+    build_brewer_stop,
     build_cancel,
     build_commit,
+    build_grinder_enter,
+    build_grinder_quit,
+    build_grinder_start,
+    build_grinder_stop,
     build_load_frames,
+    build_recipe_start_quit,
     build_save_slot,
+    build_scale_enter,
+    build_scale_exit,
+    build_scale_tare,
     build_session_start,
     build_set_mode,
     build_start,
     build_status_query,
+    build_tea_load_frames,
+    build_tea_start,
+    frame_command,
 )
 from .recipe import Recipe
+from .tea import TeaRecipe
 from .telemetry import StatusEvent, parse_notification
 
 log = logging.getLogger("xbloom_ble")
@@ -56,6 +75,9 @@ STATE_NO_BEANS = 0x0F
 # Slot-save status states (see telemetry): 0x43 saving, 0x25 saved, 0x01 idle.
 STATE_IDLE = 0x01
 STATE_SLOTS_SAVED = 0x25
+
+# Generic notification/report command codes from the official app.
+REPORT_BREWER_STOP = 40511
 
 
 class XBloomError(RuntimeError):
@@ -242,8 +264,65 @@ class XBloomClient:
             if event.state == state:
                 return event
 
+    async def _drain_for_command(self, command: int, timeout: float) -> StatusEvent:
+        """Wait for a notification carrying the full generic u16 command code."""
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise XBloomError(
+                    f"timed out waiting for command 0x{command:04x} after {timeout:.0f}s"
+                )
+            try:
+                event = await asyncio.wait_for(self._notif_queue.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                raise XBloomError(
+                    f"timed out waiting for command 0x{command:04x} after {timeout:.0f}s"
+                ) from None
+            if event.command_code == command:
+                return event
+
+    async def _drain_water_completion(
+        self, target_ml: float, timeout: float
+    ) -> StatusEvent | None:
+        """Wait for brewer stop while retaining its latest metered water volume."""
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        latest_ml: float | None = None
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return None
+            try:
+                event = await asyncio.wait_for(self._notif_queue.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return None
+            if event.water_g is not None:
+                # Report 40523 is named WaterVolume by the app; it transports
+                # millilitres as a float scaled by 1000. Water density makes the
+                # existing water_g field numerically equivalent here.
+                latest_ml = event.water_g
+            if event.command_code != REPORT_BREWER_STOP:
+                continue
+            if latest_ml is None:
+                raise XBloomError(
+                    "brewer stopped but no metered water volume was observed"
+                )
+            tolerance = max(5.0, float(target_ml) * 0.05)
+            if latest_ml < float(target_ml) - tolerance:
+                raise XBloomError(
+                    f"brewer stopped early at {latest_ml:.1f} ml; target was {target_ml:.1f} ml"
+                )
+            if latest_ml > float(target_ml) + (tolerance * 2):
+                raise XBloomError(
+                    f"brewer reported {latest_ml:.1f} ml; target was {target_ml:.1f} ml"
+                )
+            event.water_g = latest_ml
+            return event
+
     # ------------------------------------------------------------------
-    # Loading a recipe  (the ONLY write capability — never starts a brew)
+    # Loading a coffee recipe (load-only — never starts a brew)
     # ------------------------------------------------------------------
     async def load_recipe(self, recipe: Recipe, *, settle: float = 2.0) -> StatusEvent:
         """Load ``recipe`` onto the machine and return once it is armed.
@@ -382,6 +461,262 @@ class XBloomClient:
             raise XBloomError("not connected")
         log.info("→ 0x47 cancel (aborting brew)")
         await self._client.write_gatt_char(CHAR_COMMAND, build_cancel(), response=False)
+
+    # ------------------------------------------------------------------
+    # FreeSolo tools: scale, grinder, and volume-limited water dispense
+    # ------------------------------------------------------------------
+    async def stream_scale(
+        self,
+        on_event: Callable[[StatusEvent], Awaitable[None] | None],
+        *,
+        duration: float = 30.0,
+        tare: bool = False,
+    ) -> None:
+        """Enter standalone scale mode, stream gram readings, then always exit.
+
+        Taring occurs only when ``tare=True``. The app's timer is local UI state,
+        so callers that need a timer should use event timestamps.
+        """
+        if self._client is None or not self._client.is_connected:
+            raise XBloomError("not connected")
+        if not 0.1 <= float(duration) <= 3600:
+            raise XBloomError("scale duration must be 0.1-3600 seconds")
+
+        await self._start_notify()
+        entered = False
+        try:
+            await self._client.write_gatt_char(
+                CHAR_COMMAND, build_scale_enter(), response=False
+            )
+            entered = True
+            await asyncio.sleep(0.3)
+            if tare:
+                await self._client.write_gatt_char(
+                    CHAR_COMMAND, build_scale_tare(), response=False
+                )
+                await asyncio.sleep(0.2)
+
+            loop = asyncio.get_event_loop()
+            deadline = loop.time() + float(duration)
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return
+                try:
+                    event = await asyncio.wait_for(
+                        self._notif_queue.get(), timeout=remaining
+                    )
+                except asyncio.TimeoutError:
+                    return
+                if event.scale_g is None:
+                    continue
+                result = on_event(event)
+                if asyncio.iscoroutine(result):
+                    await result
+        finally:
+            if entered and self._client is not None and self._client.is_connected:
+                try:
+                    await self._client.write_gatt_char(
+                        CHAR_COMMAND, build_scale_exit(), response=False
+                    )
+                except Exception as exc:  # pragma: no cover - best-effort safety cleanup
+                    log.warning("failed to exit scale mode cleanly: %s", exc)
+            await self._stop_notify()
+
+    async def grind(self, grind: int, rpm: int, *, seconds: float) -> StatusEvent:
+        """Run the standalone grinder for at most 30 seconds, then stop and quit.
+
+        The caller must enforce the official 60-second rest interval between
+        sessions. Stop/quit frames are attempted from ``finally`` on cancellation
+        or errors so a normal interrupted process does not leave the motor running.
+        """
+        if self._client is None or not self._client.is_connected:
+            raise XBloomError("not connected")
+        if not 1 <= int(grind) <= 80:
+            raise XBloomError("grind must be 1-80")
+        if not 60 <= int(rpm) <= 120:
+            raise XBloomError("rpm must be 60-120")
+        if not 0.1 <= float(seconds) <= 30.0:
+            raise XBloomError("grinder runtime must be 0.1-30 seconds")
+
+        entered = False
+        started = False
+        finished_runtime = False
+        stop_ack: StatusEvent | None = None
+        cleanup_error: Exception | None = None
+        await self._start_notify()
+        try:
+            await self._client.write_gatt_char(
+                CHAR_COMMAND, build_grinder_enter(grind, rpm), response=False
+            )
+            entered = True
+            await self._drain_for_command(8006, self.ack_timeout)
+            await asyncio.sleep(0.3)
+            await self._client.write_gatt_char(
+                CHAR_COMMAND, build_grinder_start(grind, rpm), response=False
+            )
+            started = True
+            await self._drain_for_command(3500, self.ack_timeout)
+            await asyncio.sleep(float(seconds))
+            finished_runtime = True
+        finally:
+            if self._client is not None and self._client.is_connected:
+                if started:
+                    try:
+                        await self._client.write_gatt_char(
+                            CHAR_COMMAND, build_grinder_stop(), response=False
+                        )
+                        stop_ack = await self._drain_for_command(3505, self.ack_timeout)
+                    except Exception as exc:  # pragma: no cover - safety cleanup
+                        cleanup_error = exc
+                        log.warning("failed to stop grinder cleanly: %s", exc)
+                if entered:
+                    try:
+                        await asyncio.sleep(0.2)
+                        await self._client.write_gatt_char(
+                            CHAR_COMMAND, build_grinder_quit(), response=False
+                        )
+                    except Exception as exc:  # pragma: no cover - best-effort cleanup
+                        log.warning("failed to quit grinder mode cleanly: %s", exc)
+            await self._stop_notify()
+            if finished_runtime and cleanup_error is not None:
+                raise XBloomError(
+                    f"grinder runtime elapsed but stop was not acknowledged: {cleanup_error}"
+                ) from cleanup_error
+        if stop_ack is None:  # pragma: no cover - normal path invariant
+            raise XBloomError("grinder stop acknowledgement missing")
+        return stop_ack
+
+    async def dispense_water(
+        self,
+        volume_ml: float,
+        temp_c: int,
+        *,
+        flow_ml_s: float = 3.5,
+        pattern: str = "center",
+        timeout: float | None = None,
+    ) -> StatusEvent:
+        """Dispense a firmware-limited volume of water in FreeSolo brewer mode.
+
+        Completion is confirmed by the app's brewer-out/stop report. On timeout,
+        interruption, or error, stop and quit frames are attempted before raising.
+        """
+        if self._client is None or not self._client.is_connected:
+            raise XBloomError("not connected")
+        if not 20 <= float(volume_ml) <= 360:
+            raise XBloomError("water volume must be 20-360 ml")
+        if not 40 <= int(temp_c) <= 98:
+            raise XBloomError("water temperature must be 40-98 C")
+        flow10 = round(float(flow_ml_s) * 10)
+        if flow10 not in range(30, 36) or abs(flow10 / 10 - float(flow_ml_s)) > 1e-6:
+            raise XBloomError("water flow must be 3.0-3.5 ml/s in 0.1 steps")
+        if pattern not in {"center", "spiral", "ring"}:
+            raise XBloomError("water pattern must be center, spiral, or ring")
+        wait_timeout = (
+            float(timeout)
+            if timeout is not None
+            else min(360.0, float(volume_ml) / float(flow_ml_s) + 180.0)
+        )
+        if not 5 <= wait_timeout <= 600:
+            raise XBloomError("water completion timeout must be 5-600 seconds")
+
+        await self._start_notify()
+        entered = False
+        started = False
+        completed = False
+        try:
+            await self._client.write_gatt_char(
+                CHAR_COMMAND, build_brewer_enter(temp_c, pattern), response=False
+            )
+            entered = True
+            await asyncio.sleep(0.4)
+            await self._client.write_gatt_char(
+                CHAR_COMMAND,
+                build_brewer_start(volume_ml, temp_c, flow_ml_s, pattern),
+                response=False,
+            )
+            started = True
+            event = await self._drain_water_completion(float(volume_ml), wait_timeout)
+            if event is None:
+                raise XBloomError(
+                    f"water dispense was not confirmed complete within {wait_timeout:.0f}s"
+                )
+            completed = True
+            return event
+        finally:
+            if self._client is not None and self._client.is_connected:
+                if started and not completed:
+                    try:
+                        await self._client.write_gatt_char(
+                            CHAR_COMMAND, build_brewer_stop(), response=False
+                        )
+                    except Exception as exc:  # pragma: no cover - safety cleanup
+                        log.warning("failed to stop water cleanly: %s", exc)
+                if entered:
+                    try:
+                        await asyncio.sleep(0.2)
+                        await self._client.write_gatt_char(
+                            CHAR_COMMAND, build_brewer_quit(), response=False
+                        )
+                    except Exception as exc:  # pragma: no cover - best-effort cleanup
+                        log.warning("failed to quit brewer mode cleanly: %s", exc)
+            await self._stop_notify()
+
+    # ------------------------------------------------------------------
+    # Omni Tea Brewer: load and execute remain separate
+    # ------------------------------------------------------------------
+    async def load_tea_recipe(self, recipe: TeaRecipe, *, settle: float = 2.0) -> StatusEvent:
+        """Upload a tea recipe and stop at the pre-start screen; never execute it."""
+        if self._client is None or not self._client.is_connected:
+            raise XBloomError("not connected")
+        recipe.validate()
+        frames = build_tea_load_frames(recipe.to_protocol_dict())
+        if [frame_command(frame) for frame in frames] != [8104, CMD_TEA_RECIPE_CODE]:
+            raise XBloomError("tea load frame invariant failed")
+
+        await self._start_notify()
+        try:
+            # The phone app already has a live app session when TeaRecipeViewModel
+            # uploads these frames. A one-shot CLI connection must reproduce that
+            # handshake before cup/recipe setup, just as coffee loading does.
+            await self._client.write_gatt_char(
+                CHAR_COMMAND, build_session_start(), response=False
+            )
+            await asyncio.sleep(0.5)
+            await self._client.write_gatt_char(
+                CHAR_COMMAND, build_status_query(), response=False
+            )
+            await asyncio.sleep(settle)
+            last: StatusEvent | None = None
+            for frame in frames:
+                command = frame_command(frame)
+                await self._client.write_gatt_char(CHAR_COMMAND, frame, response=False)
+                last = await self._drain_for_command(command, 30.0)
+                await asyncio.sleep(0.3)
+            assert last is not None
+            return last
+        finally:
+            await self._stop_notify()
+
+    async def start_tea(self) -> StatusEvent:
+        """Execute a previously uploaded tea recipe (physically dispenses hot water)."""
+        if self._client is None or not self._client.is_connected:
+            raise XBloomError("not connected")
+        await self._start_notify()
+        try:
+            frame = build_tea_start()
+            await self._client.write_gatt_char(CHAR_COMMAND, frame, response=False)
+            return await self._drain_for_command(CMD_TEA_RECIPE_MAKE, self.ack_timeout)
+        finally:
+            await self._stop_notify()
+
+    async def unload_tea_recipe(self) -> None:
+        """Exit the tea pre-start screen without executing the loaded recipe."""
+        if self._client is None or not self._client.is_connected:
+            raise XBloomError("not connected")
+        await self._client.write_gatt_char(
+            CHAR_COMMAND, build_recipe_start_quit(), response=False
+        )
 
     async def save_slots(
         self,

@@ -10,11 +10,13 @@ telemetry flows run headless and deterministically.
 from __future__ import annotations
 
 import asyncio
+import struct
 
 import pytest
 
 from xbloom_ble.client import CHAR_STATUS, XBloomClient, XBloomError, scan
 from xbloom_ble.recipe import Recipe
+from xbloom_ble.tea import TeaRecipe
 
 # ── real-shape frames (0x57 status = 580207571f10000000c1<state>000000<crc>) ──
 ARMED = "580207571f10000000c11f000000ce5e"       # 0x1f
@@ -28,12 +30,36 @@ ACK_42 = "580207421f0c000000c1c5c2"              # commit echo
 WATER35 = "5802074b9e10000000c100b8084759b4"     # 0x4b water 35.0 g
 COFFEE12 = "580207155010000000c19eef4141ceba"    # 0x15 coffee 12.12 g
 
+
+def _command_notification(command: int, payload: bytes = b"") -> str:
+    body = (
+        bytes.fromhex("580207")
+        + struct.pack("<H", command)
+        + struct.pack("<I", 12 + len(payload))
+        + b"\xc1"
+        + payload
+        + b"\x00\x00"
+    )
+    return body.hex()
+
+
+def _water_volume_notification(ml: float) -> str:
+    return _command_notification(40523, struct.pack("<f", float(ml) * 1000.0))
+
 RECIPE = Recipe.from_dict({
     "name": "T", "dose_g": 16, "grind": 55, "ratio": 15,
     "pours": [{"ml": 40, "temp_c": 92, "pattern": "spiral", "pause_s": 30,
                "rpm": 100, "flow_ml_s": 3.0},
               {"ml": 200, "temp_c": 92, "pattern": "spiral", "pause_s": 5,
                "rpm": 100, "flow_ml_s": 3.0}],
+})
+
+TEA_RECIPE = TeaRecipe.from_dict({
+    "name": "Green", "kind": "tea", "leaf_g": 4, "output_ml_per_steep": 120,
+    "pours": [
+        {"ml": 90, "temp_c": 85, "pattern": "ring", "pause_s": 20, "flow_ml_s": 3.5},
+        {"ml": 90, "temp_c": 85, "pattern": "center", "pause_s": 15, "flow_ml_s": 3.5},
+    ],
 })
 
 
@@ -58,6 +84,7 @@ class FakeBleak:
             0x42: [ACK_42, STARTING],  # commit -> acts (grinding)
             0xF7: [IDLE],             # set-mode -> idle (PRO ready / back to AUTO)
         }
+        self.script_full: dict[int, list[str]] = {}
 
     async def connect(self):
         self.is_connected = True
@@ -82,6 +109,9 @@ class FakeBleak:
         data = bytes(data)
         self.writes.append(data)
         cmd = data[3]
+        command = int.from_bytes(data[3:5], "little")
+        for hx in self.script_full.get(command, []):
+            self._push(hx)
         for hx in self.script.get(cmd, []):
             self._push(hx)
         if cmd == 0xF6:  # a slot write; the machine stores after the full trio
@@ -92,6 +122,10 @@ class FakeBleak:
 
 def _cmds(fake: FakeBleak) -> list[int]:
     return [w[3] for w in fake.writes]
+
+
+def _commands(fake: FakeBleak) -> list[int]:
+    return [int.from_bytes(w[3:5], "little") for w in fake.writes]
 
 
 def _client(fake: FakeBleak) -> XBloomClient:
@@ -211,6 +245,84 @@ def test_cancel_sends_0x47():
     c = _client(fake)
     run(c.cancel_brew())
     assert _cmds(fake) == [0x47]
+
+
+# ── FreeSolo scale / grinder / brewer & dedicated tea path ────────────────
+def test_scale_stream_tares_reads_and_always_exits():
+    fake = FakeBleak()
+    fake.script_full[8003] = [COFFEE12]
+    c = _client(fake)
+    events = []
+    run(c.stream_scale(events.append, duration=0.1, tare=True))
+    commands = _commands(fake)
+    assert commands[:2] == [8003, 8500]
+    assert commands[-1] == 8014
+    assert any(event.scale_g == 12.12 for event in events)
+
+
+def test_grinder_stops_and_quits_after_timed_run():
+    fake = FakeBleak()
+    fake.script_full[8006] = [_command_notification(8006)]
+    fake.script_full[3500] = [_command_notification(3500)]
+    fake.script_full[3505] = [_command_notification(3505)]
+    c = _client(fake)
+    run(c.grind(62, 100, seconds=0.1))
+    assert _commands(fake) == [8006, 3500, 3505, 8012]
+
+
+def test_grinder_cleanup_runs_when_cancelled():
+    fake = FakeBleak()
+    fake.script_full[8006] = [_command_notification(8006)]
+    fake.script_full[3500] = [_command_notification(3500)]
+    fake.script_full[3505] = [_command_notification(3505)]
+    c = _client(fake)
+
+    async def go():
+        task = asyncio.create_task(c.grind(62, 100, seconds=5))
+        await asyncio.sleep(0.4)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    run(go())
+    assert _commands(fake) == [8006, 3500, 3505, 8012]
+
+
+def test_water_waits_for_completion_then_quits_without_forced_stop():
+    fake = FakeBleak()
+    fake.script_full[4506] = [
+        _water_volume_notification(120),
+        _command_notification(40511),
+    ]
+    c = _client(fake)
+    event = run(c.dispense_water(120, 85, timeout=5))
+    assert event.command_code == 40511
+    assert event.water_g == 120
+    assert _commands(fake) == [8007, 4506, 8013]
+
+
+def test_water_early_stop_is_failure_and_forces_cleanup():
+    fake = FakeBleak()
+    fake.script_full[4506] = [
+        _water_volume_notification(50),
+        _command_notification(40511),
+    ]
+    c = _client(fake)
+    with pytest.raises(XBloomError, match="stopped early"):
+        run(c.dispense_water(120, 85, timeout=5))
+    assert _commands(fake) == [8007, 4506, 4507, 8013]
+
+
+def test_tea_load_never_executes_then_start_is_separate():
+    fake = FakeBleak()
+    fake.script_full[8104] = [_command_notification(8104)]
+    fake.script_full[4513] = [_command_notification(4513)]
+    fake.script_full[4512] = [_command_notification(4512)]
+    c = _client(fake)
+    run(c.load_tea_recipe(TEA_RECIPE, settle=0))
+    assert _commands(fake) == [8100, 8022, 8104, 4513]
+    run(c.start_tea())
+    assert _commands(fake) == [8100, 8022, 8104, 4513, 4512]
 
 
 # ── save-slots (never brews) ───────────────────────────────────────────────

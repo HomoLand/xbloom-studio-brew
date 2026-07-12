@@ -23,10 +23,18 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 STATE_DIR = Path(os.environ.get("XBLOOM_SKILL_STATE_DIR", Path.home() / ".xbloom-studio-brew"))
 STATE_FILE = STATE_DIR / "armed-state.json"
+TEA_STATE_FILE = STATE_DIR / "tea-loaded-state.json"
+GRINDER_STATE_FILE = STATE_DIR / "grinder-rest-state.json"
 REMOTE_START_ENV = "XBLOOM_ENABLE_REMOTE_START"
 REMOTE_START_SENTINEL = "I_UNDERSTAND_REMOTE_HOT_WATER"
+REMOTE_GRINDER_ENV = "XBLOOM_ENABLE_REMOTE_GRINDER"
+REMOTE_GRINDER_SENTINEL = "I_UNDERSTAND_REMOTE_GRINDER"
 READY_SENTINEL = "cup-filter-water-beans"
+WATER_READY_SENTINEL = "vessel-water-clear"
+GRINDER_READY_SENTINEL = "beans-cup-clear"
+TEA_READY_SENTINEL = "tea-brewer-water-cup-clear"
 ARM_MAX_AGE_SECONDS = 300
+GRINDER_REST_SECONDS = 60
 FIRMWARE_RE = re.compile(rb"V\d+(?:\.\d+[A-Za-z]?)+")
 SUPPORTED_FIRMWARE = frozenset({"V12.0D.500"})
 UNTESTED_FIRMWARE_ENV = "XBLOOM_ALLOW_UNTESTED_FIRMWARE"
@@ -68,28 +76,65 @@ def require_runtime() -> None:
         raise RuntimeError("BLE runtime missing; run: python scripts/bootstrap.py")
 
 
-def state_write(data: dict[str, Any]) -> None:
+def state_write(data: dict[str, Any], path: Path = STATE_FILE) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    temp = STATE_FILE.with_suffix(".tmp")
+    temp = path.with_suffix(".tmp")
     temp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    temp.replace(STATE_FILE)
+    temp.replace(path)
 
 
-def state_read() -> dict[str, Any]:
+def state_read(path: Path = STATE_FILE) -> dict[str, Any]:
     try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
-        raise RuntimeError("no valid armed-state record; load the recipe again") from exc
+        raise RuntimeError(f"no valid state record at {path}") from exc
     if not isinstance(data, dict):
-        raise RuntimeError("armed-state record is invalid")
+        raise RuntimeError(f"state record at {path} is invalid")
     return data
 
 
-def state_clear() -> None:
+def state_clear(path: Path = STATE_FILE) -> None:
     try:
-        STATE_FILE.unlink()
+        path.unlink()
     except FileNotFoundError:
         pass
+
+
+def ensure_no_loaded_workflow() -> None:
+    active = [path.name for path in (STATE_FILE, TEA_STATE_FILE) if path.exists()]
+    if active:
+        raise RuntimeError(
+            f"a loaded recipe record exists ({', '.join(active)}); cancel before changing modes"
+        )
+
+
+def require_grinder_rest() -> None:
+    if not GRINDER_STATE_FILE.exists():
+        return
+    try:
+        data = state_read(GRINDER_STATE_FILE)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "grinder rest record is unreadable; do not grind until an owner inspects it"
+        ) from exc
+    remaining = float(data.get("blocked_until", 0)) - time.time()
+    if remaining > 0:
+        raise RuntimeError(
+            f"grinder rest interval active; wait {int(remaining + 0.999)} more seconds"
+        )
+
+
+def reserve_grinder_rest(seconds: float) -> None:
+    # Reserve before sending START. If the process is killed and cannot write a
+    # completion timestamp, the conservative block still covers runtime + rest.
+    state_write(
+        {
+            "reserved_at": time.time(),
+            "runtime_s": float(seconds),
+            "blocked_until": time.time() + float(seconds) + GRINDER_REST_SECONDS,
+        },
+        GRINDER_STATE_FILE,
+    )
 
 
 async def resolve_address(explicit: str | None, timeout: float) -> tuple[str, str]:
@@ -185,6 +230,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "bleak": importlib.util.find_spec("bleak") is not None,
         "pyyaml": importlib.util.find_spec("yaml") is not None,
         "vendored_protocol": (ROOT / "scripts" / "xbloom_ble" / "protocol.py").exists(),
+        "capabilities": {
+            "coffee_recipe": True,
+            "tea_recipe": (ROOT / "scripts" / "xbloom_ble" / "tea.py").exists(),
+            "scale": True,
+            "grinder": True,
+            "temperature_water": True,
+        },
+        "physical_actions_enabled": {
+            "hot_water": os.environ.get(REMOTE_START_ENV) == REMOTE_START_SENTINEL,
+            "grinder": os.environ.get(REMOTE_GRINDER_ENV) == REMOTE_GRINDER_SENTINEL,
+        },
     }
     if args.scan and runtime_ready():
         from xbloom_ble.client import scan
@@ -214,8 +270,8 @@ async def async_scan(args: argparse.Namespace) -> int:
 
 
 async def async_probe(args: argparse.Namespace) -> int:
-    if STATE_FILE.exists():
-        raise RuntimeError("an armed-state record exists; use monitor or cancel, not probe")
+    if STATE_FILE.exists() or TEA_STATE_FILE.exists():
+        raise RuntimeError("a loaded-recipe record exists; use monitor or cancel, not probe")
     address, name = await resolve_address(args.address, args.scan_timeout)
     report = await inspect_machine(address)
     emit({"command": "probe", "machine": name, **report})
@@ -232,8 +288,7 @@ async def async_load(args: argparse.Namespace) -> int:
     from xbloom_ble.client import XBloomClient
 
     path, recipe, summary = load_recipe(args.recipe)
-    if STATE_FILE.exists():
-        raise RuntimeError("an armed-state record already exists; cancel before loading another recipe")
+    ensure_no_loaded_workflow()
     address, name = await resolve_address(args.address, args.scan_timeout)
     preflight = await inspect_machine(address)
     firmware = require_write_preflight(preflight)
@@ -287,6 +342,8 @@ async def monitor_client(client: Any, duration: float) -> None:
             data["water_g"] = event.water_g
         if event.coffee_g is not None:
             data["coffee_g"] = event.coffee_g
+        if event.scale_g is not None:
+            data["scale_g"] = event.scale_g
         emit(data)
         if saw_active and event.state in terminal_states:
             raise _MonitorComplete()
@@ -300,10 +357,249 @@ async def monitor_client(client: Any, duration: float) -> None:
 async def async_monitor(args: argparse.Namespace) -> int:
     from xbloom_ble.client import XBloomClient
 
+    if not 0.1 <= float(args.duration) <= 3600:
+        raise RuntimeError("monitor --duration must be 0.1-3600 seconds")
     address, name = await resolve_address(args.address, args.scan_timeout)
     emit({"command": "monitor", "status": "listening", "machine": name})
     async with XBloomClient(address) as client:
         await monitor_client(client, args.duration)
+    return 0
+
+
+async def async_scale(args: argparse.Namespace) -> int:
+    """Use the Studio as a standalone electronic scale; no motor or water."""
+    from xbloom_ble.client import XBloomClient
+
+    if not 0.05 <= float(args.interval) <= 10.0:
+        raise RuntimeError("scale --interval must be 0.05-10 seconds")
+    if not 0.1 <= float(args.duration) <= 3600:
+        raise RuntimeError("scale --duration must be 0.1-3600 seconds")
+    ensure_no_loaded_workflow()
+    address, name = await resolve_address(args.address, args.scan_timeout)
+    preflight = await inspect_machine(address)
+    firmware = require_write_preflight(preflight)
+    emit(
+        {
+            "command": "scale",
+            "status": "listening",
+            "machine": name,
+            "firmware": firmware,
+            "tare_sent": bool(args.tare),
+        }
+    )
+    last_emit = 0.0
+
+    def on_weight(event: Any) -> None:
+        nonlocal last_emit
+        now = time.monotonic()
+        if now - last_emit < args.interval:
+            return
+        last_emit = now
+        emit(
+            {
+                "command": "scale-reading",
+                "time": round(time.time(), 3),
+                "grams": event.scale_g,
+            }
+        )
+
+    async with XBloomClient(address) as client:
+        await client.stream_scale(on_weight, duration=args.duration, tare=args.tare)
+    emit({"command": "scale", "status": "exited", "machine": name})
+    return 0
+
+
+async def async_grind(args: argparse.Namespace) -> int:
+    from xbloom_ble.client import XBloomClient
+
+    if os.environ.get(REMOTE_GRINDER_ENV) != REMOTE_GRINDER_SENTINEL:
+        raise RuntimeError(
+            f"remote grinder disabled; administrator must set "
+            f"{REMOTE_GRINDER_ENV}={REMOTE_GRINDER_SENTINEL}"
+        )
+    if args.confirm_ready != GRINDER_READY_SENTINEL:
+        raise RuntimeError(f"--confirm-ready must equal {GRINDER_READY_SENTINEL}")
+    if not 1 <= int(args.size) <= 80:
+        raise RuntimeError("grind --size must be 1-80")
+    if not 60 <= int(args.rpm) <= 120:
+        raise RuntimeError("grind --rpm must be 60-120")
+    if not 0.1 <= float(args.seconds) <= 30.0:
+        raise RuntimeError("grind --seconds must be 0.1-30")
+    ensure_no_loaded_workflow()
+    require_grinder_rest()
+    address, name = await resolve_address(args.address, args.scan_timeout)
+    preflight = await inspect_machine(address)
+    firmware = require_write_preflight(preflight)
+    reserve_grinder_rest(args.seconds)
+    async with XBloomClient(address) as client:
+        stop_ack = await client.grind(args.size, args.rpm, seconds=args.seconds)
+    emit(
+        {
+            "command": "grind",
+            "status": "stopped",
+            "machine": name,
+            "firmware": firmware,
+            "size": args.size,
+            "rpm": args.rpm,
+            "seconds": args.seconds,
+            "rest_seconds": GRINDER_REST_SECONDS,
+            "verified_stop_command": (
+                f"0x{stop_ack.command_code:04x}"
+                if stop_ack.command_code is not None
+                else None
+            ),
+        }
+    )
+    return 0
+
+
+async def async_water(args: argparse.Namespace) -> int:
+    from xbloom_ble.client import XBloomClient
+
+    if os.environ.get(REMOTE_START_ENV) != REMOTE_START_SENTINEL:
+        raise RuntimeError(
+            f"hot-water actions disabled; administrator must set "
+            f"{REMOTE_START_ENV}={REMOTE_START_SENTINEL}"
+        )
+    if args.confirm_ready != WATER_READY_SENTINEL:
+        raise RuntimeError(f"--confirm-ready must equal {WATER_READY_SENTINEL}")
+    if not 20 <= float(args.volume) <= 360:
+        raise RuntimeError("water --volume must be 20-360 ml")
+    if not 40 <= int(args.temp) <= 98:
+        raise RuntimeError("water --temp must be 40-98 C")
+    flow10 = round(float(args.flow) * 10)
+    if flow10 not in range(30, 36) or abs(flow10 / 10 - float(args.flow)) > 1e-6:
+        raise RuntimeError("water --flow must be 3.0-3.5 ml/s in 0.1 steps")
+    if args.timeout is not None and not 5 <= float(args.timeout) <= 600:
+        raise RuntimeError("water --timeout must be 5-600 seconds")
+    ensure_no_loaded_workflow()
+    address, name = await resolve_address(args.address, args.scan_timeout)
+    preflight = await inspect_machine(address)
+    firmware = require_write_preflight(preflight)
+    async with XBloomClient(address) as client:
+        event = await client.dispense_water(
+            args.volume,
+            args.temp,
+            flow_ml_s=args.flow,
+            pattern=args.pattern,
+            timeout=args.timeout,
+        )
+    emit(
+        {
+            "command": "water",
+            "status": "complete",
+            "verified_by_command": (
+                f"0x{event.command_code:04x}" if event.command_code is not None else None
+            ),
+            "machine": name,
+            "firmware": firmware,
+            "volume_ml": args.volume,
+            "metered_volume_ml": event.water_g,
+            "temp_c": args.temp,
+            "flow_ml_s": args.flow,
+            "pattern": args.pattern,
+        }
+    )
+    return 0
+
+
+def load_tea_recipe(path: str | Path):
+    from xbloom_ble.tea import TeaRecipe
+    from xbloom_safety import recipe_sha256
+
+    resolved = Path(path).expanduser().resolve(strict=True)
+    recipe = TeaRecipe.from_yaml(resolved)
+    summary = recipe.summary()
+    summary["recipe_sha256"] = recipe_sha256(resolved)
+    return resolved, recipe, summary
+
+
+def cmd_tea_validate(args: argparse.Namespace) -> int:
+    path, _recipe, summary = load_tea_recipe(args.recipe)
+    emit({"command": "tea-validate", "ok": True, "path": str(path), **summary})
+    return 0
+
+
+async def async_tea_load(args: argparse.Namespace) -> int:
+    from xbloom_ble.client import XBloomClient
+
+    path, recipe, summary = load_tea_recipe(args.recipe)
+    ensure_no_loaded_workflow()
+    address, name = await resolve_address(args.address, args.scan_timeout)
+    preflight = await inspect_machine(address)
+    firmware = require_write_preflight(preflight)
+    async with XBloomClient(address) as client:
+        ack = await client.load_tea_recipe(recipe)
+    state_write(
+        {
+            "address": address,
+            "machine": name,
+            "recipe_path": str(path),
+            "recipe_sha256": summary["recipe_sha256"],
+            "loaded_at": time.time(),
+            "status": "tea_loaded",
+            "firmware": firmware,
+        },
+        TEA_STATE_FILE,
+    )
+    emit(
+        {
+            "command": "tea-load",
+            "status": "tea_loaded",
+            "machine": name,
+            "firmware": firmware,
+            "verified_by_command": (
+                f"0x{ack.command_code:04x}" if ack.command_code is not None else None
+            ),
+            "remote_start_sent": False,
+            **summary,
+        }
+    )
+    return 0
+
+
+async def async_tea_start(args: argparse.Namespace) -> int:
+    from xbloom_ble.client import XBloomClient
+    from xbloom_safety import recipe_sha256
+
+    if os.environ.get(REMOTE_START_ENV) != REMOTE_START_SENTINEL:
+        raise RuntimeError(
+            f"hot-water actions disabled; administrator must set "
+            f"{REMOTE_START_ENV}={REMOTE_START_SENTINEL}"
+        )
+    if args.confirm_ready != TEA_READY_SENTINEL:
+        raise RuntimeError(f"--confirm-ready must equal {TEA_READY_SENTINEL}")
+    if not 1 <= float(args.duration) <= 3600:
+        raise RuntimeError("tea-start --duration must be 1-3600 seconds")
+    path, _recipe, summary = load_tea_recipe(args.recipe)
+    state = state_read(TEA_STATE_FILE)
+    age = time.time() - float(state.get("loaded_at", 0))
+    if age < 0 or age > ARM_MAX_AGE_SECONDS:
+        raise RuntimeError("loaded tea state is older than 5 minutes; load the recipe again")
+    if state.get("recipe_sha256") != recipe_sha256(path):
+        raise RuntimeError("tea recipe changed since it was loaded")
+    if state.get("status") != "tea_loaded":
+        raise RuntimeError("tea state record is not loaded; load the recipe again")
+    address = str(state.get("address") or "")
+    if not address:
+        raise RuntimeError("loaded tea state has no machine address")
+    if args.address and args.address != address:
+        raise RuntimeError("requested machine differs from the loaded tea machine")
+
+    async with XBloomClient(address) as client:
+        ack = await client.start_tea()
+        emit(
+            {
+                "command": "tea-start",
+                "status": "start_accepted",
+                "verified_by_command": (
+                    f"0x{ack.command_code:04x}" if ack.command_code is not None else None
+                ),
+                "recipe_sha256": summary["recipe_sha256"],
+            }
+        )
+        await monitor_client(client, args.duration)
+    state_clear(TEA_STATE_FILE)
     return 0
 
 
@@ -313,9 +609,21 @@ async def async_cancel(args: argparse.Namespace) -> int:
     address, name = await resolve_address(args.address, args.scan_timeout)
     async with XBloomClient(address) as client:
         await client.cancel_brew()
+        if TEA_STATE_FILE.exists():
+            await asyncio.sleep(0.2)
+            await client.unload_tea_recipe()
         await asyncio.sleep(0.5)
     state_clear()
-    emit({"command": "cancel", "status": "cancel_sent", "machine": name})
+    state_clear(TEA_STATE_FILE)
+    emit(
+        {
+            "command": "cancel",
+            "status": "cancel_sent",
+            "machine": name,
+            "coffee_state_cleared": True,
+            "tea_state_cleared": True,
+        }
+    )
     return 0
 
 
@@ -329,6 +637,8 @@ async def async_start(args: argparse.Namespace) -> int:
         )
     if args.confirm_ready != READY_SENTINEL:
         raise RuntimeError(f"--confirm-ready must equal {READY_SENTINEL}")
+    if not 1 <= float(args.duration) <= 3600:
+        raise RuntimeError("start --duration must be 1-3600 seconds")
     path, _recipe, summary = load_recipe(args.recipe)
     state = state_read()
     age = time.time() - float(state.get("loaded_at", 0))
@@ -363,8 +673,7 @@ async def async_save_slots(args: argparse.Namespace) -> int:
     from xbloom_ble.client import XBloomClient
 
     loaded = [load_recipe(path) for path in args.recipes]
-    if STATE_FILE.exists():
-        raise RuntimeError("an armed-state record exists; cancel before writing preset slots")
+    ensure_no_loaded_workflow()
     address, name = await resolve_address(args.address, args.scan_timeout)
     preflight = await inspect_machine(address)
     firmware = require_write_preflight(preflight)
@@ -399,6 +708,30 @@ def build_parser() -> argparse.ArgumentParser:
     load.add_argument("recipe")
     monitor = sub.add_parser("monitor", help="stream status/weights without starting")
     monitor.add_argument("--duration", type=float, default=300.0)
+    scale = sub.add_parser("scale", help="standalone electronic scale; optionally tare")
+    scale.add_argument("--duration", type=float, default=30.0)
+    scale.add_argument("--interval", type=float, default=0.25, help="minimum seconds between JSON readings")
+    scale.add_argument("--tare", action="store_true", help="explicitly tare after entering scale mode")
+    grind = sub.add_parser("grind", help="explicitly gated standalone grinder")
+    grind.add_argument("--size", type=int, required=True, help="grind setting 1-80")
+    grind.add_argument("--rpm", type=int, default=100, help="60-120 RPM")
+    grind.add_argument("--seconds", type=float, required=True, help="0.1-30 seconds")
+    grind.add_argument("--confirm-ready", default="")
+    water = sub.add_parser("water", help="explicitly gated temperature/volume water dispense")
+    water.add_argument("--volume", type=float, required=True, help="20-360 ml")
+    water.add_argument("--temp", type=int, required=True, help="40-98 C")
+    water.add_argument("--flow", type=float, default=3.5, help="3.0-3.5 ml/s")
+    water.add_argument("--pattern", choices=("center", "spiral", "ring"), default="center")
+    water.add_argument("--timeout", type=float, default=None, help="completion timeout (5-600 s)")
+    water.add_argument("--confirm-ready", default="")
+    tea_validate = sub.add_parser("tea-validate", help="strictly validate an Omni Tea Brewer recipe")
+    tea_validate.add_argument("recipe")
+    tea_load = sub.add_parser("tea-load", help="upload a tea recipe; never starts it")
+    tea_load.add_argument("recipe")
+    tea_start = sub.add_parser("tea-start", help="explicitly gated tea recipe execution")
+    tea_start.add_argument("recipe")
+    tea_start.add_argument("--confirm-ready", default="")
+    tea_start.add_argument("--duration", type=float, default=600.0)
     sub.add_parser("cancel", help="cancel/exit an armed or running brew")
     start = sub.add_parser("start", help="explicitly gated remote start")
     start.add_argument("recipe")
@@ -426,6 +759,18 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(async_load(args))
         if args.command == "monitor":
             return asyncio.run(async_monitor(args))
+        if args.command == "scale":
+            return asyncio.run(async_scale(args))
+        if args.command == "grind":
+            return asyncio.run(async_grind(args))
+        if args.command == "water":
+            return asyncio.run(async_water(args))
+        if args.command == "tea-validate":
+            return cmd_tea_validate(args)
+        if args.command == "tea-load":
+            return asyncio.run(async_tea_load(args))
+        if args.command == "tea-start":
+            return asyncio.run(async_tea_start(args))
         if args.command == "cancel":
             return asyncio.run(async_cancel(args))
         if args.command == "start":

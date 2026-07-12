@@ -11,6 +11,7 @@ Search when at least one condition holds:
 - Critical bean metadata is missing but the product identity is searchable.
 - The user asks for recipes from baristas, cafes, roasters, champions, or the xBloom community.
 - A direct xBloom recipe or recipe-card equivalent may exist.
+- The coffee is an xPod, or the user has its NFC Recipe Card/package.
 
 Skip research when the bean is generic, the user asks for a quick/offline answer, or no web tool is
 available. State that the result uses the bundled offline model.
@@ -29,6 +30,19 @@ Prefer sources in this order:
 Prefer the original publisher over reposts, search summaries, aggregators, and retailer copies.
 Do not call someone a champion or expert unless a first-party or competition source supports it.
 Never bypass logins, paywalls, app authentication, or private recipe cards.
+
+## Classify the source device
+
+Every published reference must carry one of these classes before adaptation:
+
+- **xPod-native:** recipe intended for xBloom's pre-portioned xPod brewer/pod geometry.
+- **Omni-native:** recipe intended for loose beans in an Omni Dripper.
+- **Tea-native:** recipe intended for the Omni Tea Brewer siphon accessory.
+- **Manual flat-bottom:** manual recipe whose bed geometry is directionally similar to Omni.
+- **Manual cone:** method inspiration only; do not copy its pours mechanically.
+
+Do not collapse xPod-native and Omni-native into a generic "xBloom recipe". The same machine can
+execute both, but pod/dripper geometry and coffee preparation differ.
 
 ## Verify and extract
 
@@ -49,6 +63,9 @@ Do not invent missing parameters. Quote sparingly; summarize the method and cite
 
 - **Native xBloom:** preserve the source intent, then apply the guarded schema and explain any
   values changed for safety or current firmware.
+- **xPod-native:** treat the original roaster recipe as high-value first-party evidence for
+  temperature, ratio, pour intent, flavor target, and dial-in direction, but do not run it unchanged
+  on Omni. Rebuild it conservatively for the Omni bed and label the result an adaptation.
 - **Flat-bottom manual:** treat as a medium-confidence adaptation. Map pulse structure, ratio, and
   temperature; derive xBloom grind/RPM conservatively.
 - **Cone brewer:** treat as flavor/method inspiration only. Rebuild pours for the Omni's flat bed
@@ -58,6 +75,19 @@ Do not invent missing parameters. Quote sparingly; summarize the method and cite
 
 Every adapted file must pass `scripts/xbloom.py validate`. A public recipe never overrides firmware,
 hot-water, state, or opcode safety gates.
+
+## xPod and NFC Recipe Cards
+
+xPod is valuable reference data when it is the exact coffee: the bag/card represents xBloom and the
+roaster's intended recipe rather than a generic model guess. xBloom states that current bags use one
+NFC Recipe Card per bag (older individual xPods carried NFC). Use the printed/app-visible recipe and
+flavor information when the user can provide it.
+
+Do not claim the NFC tag itself contains the full recipe. Public material confirms that tapping the
+card selects the paired recipe, but does not establish whether the NDEF payload stores all parameters
+or only an identifier resolved elsewhere. A future direct-import workflow must first capture a
+user-owned card's NDEF records and compare them with the app-visible recipe. Until then, treat NFC as
+a recipe-selection source, not a decoded executable format.
 
 ## Present choices
 

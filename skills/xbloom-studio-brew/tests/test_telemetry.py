@@ -79,7 +79,16 @@ def test_coffee_scale_decodes_grams():
     # 0x15 = coffee: float32 LE already in grams. 0x4141ef9e = 12.121 g (bloom plateau).
     ev = parse_notification("580207155010000000c19eef41410000")
     assert ev.coffee_g == 12.12
+    assert ev.scale_g == 12.12  # same 20501 report powers standalone scale mode
     assert ev.water_g is None
+
+
+def test_dedicated_scale_report_10507_decodes_grams():
+    # Full report command is 10507 = 0x290b, with float32 LE after c1.
+    ev = parse_notification("5802070b2910000000c1000048410000")  # 12.5f
+    assert ev.command_code == 10507
+    assert ev.scale_g == 12.5
+    assert ev.coffee_g is None
 
 
 def test_scale_end_of_brew_values():
@@ -104,6 +113,7 @@ def test_command_echo_is_ack():
         assert ev.state is None
         assert ev.state_name == f"ack_0x{cmd:02x}"
         assert ev.raw[3] == cmd  # this is how the client matches an ACK
+        assert ev.command_code == 0x1F00 | cmd
 
 
 # --- misc ------------------------------------------------------------------

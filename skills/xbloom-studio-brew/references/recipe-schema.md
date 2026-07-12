@@ -3,6 +3,9 @@
 Create recipes as local UTF-8 YAML or JSON files. Use the bundled templates in `assets/` and
 validate every edited recipe before any BLE write.
 
+This page defines coffee and flash-brew files. Omni Tea Brewer files use a deliberately separate
+schema and protocol; read `tea-brewing.md` and validate them with `tea-validate`.
+
 ## Top-level fields
 
 | Field | Required | Guarded meaning |

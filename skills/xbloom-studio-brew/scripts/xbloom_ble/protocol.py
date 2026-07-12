@@ -6,19 +6,22 @@ It is what lets the rest of the package talk to the machine without guessing.
 
 Frame format
 ------------
-Every command frame written to the ``ffe1`` characteristic is::
+The official app's generic J15 command frame written to ``ffe1`` is::
 
-    58 01 01 | CMD(u8) | SEQ(u8) | LEN(u16le) | 00 00 | PAYLOAD | CRC16(u16le)
+    58 01 TYPE | COMMAND(u16le) | LEN(u32le) | 01 | DATA | CRC16(u16le)
 
-* ``58 01 01`` — constant header.
-* ``CMD``      — command opcode (see below).
-* ``SEQ``      — sequence byte. The load sequence uses ``0x1f`` (31).
-* ``LEN``      — total frame length in bytes, little-endian, *including* header
-  and CRC. Stored at offset 5.
-* ``00 00``    — two constant zero bytes.
-* ``PAYLOAD``  — command-specific body.
+* ``58 01``    — constant header; ``TYPE`` is normally ``01``.
+* ``COMMAND``  — one little-endian 16-bit command identifier.
+* ``LEN``      — total frame length in bytes, little-endian, including CRC.
+* ``01``       — command payload marker.
+* ``DATA``     — command-specific raw bytes or little-endian 32-bit values.
 * ``CRC16``    — CRC-16/KERMIT over the whole frame except the last two bytes,
   stored little-endian.
+
+The original HCI port named the two command bytes ``CMD`` and ``SEQ``. Those
+legacy builder arguments remain for compatibility, but Android app analysis
+confirmed that they form one command: for example ``a4 1f`` is command 8100,
+``41 1f`` is 8001, and ``46 9e`` is 40518.
 
 CRC-16/KERMIT: polynomial ``0x1021``, init ``0``, reflected input and output,
 no final XOR.
@@ -31,14 +34,14 @@ Vendor service ``0000e0ff-3c17-d293-8e48-14fe2e4da212`` exposes:
 * ``ffe2`` — status (notify).
 * ``ffe3`` — aux.
 
-The LOAD sequence (this package's only job)
--------------------------------------------
+The coffee LOAD sequence
+------------------------
 Sent frame-by-frame, waiting for each ACK on ``ffe2``:
 
-1. ``0xa4`` — session start (constant payload ``01b900000001000000``).
-2. ``0xa6`` — dose (grams as ``u8`` at payload offset 9).
-3. ``0xa8`` — stage temps (``01`` + f32le temp1 + f32le temp2, default 110/90).
-4. ``0x41`` — pours + grind.
+1. command 8100 (legacy ``a4 1f``) — session start.
+2. command 8102 (``a6 1f``) — dose.
+3. command 8104 (``a8 1f``) — staging/cup float values.
+4. command 8001 (``41 1f``), or 8004 for no-grind — pours + grind.
 
 After these four frames the machine reports STATE ``0x1f`` (armed/loaded). At
 that point you can either approve the brew **on the machine** or start it
@@ -47,12 +50,12 @@ remotely (below), exactly like the official app.
 Starting a brew (commit / start / cancel)
 -----------------------------------------
 Loading only *arms* the machine. To start the brew remotely — the way the app
-does when you tap "Brew" — three further single-byte frames are used:
+does when you tap "Brew" — three further command frames are used:
 
-* ``0x42`` (seq ``0x1f``) — **commit**: the machine moves to ``0x1e``
+* command 8002 (legacy ``42 1f``) — **commit**: the machine moves to ``0x1e``
   (awaiting-confirm) and shows its ~99 s add-beans countdown.
-* ``0x46`` (seq ``0x9e``) — **start**: the "go" — the machine begins brewing.
-* ``0x47`` (seq ``0x9e``) — **cancel**: abort a committed/running brew.
+* command 40518 (``46 9e``) — **start**: the "go" — the machine begins brewing.
+* command 40519 (``47 9e``) — **cancel**: abort a committed/running brew.
 
 All three carry the constant one-byte payload ``01`` and were captured
 byte-for-byte from the vendor app (:func:`build_commit`, :func:`build_start`,
@@ -76,9 +79,12 @@ from collections.abc import Iterable, Mapping
 
 __all__ = [
     "PATTERN_CODES",
+    "MACHINE_PATTERN_CODES",
     "LOAD_SEQ",
     "crc16_kermit",
     "xbloom_frame",
+    "j15_frame",
+    "frame_command",
     "build_a4",
     "build_a6",
     "build_a8",
@@ -102,6 +108,37 @@ __all__ = [
     "COMMIT_OPCODE",
     "START_OPCODE",
     "CANCEL_OPCODE",
+    "CMD_SCALE_ENTER",
+    "CMD_SCALE_EXIT",
+    "CMD_SCALE_TARE",
+    "CMD_GRINDER_ENTER",
+    "CMD_GRINDER_START",
+    "CMD_GRINDER_STOP",
+    "CMD_GRINDER_QUIT",
+    "CMD_BREWER_ENTER",
+    "CMD_BREWER_START",
+    "CMD_BREWER_STOP",
+    "CMD_BREWER_QUIT",
+    "CMD_TEA_RECIPE_CODE",
+    "CMD_TEA_RECIPE_MAKE",
+    "CMD_RECIPE_START_QUIT",
+    "build_scale_enter",
+    "build_scale_exit",
+    "build_scale_tare",
+    "build_grinder_enter",
+    "build_grinder_start",
+    "build_grinder_stop",
+    "build_grinder_quit",
+    "build_brewer_enter",
+    "build_brewer_start",
+    "build_brewer_stop",
+    "build_brewer_quit",
+    "build_tea_recipe_code",
+    "build_tea_set_cup",
+    "build_tea_code_upload",
+    "build_tea_load_frames",
+    "build_tea_start",
+    "build_recipe_start_quit",
 ]
 
 # Sequence byte used for the load sequence, and for the brew (commit/start) phase.
@@ -122,6 +159,38 @@ PATTERN_CODES: dict[tuple[str, bool], tuple[int, int]] = {
     ("ring", False): (0x01, 0x00),    # ring / middle
     ("center", False): (0x00, 0x01),  # center single dot
 }
+
+# Pattern values used by the app's generic J15 commands. The app UI calls
+# ``ring`` "circular"; both names map to the same machine value.
+MACHINE_PATTERN_CODES: dict[str, int] = {
+    "center": 0,
+    "ring": 1,
+    "circular": 1,
+    "spiral": 2,
+}
+
+# Generic J15 command codes recovered from the official Android app. The two
+# bytes at offsets 3-4 are one little-endian u16 command, not semantically a
+# separate opcode and sequence. The existing load builders retain their historic
+# names because they are byte-exact and already hardware-tested.
+CMD_SCALE_ENTER = 8003
+CMD_SCALE_EXIT = 8014
+CMD_SCALE_TARE = 8500
+
+CMD_GRINDER_ENTER = 8006
+CMD_GRINDER_START = 3500
+CMD_GRINDER_STOP = 3505
+CMD_GRINDER_QUIT = 8012
+
+CMD_BREWER_ENTER = 8007
+CMD_BREWER_START = 4506
+CMD_BREWER_STOP = 4507
+CMD_BREWER_QUIT = 8013
+
+CMD_TEA_RECIPE_MAKE = 4512
+CMD_TEA_RECIPE_CODE = 4513
+CMD_RECIPE_START_QUIT = 8017
+CMD_SET_CUP = 8104
 
 
 def crc16_kermit(data: bytes) -> int:
@@ -154,6 +223,257 @@ def xbloom_frame(cmd: int, seq: int, payload: bytes) -> bytes:
     frame[5:7] = struct.pack("<H", total)
     crc = crc16_kermit(bytes(frame))
     return bytes(frame) + struct.pack("<H", crc)
+
+
+def frame_command(frame: bytes) -> int:
+    """Return the generic little-endian u16 command at frame offsets 3-4."""
+    if len(frame) < 5:
+        raise ValueError("frame is too short to contain a command")
+    return struct.unpack_from("<H", frame, 3)[0]
+
+
+def j15_frame(
+    command: int,
+    data: Iterable[int] = (),
+    *,
+    raw: bytes | None = None,
+    frame_type: int = 0x01,
+) -> bytes:
+    """Build the official app's generic J15 command frame.
+
+    Shape::
+
+        58 01 TYPE | COMMAND(u16le) | LENGTH(u32le) | 01 |
+        DATA(i32le...) or RAW | CRC16-KERMIT(u16le)
+
+    ``LENGTH`` includes the complete frame, including its CRC. ``raw`` is used
+    for opaque recipe-code bytes; integer ``data`` and ``raw`` are mutually
+    exclusive. This is a direct port of ``VerifyCodeUtils.buildCommandString``
+    from the official Android app.
+    """
+    command = int(command)
+    if not 1 <= command <= 0xFFFF:
+        raise ValueError(f"command must be 1-65535; got {command!r}")
+    values = tuple(int(value) for value in data)
+    if raw is not None and values:
+        raise ValueError("data and raw are mutually exclusive")
+    if not 0 <= int(frame_type) <= 0xFF:
+        raise ValueError("frame_type must fit one byte")
+    payload = bytes(raw) if raw is not None else b"".join(
+        struct.pack("<I", value & 0xFFFFFFFF) for value in values
+    )
+    body = bytearray(
+        b"\x58\x01"
+        + bytes([int(frame_type)])
+        + struct.pack("<H", command)
+        + b"\x00\x00\x00\x00"
+        + b"\x01"
+        + payload
+    )
+    body[5:9] = struct.pack("<I", len(body) + 2)
+    return bytes(body) + struct.pack("<H", crc16_kermit(bytes(body)))
+
+
+def _float_bits(value: float) -> int:
+    """Java ``Float.floatToIntBits`` equivalent for a finite Python float."""
+    value = float(value)
+    if value != value or value in (float("inf"), float("-inf")):
+        raise ValueError("float command values must be finite")
+    return struct.unpack("<I", struct.pack("<f", value))[0]
+
+
+def _machine_pattern(pattern: str) -> int:
+    try:
+        return MACHINE_PATTERN_CODES[str(pattern).strip().lower()]
+    except KeyError as exc:
+        raise ValueError(
+            f"pattern must be one of {sorted(MACHINE_PATTERN_CODES)}; got {pattern!r}"
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# FreeSolo scale / grinder / brewer commands
+# ---------------------------------------------------------------------------
+def build_scale_enter() -> bytes:
+    return j15_frame(CMD_SCALE_ENTER)
+
+
+def build_scale_exit() -> bytes:
+    return j15_frame(CMD_SCALE_EXIT)
+
+
+def build_scale_tare() -> bytes:
+    return j15_frame(CMD_SCALE_TARE)
+
+
+def build_grinder_enter(grind: int, rpm: int) -> bytes:
+    return j15_frame(CMD_GRINDER_ENTER, [int(grind), int(rpm)])
+
+
+def build_grinder_start(grind: int, rpm: int) -> bytes:
+    # The leading 1000 is the constant used by GrinderActivity in the app.
+    return j15_frame(CMD_GRINDER_START, [1000, int(grind), int(rpm)])
+
+
+def build_grinder_stop() -> bytes:
+    return j15_frame(CMD_GRINDER_STOP)
+
+
+def build_grinder_quit() -> bytes:
+    return j15_frame(CMD_GRINDER_QUIT)
+
+
+def build_brewer_enter(temp_c: int, pattern: str = "center") -> bytes:
+    # HomeActivity passes pattern first, then Float.floatToIntBits(temp*10).
+    return j15_frame(
+        CMD_BREWER_ENTER,
+        [_machine_pattern(pattern), _float_bits(int(temp_c) * 10.0)],
+    )
+
+
+def build_brewer_start(
+    volume_ml: float,
+    temp_c: int,
+    flow_ml_s: float = 3.5,
+    pattern: str = "center",
+    *,
+    water_feed: int = 0,
+) -> bytes:
+    """Start a volume-limited FreeSolo water dispense.
+
+    BrewerActivity encodes flow, volume, and temperature as Java float bit
+    patterns after multiplying each by ten, followed by the configured water
+    source and machine pattern.
+    """
+    return j15_frame(
+        CMD_BREWER_START,
+        [
+            _float_bits(float(flow_ml_s) * 10.0),
+            _float_bits(float(volume_ml) * 10.0),
+            _float_bits(int(temp_c) * 10.0),
+            int(water_feed),
+            _machine_pattern(pattern),
+        ],
+    )
+
+
+def build_brewer_stop() -> bytes:
+    return j15_frame(CMD_BREWER_STOP)
+
+
+def build_brewer_quit() -> bytes:
+    return j15_frame(CMD_BREWER_QUIT)
+
+
+# ---------------------------------------------------------------------------
+# Omni Tea Brewer commands and recipe-code port
+# ---------------------------------------------------------------------------
+def _tea_pause_bytes(seconds: int) -> tuple[int, int]:
+    """Port the app's native ``TeaRecipeCreate`` pause rewrite.
+
+    Pauses are split into a negative remainder byte and a five-bit minute count
+    in the second byte: 20 s -> ``ec 00``; 60 s -> ``00 20``; 120 s ->
+    ``00 40``. The official UI caps tea pauses at 120 seconds even though the
+    native routine accepts up to 360.
+    """
+    seconds = int(seconds)
+    if not 0 <= seconds <= 120:
+        raise ValueError(f"tea pause must be 0-120 seconds; got {seconds}")
+    minutes, remainder = divmod(seconds, 60)
+    return ((-remainder) & 0xFF, (minutes * 32) & 0xFF)
+
+
+def build_tea_recipe_code(
+    pours: Iterable[Mapping],
+    *,
+    grinder_size: int = 50,
+    grand_water: float = 45.0,
+    rpm: int = 120,
+) -> bytes:
+    """Build the tea recipe blob used by command 4513.
+
+    This ports the official app's Java ``GetRecipeCodeManager`` plus its native
+    ``TeaRecipeCreate`` pause transform. The seemingly coffee-oriented suffix
+    values are retained because the five official tea recipes all carry them;
+    tea mode does not run the grinder.
+    """
+    stages: list[bytes] = []
+    for index, pour in enumerate(pours):
+        ml = int(pour["ml"])
+        temp = int(pour.get("temp", pour.get("temp_c")))
+        pattern = _machine_pattern(str(pour.get("pattern", "ring")))
+        vibration = int(pour.get("vibration", 0)) & 0xFF
+        pause_lo, pause_hi = _tea_pause_bytes(
+            int(pour.get("pause", pour.get("pause_s", 0)))
+        )
+        flow10 = int(round(float(pour.get("flow", pour.get("flow_ml_s", 3.5))) * 10))
+
+        volume_parts: list[int] = []
+        remaining = ml
+        while remaining > 127:
+            volume_parts.append(127)
+            remaining -= 127
+        if remaining:
+            volume_parts.append(remaining)
+        stage = bytearray()
+        for part in volume_parts:
+            stage.extend([part & 0xFF, temp & 0xFF, pattern, vibration])
+        stage.extend(
+            [
+                pause_lo,
+                pause_hi,
+                int(rpm) & 0xFF if index == 0 else 0,
+                flow10 & 0xFF,
+            ]
+        )
+        stages.append(bytes(stage))
+
+    body = b"".join(stages)
+    if not body or len(body) > 0xFF:
+        raise ValueError("tea recipe body must contain 1-255 bytes")
+    # Java BigDecimal.byteValue truncates to the low eight bits.
+    suffix = bytes(
+        [int(grinder_size) & 0xFF, int(float(grand_water) * 10) & 0xFF]
+    )
+    return bytes([len(body)]) + body + suffix
+
+
+def build_tea_set_cup(max_mm: float = 80.0, min_mm: float = 40.0) -> bytes:
+    return j15_frame(CMD_SET_CUP, [_float_bits(max_mm), _float_bits(min_mm)])
+
+
+def build_tea_code_upload(code: bytes) -> bytes:
+    return j15_frame(CMD_TEA_RECIPE_CODE, raw=bytes(code))
+
+
+def build_tea_load_frames(recipe: Mapping) -> list[bytes]:
+    """Return tea setup + recipe upload frames; never the execute command."""
+    code = build_tea_recipe_code(
+        recipe["pours"],
+        grinder_size=int(recipe.get("grinder_size", 50)),
+        grand_water=float(recipe.get("grand_water", 45.0)),
+        rpm=int(recipe.get("rpm", 120)),
+    )
+    frames = [
+        build_tea_set_cup(
+            float(recipe.get("cup_max_mm", 80.0)),
+            float(recipe.get("cup_min_mm", 40.0)),
+        ),
+        build_tea_code_upload(code),
+    ]
+    if any(frame_command(frame) == CMD_TEA_RECIPE_MAKE for frame in frames):
+        raise AssertionError("tea load frames must never execute the recipe")
+    return frames
+
+
+def build_tea_start() -> bytes:
+    """Execute the previously uploaded tea recipe (physically dispenses hot water)."""
+    return j15_frame(CMD_TEA_RECIPE_MAKE)
+
+
+def build_recipe_start_quit() -> bytes:
+    """Exit a loaded recipe's pre-start screen without executing it."""
+    return j15_frame(CMD_RECIPE_START_QUIT)
 
 
 # ---------------------------------------------------------------------------

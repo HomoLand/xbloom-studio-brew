@@ -1,6 +1,6 @@
 ---
 name: xbloom-studio-brew
-description: Design bean-specific hot pour-over and Americano-style flash-brew recipes for xBloom Studio, research cited public recipes from roasters, cafes, and named coffee professionals, compare adaptations, validate guarded YAML, dial in by taste, and operate the machine through bundled local BLE for scan, probe, load, monitoring, cancel, presets, and explicitly gated remote start. Use when the user mentions xBloom Studio, Omni Dripper, coffee-bean recipes, iced coffee, expert recipes, C40 conversion, WAIT troubleshooting, or direct xBloom Bluetooth control.
+description: Design bean-specific hot pour-over and Americano-style flash-brew recipes for xBloom Studio, research cited roaster/cafe/xPod references, run guarded Omni Tea Brewer recipes, dial in by taste, and operate bundled local BLE for diagnostics, scale, grinder, temperature/volume water, recipe load, presets, monitoring, cancel, and explicitly gated physical starts. Use for xBloom Studio, Omni Dripper, xPod/NFC Recipe Cards, Omni Tea Brewer, coffee or tea recipes, iced coffee, C40 conversion, WAIT troubleshooting, electronic-scale readings, standalone grinding/water, or direct xBloom Bluetooth control.
 ---
 
 # xBloom Studio Brew
@@ -18,9 +18,14 @@ Classify the request before acting:
 - **Recipe only:** design, save, validate, and explain the recipe. Do not scan or connect.
 - **Research and compare:** find credible public bean/recipe sources, distinguish native xBloom
   recipes from adapted manual brews, and let the user choose before creating an executable recipe.
+- **xPod reference:** preserve roaster intent but classify it `xPod-native`; adapt explicitly before
+  using loose beans with Omni, and never assume an NFC card contains the full recipe payload.
 - **Dial-in:** inspect the previous recipe and tasted result, then change one variable.
 - **Load to machine:** validate, preflight firmware/state, and arm the recipe. Do not start it.
 - **Brew now:** load first, then require current physical-readiness confirmation before `start`.
+- **Tea:** use the dedicated tea schema and Omni Tea Brewer protocol; keep load and execute separate.
+- **Scale:** stream grams; tare only when explicitly requested and the empty vessel is ready.
+- **Standalone grinder/water:** use their specific owner gate, readiness phrase, and cleanup flow.
 - **Preset slots:** require explicit intent to overwrite all A/B/C presets.
 - **Diagnostics:** use read-only `doctor`, `scan`, `probe`, or `monitor`; use `cancel` for recovery.
 
@@ -34,7 +39,7 @@ Read `references/recipe-design.md` when creating or adjusting a recipe. Read
 
 1. Extract drink style, roast, roast date, process, origin/variety, tasting notes, water, and the
    user's flavor target. Prefer the user's target over the roaster's notes.
-2. When an exact roaster, coffee, or lot is identifiable, or the user asks for expert/public
+2. When an exact roaster, coffee, lot, or xPod is identifiable, or the user asks for expert/public
    recipes, read `references/web-enrichment.md` and search first-party public sources if web tools
    are available. If credible recipes exist, show the Skill baseline and up to two cited adaptations
    for selection. Never load an external adaptation before the user chooses it.
@@ -60,6 +65,8 @@ and drawdown behavior to adjust one variable at a time.
 ## Prepare local BLE
 
 Read `references/device-safety.md` completely before the first BLE action in a task.
+For a scale, grinder, or water request, also read `references/standalone-tools.md`. For tea, read
+`references/tea-brewing.md`.
 
 Bootstrap once per installed copy:
 
@@ -104,7 +111,7 @@ armed. To exit instead, run:
 python <skill-dir>/scripts/xbloom.py cancel
 ```
 
-## Start and monitor a brew
+## Start and monitor a coffee brew
 
 Remote start is a shipped core capability, not an add-on, but it has owner and per-brew gates.
 Never set the owner opt-in yourself. Never infer physical readiness from BLE.
@@ -124,6 +131,61 @@ python <skill-dir>/scripts/xbloom.py monitor --duration 300
 ```
 
 If anything is uncertain, cancel. Never schedule an unattended start.
+
+## Use the Omni Tea Brewer
+
+Tea requires the dedicated siphon accessory and schema; never emulate it with a coffee no-grind
+recipe. Copy the closest official template from `assets/tea-*-official.yaml` to a workspace path,
+then read `references/tea-brewing.md`, adapt one variable at a time, and validate:
+
+```text
+python <skill-dir>/scripts/xbloom.py tea-validate <tea.yaml>
+python <skill-dir>/scripts/xbloom.py tea-load <tea.yaml>
+```
+
+`tea-load` only uploads the recipe. It must report `"status": "tea_loaded"` and
+`"remote_start_sent": false`. Execute only after the owner hot-water gate is enabled and the user
+currently confirms the Omni Tea Brewer, leaves, tank, receiving vessel, and clear surroundings:
+
+```text
+python <skill-dir>/scripts/xbloom.py tea-start <same-tea.yaml> \
+  --confirm-ready tea-brewer-water-cup-clear
+```
+
+Never schedule it. Use `cancel` to exit a loaded tea recipe or recover from an unsafe operation.
+
+## Use the standalone tools
+
+Read `references/standalone-tools.md` and keep recipe states separate from FreeSolo modes.
+
+Electronic-scale reading is low risk and does not require a physical-action environment gate:
+
+```text
+python <skill-dir>/scripts/xbloom.py scale --duration 30
+```
+
+Add `--tare` only when the user explicitly requests tare and confirms the intended empty vessel is
+on the scale. Do not infer tare from a request to weigh something.
+
+The grinder is a motor action. Never set its owner opt-in yourself. After current confirmation of
+beans, receiving cup, clear chute, and clear hands, an enabled deployment may run at most 30 s:
+
+```text
+python <skill-dir>/scripts/xbloom.py grind --size 62 --rpm 100 --seconds 10 \
+  --confirm-ready beans-cup-clear
+```
+
+Respect the persisted 60-second rest lock; do not delete it to retry. Standalone water is a
+hot-water action and uses the hot-water owner gate. Require a suitable centered vessel, filled tank,
+correct water path, and clear surroundings in the current interaction:
+
+```text
+python <skill-dir>/scripts/xbloom.py water --volume 250 --temp 85 --flow 3.5 \
+  --pattern center --confirm-ready vessel-water-clear
+```
+
+Never claim a grind or dispense completed unless its command reports success. On uncertainty, use
+the machine's physical stop/cancel after the wrapper's automatic STOP/QUIT cleanup.
 
 ## Save A/B/C presets
 
@@ -146,6 +208,8 @@ as a substitute for loading one temporary recipe.
 - Unknown firmware: stop. Only the deployment owner may use the explicit override documented in
   `references/device-safety.md` after controlled validation.
 - Armed-state record exists: monitor or cancel; do not probe or load over it.
+- Tea-loaded-state record exists: execute the unchanged recipe while currently ready, or cancel.
+- Grinder cooldown active: wait for the reported remainder; never bypass the rest record.
 - `WAIT` or slow drawdown: follow the physical checks in `references/recipe-design.md`, then change
   one recipe variable.
 - Interrupted or unsafe operation: run `cancel` and use the machine's physical control if BLE fails.
@@ -155,12 +219,16 @@ as a substitute for loading one temporary recipe.
 Match the user's language. Keep the response compact but include:
 
 - Bean assumptions and flavor target.
-- Dose, hot water, ice/final water where applicable, grind, RPM, and expected time.
+- For coffee: dose, hot water, ice/final water where applicable, grind, RPM, and expected time.
+- For tea: leaf mass, each steep's programmed water/temperature/pause, expected siphon output, and
+  whether the recipe is official or adapted.
 - Every pour: ml, temperature, pattern, agitation, pause, and flow.
 - Validation result and file path.
 - Cited public sources, source brewer, original device, match quality, and every adaptation when
   web enrichment was used. Keep citations outside executable YAML.
 - Device state only if a BLE command was requested and actually run.
+- For scale/grinder/water, report the requested values and confirmed completion/exit without
+  publishing the machine identifier.
 - One taste-based next adjustment.
 
 Never say a brew started, completed, or was cancelled unless the corresponding command and machine
@@ -172,5 +240,7 @@ state support it. Distinguish `loaded/armed` from `started/brewing`.
 - Read `references/web-enrichment.md` when researching bean metadata or public expert recipes.
 - Read `references/recipe-schema.md` for the exact guarded file contract.
 - Read `references/device-safety.md` before BLE writes or remote start.
+- Read `references/standalone-tools.md` for FreeSolo scale, grinder, and brewer commands.
+- Read `references/tea-brewing.md` for tea requirements, official templates, schema, and workflow.
 - Read `references/deployment.md` for Codex/Hermes installation, publication, and environment setup.
 - Read `references/sources.md` when checking provenance or making hardware/protocol claims.

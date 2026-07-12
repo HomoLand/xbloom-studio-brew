@@ -1,4 +1,4 @@
 interface:
   display_name: "xBloom Studio Brew"
-  short_description: "Design and safely run xBloom Studio brews"
-  default_prompt: "Use $xbloom-studio-brew to create a bean-specific recipe and load it safely onto my xBloom Studio."
+  short_description: "Coffee, tea, scale, grinder, water, and guarded BLE"
+  default_prompt: "Use $xbloom-studio-brew to create or research a coffee/tea recipe, or safely use my xBloom Studio scale, grinder, brewer, and local BLE controls."

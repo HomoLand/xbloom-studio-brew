@@ -10,6 +10,7 @@ __version__ = "2.3.0"
 
 from .protocol import PATTERN_CODES, build_load_frames, crc16_kermit, xbloom_frame
 from .recipe import Pour, Recipe, RecipeError
+from .tea import TeaPour, TeaRecipe, TeaRecipeError
 from .telemetry import STATE_NAMES, StatusEvent, parse_notification
 
 __all__ = [
@@ -21,6 +22,9 @@ __all__ = [
     "Recipe",
     "Pour",
     "RecipeError",
+    "TeaRecipe",
+    "TeaPour",
+    "TeaRecipeError",
     "StatusEvent",
     "parse_notification",
     "STATE_NAMES",

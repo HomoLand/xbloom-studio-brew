@@ -10,8 +10,54 @@ project for decoded BLE behavior, and tasting feedback for recipe correction.
 - [Brewing with the Omni Dripper 2](https://tbdxsupport.zendesk.com/hc/en-us/articles/25915864027675-How-do-I-brew-my-favorite-coffee-beans-with-the-Omni-Dripper-2) — dose and dripper workflow.
 - [Settings](https://tbdxsupport.zendesk.com/hc/en-us/articles/25198572238875-Settings) — firmware display and machine controls.
 - [Iced coffee brewing methods](https://xbloom.com/blogs/news/iced-coffee-brewing-methods) — official iced/flash-brew context.
+- [Three Creative Modes](https://tbdxsupport.zendesk.com/hc/en-us/articles/25198266531355-Three-Creative-Modes)
+  — official FreeSolo scale/grinder/brewer ranges and usage.
+- [Omni Tea Brewer how-to](https://xbloom.com/blogs/news/how-to-use-omni-tea-brewer) and
+  [detailed support guide](https://tbdxsupport.zendesk.com/hc/en-us/articles/34937798170779-xBloom-Omni-Tea-Brewer-A-How-to-Guide)
+  — accessory setup, leaf guidance, manual siphon sequence, firmware/app requirements, and links to
+  xBloom's five public tea templates.
+- [Tea and brewing temperature](https://xbloom.com/blogs/news/tea-and-brewing-temperature) — broad
+  green/black/oolong/white/herbal starting ranges.
+- [Tea siphon troubleshooting](https://tbdxsupport.zendesk.com/hc/en-us/articles/37704056850459-Why-does-the-tea-brewer-siphon-trigger-too-early)
+  — leaf expansion, water adjustment, pause, scale, and movement guidance.
+- [xPod and NFC packaging history](https://xbloom.com/blogs/news/specialty-coffee-sustainability) —
+  xBloom's change from an NFC tag on every xPod to one Recipe Card per bag.
 
 Official specifications do not document the private BLE command protocol used here.
+
+## Official Android interoperability analysis
+
+FreeSolo and tea commands were independently derived for interoperability from
+[xBloom's public Android download](https://tbdprodproducts.s3.amazonaws.com/downloads/xbloom_coffee_release.apk),
+`xbloom_coffee_release.apk` (retrieved 2026-07-12, SHA-256
+`29624db558917e6a975cd58a3123c240950d200a3adc4efe8ffef222e1b14c6e`). The project does not
+redistribute the APK or decompiled sources.
+
+The port is pinned by tests for:
+
+- Generic J15 frame layout and CRC.
+- Scale enter/tare/exit and both weight-report identifiers.
+- Grinder enter/start/stop/quit arguments and cleanup ordering.
+- Brewer enter/start argument encoding and completion cleanup.
+- Tea cup setup, recipe upload, execute separation, official green-tea blob, and native minute-pause
+  transformation.
+
+These are decoded, firmware-dependent behaviors, not an official xBloom API. Scale enter/read/exit
+has also been verified on `V12.0D.500`; unattended tests do not run the grinder or hot water.
+
+## Public official tea templates
+
+xBloom's detailed support guide links the five share pages used for bundled assets:
+
+- [Green tea](https://share-h5-test-cn.xbloomcoffee.cn/?id=850qMtt0WPvyTOSvvizGlw%3D%3D)
+- [White tea](https://share-h5-test-cn.xbloomcoffee.cn/?id=FELD1GKNl68YmE7BV50nuA%3D%3D)
+- [Flower tea](https://share-h5-test-cn.xbloomcoffee.cn/?id=KDqLjy1OqB4HRuPFY9ywgQ%3D%3D)
+- [Black tea](https://share-h5-test-cn.xbloomcoffee.cn/?id=ysyArYOVGRv3I7SulAsmXA%3D%3D)
+- [Oolong tea](https://share-h5-test-cn.xbloomcoffee.cn/?id=ZjhJp8TorA3kS9dFjZWgWA%3D%3D)
+
+The public response distinguishes the 90 ml programmed stage value from the displayed 120 ml
+per-steep output. It is test/public infrastructure, so the bundled snapshot is authoritative for
+this release while future Agents should re-check the live source before claiming it is unchanged.
 
 ## Public recipe research examples
 

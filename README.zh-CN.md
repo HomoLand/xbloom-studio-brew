@@ -2,23 +2,27 @@
 
 [English](README.md)
 
-一个可移植的 Agent Skill：根据咖啡豆信息为 xBloom Studio 设计配方，并通过受控的本地
-Bluetooth LE 操作机器。
+一个可移植的 Agent Skill：为 xBloom Studio 设计咖啡/茶配方，并通过受控的本地
+Bluetooth LE 使用机器的电子秤、研磨器、冲煮器和自动配方能力。
 
 它把离线配方知识、可选的有来源网络检索、确定性配方校验和内置 BLE 控制组合在一起，
 可用于 Hermes 及其他兼容 Agent Skills 的客户端。
 
 > [!WARNING]
-> 这是非官方社区项目。BLE 协议来自逆向工程，并能控制会释放近沸水的机器。默认设备动作
-> 只装载配方；远程启动需要部署级和每次冲煮两层安全确认。
+> 这是非官方社区项目。BLE 协议来自逆向工程，能控制电机以及释放近沸水的机器。配方装载、
+> 称重与物理启动互相分离；研磨和热水动作需要部署级与当次操作两层安全确认。
 
 ## 核心能力
 
 - 根据豆子和口味目标设计热手冲与冰美式风格闪冲配方。
 - 可检索烘焙商、咖啡馆和具名咖啡从业者公开发布的方案。
+- 将精确匹配的 xPod/NFC Recipe Card 作为高价值的一方参考，但会明确适配 xPod 与 Omni
+  不同的冲煮结构，不会原样套用。
+- 内置 xBloom 公布的五套 Omni Tea Brewer 茶配方，并使用专用茶协议和校验器。
 - 同时列出保守的 Skill 基线和有引用的适配方案，交给用户选择。
 - 写入前确定性校验粉量、比例、水量、研磨、温度、流速、RPM 和 BLE opcode。
 - 支持扫描、固件探测、配方装载、遥测、取消、A/B/C 预设及受控远程启动。
+- 支持 FreeSolo 电子秤（读取/去皮）、独立研磨，以及指定温度和体积的出水。
 - 本地运行，不需要 xBloom 云端凭据或 App 账号。
 
 ## 配方如何生成
@@ -35,10 +39,19 @@ Bluetooth LE 操作机器。
 网络补全以证据为先：原烘焙商或作者发布的 xBloom 原生配方优先于人工手冲指南；平底滤杯
 方案会明确适配，锥形滤杯方案只作为风味与方法参考。输出必须显示来源、原始器具、匹配度、
 适配内容和置信度。没有可靠来源或网络工具时，回退到内置离线模型。
+原生 xPod 配方会保留烘焙商意图，但不会被默认为 Omni 原生配方。
 因此联网补全需要宿主 Agent 已配置 Web 搜索工具；本 Skill 不保存搜索凭据，而且缺少网络能力
 不会影响离线配方生成或本地 BLE 控制。
 
 详见[网络补全规则](skills/xbloom-studio-brew/references/web-enrichment.md)。
+
+Hermes 可用下面的无密钥搜索后端；若网关已运行，配置后重启网关：
+
+```text
+hermes config set web.search_backend ddgs
+```
+
+端到端验证命令见[部署说明](skills/xbloom-studio-brew/references/deployment.md)。
 
 ## 安装
 
@@ -70,17 +83,33 @@ python scripts/xbloom.py probe
 用 xbloom-studio-brew 给这包豆子做一套花果调清晰的热冲方案。
 搜索这支豆子的可靠公开配方，列出几个来源让我选，再生成 xBloom 配方。
 做一套冰美式风格闪冲，校验后装载到机器，但不要启动。
+使用官方绿茶模板，但只装载不要启动。
+读取 Studio 电子秤 10 秒，不要去皮。
 ```
 
 可执行配方保存为本地 YAML。公开资料的引用放在回复或配套说明中，不塞进机器配方字段。
 
+基础命令示例：
+
+```text
+python scripts/xbloom.py scale --duration 30
+python scripts/xbloom.py tea-validate assets/tea-green-official.yaml
+python scripts/xbloom.py tea-load assets/tea-green-official.yaml
+```
+
+`grind`、`water`、咖啡 `start` 和 `tea-start` 已内置，但在部署者启用对应安全开关前保持
+禁用。详见[独立工具说明](skills/xbloom-studio-brew/references/standalone-tools.md)与
+[茶冲煮说明](skills/xbloom-studio-brew/references/tea-brewing.md)。
+
 ## 安全模型
 
 - `load` 只发送受控装载帧并停在 `armed`，不会启动冲煮。
+- `tea-load` 只上传专用茶配方，不会执行；`scale` 会在结束或中断时退出称重模式。
 - 配方及预设写入前自动检查固件和机器状态。
 - 远程启动要求部署者开关、当次物理就绪确认、相同配方哈希与机器，以及五分钟内的 armed 状态。
 - 当前已验证固件为 `V12.0D.500`；其他固件必须由部署者显式接受兼容性风险。
 - 所有网络来源或模型生成的配方都经过同一个校验器。
+- 独立研磨单次最多 30 秒，并持久化 60 秒休息锁；普通中断时仍会尝试发送停止和退出。
 
 完整规则见[设备安全策略](skills/xbloom-studio-brew/references/device-safety.md)。
 
@@ -91,7 +120,8 @@ cd skills/xbloom-studio-brew
 python scripts/bootstrap.py --dev
 ```
 
-当前测试结果为 112 项通过、4 项硬件/平台跳过。
+当前测试结果为 138 项通过、4 项硬件/平台跳过。发布测试不会启动研磨器或释放热水；
+电子秤进入、读数和退出已在固件 `V12.0D.500` 上完成真机验证。
 
 ## 致谢
 

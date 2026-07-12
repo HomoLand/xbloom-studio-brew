@@ -1,19 +1,17 @@
 """Decode xBloom Studio status notifications (the ``ffe2`` characteristic).
 
 The machine pushes status frames to the ``ffe2`` notify characteristic. Unlike
-the *command* frames we send to ``ffe1`` (``58 01 01 | cmd | seq | len16 | 00 00
-| payload | crc``), notifications use a **distinct** frame shape (verified from
-the vendor app's HCI capture — 4658 notifications, all this format)::
+the command frames sent to ``ffe1``, notifications use a distinct envelope
+(verified from the vendor app's HCI capture)::
 
-    58 02 07 | TYPE(1) | SUB(1) | LEN(u32le) | 0xc1 | payload | CRC16(u16le)
+    58 02 07 | COMMAND/REPORT(u16le) | LEN(u32le) | 0xc1 | payload | CRC16(u16le)
 
-* ``TYPE`` (offset 3) is the frame kind:
-  - a **command echo / ACK** — ``TYPE`` equals the command byte the app just
-    wrote (``a4/a6/a8/41/42/46``), so an ACK is simply "the notification whose
-    offset-3 byte matches my command".
+The low command byte at offset 3 remains useful for the legacy coffee parser:
+  - a **command echo / ACK** carries the full command written by the app.
   - ``0x57`` — a **status** frame; the byte right after ``0xc1`` is the machine
     *state* (see table).
-  - ``0x15`` / ``0x4b`` — idle **heartbeats** (ignored).
+  - full reports 10507/20501 carry standalone scale grams; legacy ``0x15`` and
+    ``0x4b`` streams carry coffee/cup and water weights.
   - ``0x49`` — machine-info dump (serial + firmware string), ``0x39`` etc. carry
     live brew progress (best-effort, not needed for load-only).
 
@@ -91,6 +89,10 @@ STATE_NAMES: dict[int, str] = {
 # weight stream. Verified against hardware + the app's on-screen "Brew Record" graph.
 WATER_TYPE = 0x4B          # TYPE 0x4b: water weight — float32 LE in MILLIgrams (÷1000 = g)
 COFFEE_TYPE = 0x15         # TYPE 0x15: coffee/cup weight — float32 LE already in grams
+# Full little-endian command identifiers used by FreeSolo scale mode. 20501 is
+# the same stream historically exposed as ``COFFEE_TYPE``; 10507 is used by the
+# dedicated scale screen on other firmware/UI paths.
+CURRENT_WEIGHT_COMMANDS = frozenset({10507, 20501})
 # Heartbeat state sentinels (0x15/0x4b as *states*) — kept for the is_heartbeat property
 # and back-compat; the live streams above are keyed by TYPE, not state.
 IGNORED_STATES = frozenset({0x15, 0x4B})
@@ -112,10 +114,14 @@ class StatusEvent:
     state: int | None
     state_name: str
     raw: bytes
+    #: Full little-endian u16 command/report code from notification offsets 3-4.
+    command_code: int | None = None
     #: Live water weight in grams (brew-record frames only), best-effort.
     water_g: float | None = None
     #: Live coffee/extracted weight in grams (brew-record frames only).
     coffee_g: float | None = None
+    #: Standalone electronic-scale reading in grams (FreeSolo scale mode).
+    scale_g: float | None = None
 
     @property
     def is_heartbeat(self) -> bool:
@@ -131,6 +137,8 @@ class StatusEvent:
             bits.append(f"water={self.water_g:g}g")
         if self.coffee_g is not None:
             bits.append(f"coffee={self.coffee_g:g}g")
+        if self.scale_g is not None:
+            bits.append(f"scale={self.scale_g:g}g")
         return " ".join(bits)
 
 
@@ -182,7 +190,8 @@ def parse_notification(data: bytes) -> StatusEvent | None:
     if len(data) < 10 or data[0] != 0x58:
         return None
 
-    ftype = data[3]  # TYPE byte: command echo/ACK, 0x57 status, or a scale stream.
+    ftype = data[3]  # Low command byte / historic TYPE view.
+    command_code = struct.unpack_from("<H", data, 3)[0]
 
     # Live-scale streams (the two brew-record weights the app graphs). Each carries a
     # single float32 (LE) after the 0xc1 marker: 0x4b = water (milligrams), 0x15 =
@@ -190,10 +199,32 @@ def parse_notification(data: bytes) -> StatusEvent | None:
     # separate, interleaved frames). Idle/untared noise decodes to None and is dropped.
     if ftype == WATER_TYPE:
         g = _decode_scale_grams(data, scale=0.001)
-        return StatusEvent(state=None, state_name="scale", raw=data, water_g=g)
+        return StatusEvent(
+            state=None,
+            state_name="scale",
+            raw=data,
+            command_code=command_code,
+            water_g=g,
+        )
     if ftype == COFFEE_TYPE:
         g = _decode_scale_grams(data, scale=1.0)
-        return StatusEvent(state=None, state_name="scale", raw=data, coffee_g=g)
+        return StatusEvent(
+            state=None,
+            state_name="scale",
+            raw=data,
+            command_code=command_code,
+            coffee_g=g,
+            scale_g=g if command_code in CURRENT_WEIGHT_COMMANDS else None,
+        )
+    if command_code in CURRENT_WEIGHT_COMMANDS:
+        g = _decode_scale_grams(data, scale=1.0)
+        return StatusEvent(
+            state=None,
+            state_name="scale",
+            raw=data,
+            command_code=command_code,
+            scale_g=g,
+        )
 
     marker = _marker_idx(data)
     payload = data[marker + 1 : -2] if marker >= 0 else b""
@@ -202,11 +233,21 @@ def parse_notification(data: bytes) -> StatusEvent | None:
     if ftype == STATUS_CMD and payload:
         state = payload[0]
         name = STATE_NAMES.get(state, f"unknown_0x{state:02x}")
-        return StatusEvent(state=state, state_name=name, raw=data)
+        return StatusEvent(
+            state=state,
+            state_name=name,
+            raw=data,
+            command_code=command_code,
+        )
 
     # Otherwise it's a command echo / ACK (TYPE == the acked command byte) or a
     # brew-progress frame. No parsed state; the ACK is identified by data[3].
-    return StatusEvent(state=None, state_name=f"ack_0x{ftype:02x}", raw=data)
+    return StatusEvent(
+        state=None,
+        state_name=f"ack_0x{ftype:02x}",
+        raw=data,
+        command_code=command_code,
+    )
 
 
 def is_idle_or_complete(event: StatusEvent) -> bool:
