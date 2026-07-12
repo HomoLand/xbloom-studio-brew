@@ -21,8 +21,14 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: skills/xbloom-studio-brew/requirements-dev.txt
       - run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
+        working-directory: skills/xbloom-studio-brew
       - run: python -m pytest -q
+        working-directory: skills/xbloom-studio-brew
       - run: python scripts/xbloom.py doctor
+        working-directory: skills/xbloom-studio-brew
       - run: python scripts/xbloom.py validate assets/hot-template.yaml
+        working-directory: skills/xbloom-studio-brew
       - run: python scripts/xbloom.py validate assets/flash-brew-template.yaml
+        working-directory: skills/xbloom-studio-brew

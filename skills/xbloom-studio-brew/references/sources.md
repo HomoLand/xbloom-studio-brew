@@ -13,6 +13,20 @@ project for decoded BLE behavior, and tasting feedback for recipe correction.
 
 Official specifications do not document the private BLE command protocol used here.
 
+## Public recipe research examples
+
+- [xBloom Studio overview](https://xbloom.com/pages/xbloom-studio) — xBloom describes app-accessible,
+  roaster-curated recipes; availability does not mean the full parameters are public on the web.
+- [Standout Coffee: Brewing Standout Coffee on the xBloom Studio](https://www.standoutcoffee.com/blogs/news/brewing-standout-coffee-on-the-xbloom-studio-by-erik-persson)
+  — a roaster-published xBloom Studio case study crediting Erik Persson and documenting taste-led
+  grind adjustment of a Standout double-bloom starting recipe.
+- [April Coffee: Coffee info and recipes](https://www.aprilcoffeeroasters.com/pages/coffee-inf-recipes)
+  — a roaster-owned library of coffee-specific and base manual recipes. These use April/EK43
+  references and require explicit Omni/xBloom adaptation.
+
+Use these as evidence examples, not as a fixed recommendation list. Re-open the current source,
+verify the author and brewer, cite it, and label every adaptation.
+
 ## Community projects incorporated under MIT
 
 - [ryunana/xbloom-studio-recipe-skill](https://github.com/ryunana/xbloom-studio-recipe-skill), commit
@@ -40,5 +54,7 @@ See `THIRD_PARTY_NOTICES.md` and `licenses/` for attribution and license texts.
 - **Decoded behavior:** observed and implemented by the community BLE project; firmware-dependent.
 - **Guarded policy:** a deliberately stricter limit imposed by this Skill.
 - **Recipe heuristic:** a first-cup flavor hypothesis. Validate by taste and change one variable.
+- **Published reference:** a cited public recipe or case study whose original brewer and adaptation
+  must remain visible to the user.
 
 This project is independent, unofficial, and not affiliated with or endorsed by xBloom.

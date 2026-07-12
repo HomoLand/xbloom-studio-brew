@@ -26,6 +26,10 @@ adapter and is near the xBloom Studio.
 No xBloom account, cloud token, Android app credential, or internet connection is required after
 the Python dependencies are installed.
 
+Web recipe enrichment is optional and uses the host Agent's own web-search tool. Configure a web
+backend in Hermes or the target Agent when this feature is wanted; keep using the bundled offline
+recipe model when none is available. Do not store search-provider credentials inside the Skill.
+
 ## Bootstrap
 
 From the skill directory, create its isolated runtime:
@@ -50,7 +54,11 @@ Keep the directory name `xbloom-studio-brew`; it must match the `name` in `SKILL
 
 - Agent Skills clients: place the whole directory in the client's configured skills root.
 - Codex: install/copy it under `$CODEX_HOME/skills/xbloom-studio-brew` and restart or reload skills.
-- Hermes: install from the published GitHub/Skills Hub identifier, or add the repository as a tap.
+- Hermes: install the published Skill directly:
+
+```text
+hermes skills install HomoLand/xbloom-studio-brew/skills/xbloom-studio-brew
+```
 
 Hermes publishing and custom-repository commands documented by Hermes are:
 
@@ -59,9 +67,7 @@ hermes skills publish xbloom-studio-brew --to github --repo OWNER/REPOSITORY
 hermes skills tap add OWNER/REPOSITORY
 ```
 
-After publication, consumers can install the direct GitHub identifier with `hermes skills install`
-(for example `OWNER/REPOSITORY/xbloom-studio-brew` when the skill is a subdirectory). Test loading
-with:
+GitHub identifiers include the path to the Skill directory after `OWNER/REPOSITORY`. Test loading with:
 
 ```text
 hermes chat --toolsets skills -q "Use xbloom-studio-brew to validate a hot recipe"

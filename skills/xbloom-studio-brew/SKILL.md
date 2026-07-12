@@ -1,6 +1,6 @@
 ---
 name: xbloom-studio-brew
-description: Design bean-specific hot pour-over and Americano-style flash-brew recipes for xBloom Studio, validate guarded YAML, dial in by taste, and operate the machine through bundled local BLE for scan, firmware probe, recipe load, monitoring, cancel, preset slots, and explicitly gated remote start. Use when the user mentions xBloom Studio, Omni Dripper, coffee-bean recipes, iced coffee, C40 conversion, WAIT troubleshooting, or direct xBloom Bluetooth control.
+description: Design bean-specific hot pour-over and Americano-style flash-brew recipes for xBloom Studio, research cited public recipes from roasters, cafes, and named coffee professionals, compare adaptations, validate guarded YAML, dial in by taste, and operate the machine through bundled local BLE for scan, probe, load, monitoring, cancel, presets, and explicitly gated remote start. Use when the user mentions xBloom Studio, Omni Dripper, coffee-bean recipes, iced coffee, expert recipes, C40 conversion, WAIT troubleshooting, or direct xBloom Bluetooth control.
 ---
 
 # xBloom Studio Brew
@@ -16,6 +16,8 @@ that directory; never recreate protocol frames in the conversation.
 Classify the request before acting:
 
 - **Recipe only:** design, save, validate, and explain the recipe. Do not scan or connect.
+- **Research and compare:** find credible public bean/recipe sources, distinguish native xBloom
+  recipes from adapted manual brews, and let the user choose before creating an executable recipe.
 - **Dial-in:** inspect the previous recipe and tasted result, then change one variable.
 - **Load to machine:** validate, preflight firmware/state, and arm the recipe. Do not start it.
 - **Brew now:** load first, then require current physical-readiness confirmation before `start`.
@@ -32,20 +34,24 @@ Read `references/recipe-design.md` when creating or adjusting a recipe. Read
 
 1. Extract drink style, roast, roast date, process, origin/variety, tasting notes, water, and the
    user's flavor target. Prefer the user's target over the roaster's notes.
-2. If details are missing, use reasonable assumptions and state them. Default to 15 g coffee,
+2. When an exact roaster, coffee, or lot is identifiable, or the user asks for expert/public
+   recipes, read `references/web-enrichment.md` and search first-party public sources if web tools
+   are available. If credible recipes exist, show the Skill baseline and up to two cited adaptations
+   for selection. Never load an external adaptation before the user chooses it.
+3. If details are missing after research, use reasonable assumptions and state them. Default to 15 g coffee,
    240 g final water, Omni Dripper 2, and filtered water; never assume unknown water is RO.
-3. Choose the smallest useful pour count and a conservative first-cup profile.
-4. For flash brew, separate hot machine water from ice and label the hot and final ratios.
-5. Copy `assets/hot-template.yaml` or `assets/flash-brew-template.yaml` to a user/workspace path.
+4. Choose the smallest useful pour count and a conservative first-cup profile.
+5. For flash brew, separate hot machine water from ice and label the hot and final ratios.
+6. Copy `assets/hot-template.yaml` or `assets/flash-brew-template.yaml` to a user/workspace path.
    Never modify the installed template in place.
-6. Fill every field with a concrete value. Preserve `stage_temps: [110.0, 90.0]`.
-7. Validate the finished local file:
+7. Fill every field with a concrete value. Preserve `stage_temps: [110.0, 90.0]`.
+8. Validate the finished local file:
 
 ```text
 python <skill-dir>/scripts/xbloom.py validate <recipe.yaml>
 ```
 
-8. Fix every validation error rather than bypassing the guard. Present the validated recipe, its
+9. Fix every validation error rather than bypassing the guard. Present the validated recipe, its
    assumptions, and exactly one first correction for the next cup.
 
 Do not claim a generated recipe has been taste-validated. After the user tastes it, use the result
@@ -152,6 +158,8 @@ Match the user's language. Keep the response compact but include:
 - Dose, hot water, ice/final water where applicable, grind, RPM, and expected time.
 - Every pour: ml, temperature, pattern, agitation, pause, and flow.
 - Validation result and file path.
+- Cited public sources, source brewer, original device, match quality, and every adaptation when
+  web enrichment was used. Keep citations outside executable YAML.
 - Device state only if a BLE command was requested and actually run.
 - One taste-based next adjustment.
 
@@ -161,20 +169,8 @@ state support it. Distinguish `loaded/armed` from `started/brewing`.
 ## References
 
 - Read `references/recipe-design.md` for bean logic, flash brew, C40 conversion, and dial-in.
+- Read `references/web-enrichment.md` when researching bean metadata or public expert recipes.
 - Read `references/recipe-schema.md` for the exact guarded file contract.
 - Read `references/device-safety.md` before BLE writes or remote start.
 - Read `references/deployment.md` for Codex/Hermes installation, publication, and environment setup.
 - Read `references/sources.md` when checking provenance or making hardware/protocol claims.
-
-## Acknowledgements
-
-This Skill stands on two excellent MIT-licensed community projects:
-
-- [ryunana/xbloom-studio-recipe-skill](https://github.com/ryunana/xbloom-studio-recipe-skill)
-  supplied the recipe-engineering foundation, including bean archetypes, dial-in heuristics, and
-  C40 conversion starting points.
-- [Janczykkkko/xbloom-ble](https://github.com/Janczykkkko/xbloom-ble) supplied the reverse-engineered
-  xBloom Studio BLE protocol, client, telemetry parser, and protocol tests.
-
-Thank you to both maintainers for making their work available to the coffee and Agent communities.
-See `THIRD_PARTY_NOTICES.md` and `licenses/` for pinned upstream commits and complete license texts.
