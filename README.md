@@ -24,7 +24,8 @@ validation, and bundled BLE control. It works with Hermes and other Agent Skills
 - Shows a conservative Skill baseline plus cited adaptations for the user to compare.
 - Validates dose, ratio, water totals, grind, temperature, flow, RPM, and BLE opcodes before writes.
 - Scans, probes, loads, monitors, cancels, saves A/B/C presets, and supports gated remote start.
-- Uses FreeSolo electronic scale (read/tare), standalone grinder, and exact-temperature/volume water.
+- Uses the FreeSolo scale with explicit entry auto-zero semantics, the standalone grinder, and
+  volume-controlled water at RT or 40-98 C.
 - Runs locally without xBloom cloud credentials or an app account.
 
 ## How recipes are produced
@@ -91,7 +92,8 @@ Use xbloom-studio-brew to design a clear, fruit-forward hot recipe for this coff
 Find credible public recipes for this coffee and let me choose before creating the xBloom recipe.
 Create an Americano-style flash brew, validate it, and load it onto my xBloom Studio without starting.
 Use the official green-tea template, but load it without starting.
-Read 10 seconds from the Studio scale without taring it.
+Help me weigh this empty cup: enter the scale with an empty platform, tell me when it is ready,
+then I will place the cup.
 ```
 
 The executable recipe is a local YAML file. Public-source citations stay in the response or a
@@ -105,6 +107,11 @@ python scripts/xbloom.py tea-validate assets/tea-green-official.yaml
 python scripts/xbloom.py tea-load assets/tea-green-official.yaml
 ```
 
+Scale entry automatically zeros the load already present. Start with an empty platform for an
+object's absolute weight, or pre-position an empty vessel when measuring net contents; `--tare`
+sends an additional re-tare. FreeSolo room-temperature water uses `water --temp RT` and remains
+behind the same physical water-action gates as heated water.
+
 `grind`, `water`, coffee `start`, and `tea-start` are included but disabled until the deployment
 owner enables their documented safety gate. See [standalone tools](skills/xbloom-studio-brew/references/standalone-tools.md)
 and [tea brewing](skills/xbloom-studio-brew/references/tea-brewing.md).
@@ -112,7 +119,8 @@ and [tea brewing](skills/xbloom-studio-brew/references/tea-brewing.md).
 ## Safety model
 
 - `load` sends guarded recipe frames and stops at `armed`; it does not start brewing.
-- `tea-load` uploads a dedicated tea recipe but never executes it; `scale` always exits its mode.
+- `tea-load` uploads a dedicated tea recipe but never executes it; `scale` reports its auto-zero
+  baseline and always exits its mode.
 - Firmware/state preflight runs before recipe or preset writes.
 - Remote start requires an owner opt-in, current physical-readiness confirmation, the same recipe
   hash and machine, and an armed state less than five minutes old.
@@ -131,7 +139,7 @@ cd skills/xbloom-studio-brew
 python scripts/bootstrap.py --dev
 ```
 
-The current suite contains 138 passing tests and 4 hardware/platform skips. Release tests never
+The current suite contains 149 passing tests and 4 hardware/platform skips. Release tests never
 activate the grinder or dispense hot water; the scale enter/read/exit path is hardware-verified on
 firmware `V12.0D.500`.
 

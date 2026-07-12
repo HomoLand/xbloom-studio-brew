@@ -24,7 +24,8 @@ Classify the request before acting:
 - **Load to machine:** validate, preflight firmware/state, and arm the recipe. Do not start it.
 - **Brew now:** load first, then require current physical-readiness confirmation before `start`.
 - **Tea:** use the dedicated tea schema and Omni Tea Brewer protocol; keep load and execute separate.
-- **Scale:** stream grams; tare only when explicitly requested and the empty vessel is ready.
+- **Scale:** account for the firmware's mandatory entry auto-zero; choose an empty-platform
+  baseline for absolute object weight or a pre-positioned empty vessel for net contents.
 - **Standalone grinder/water:** use their specific owner gate, readiness phrase, and cleanup flow.
 - **Preset slots:** require explicit intent to overwrite all A/B/C presets.
 - **Diagnostics:** use read-only `doctor`, `scan`, `probe`, or `monitor`; use `cancel` for recovery.
@@ -164,8 +165,15 @@ Electronic-scale reading is low risk and does not require a physical-action envi
 python <skill-dir>/scripts/xbloom.py scale --duration 30
 ```
 
-Add `--tare` only when the user explicitly requests tare and confirms the intended empty vessel is
-on the scale. Do not infer tare from a request to weigh something.
+The official `8003` scale-enter command automatically zeros the load already present. For an
+object's absolute weight, require the platform to be empty before starting, wait until JSON reports
+`"status": "ready"`, then ask the user to place the object. For net contents, put the empty vessel
+on the platform before starting and add contents only after `ready`. An object present at entry
+will read zero; removing it will read negative. There is no decoded enter-without-zero command.
+
+Add `--tare` only when the user explicitly requests an *additional* re-tare after entry. Do not
+describe the default as "without tare" or imply that omitting `--tare` preserves the pre-entry
+absolute load.
 
 The grinder is a motor action. Never set its owner opt-in yourself. After current confirmation of
 beans, receiving cup, clear chute, and clear hands, an enabled deployment may run at most 30 s:
@@ -183,6 +191,9 @@ correct water path, and clear surroundings in the current interaction:
 python <skill-dir>/scripts/xbloom.py water --volume 250 --temp 85 --flow 3.5 \
   --pattern center --confirm-ready vessel-water-clear
 ```
+
+Use `--temp RT` for the official room-temperature/pass-through setting. RT does not actively cool
+the tank water to an exact 20 C, and it remains a guarded physical water-dispense action.
 
 Never claim a grind or dispense completed unless its command reports success. On uncertainty, use
 the machine's physical stop/cancel after the wrapper's automatic STOP/QUIT cleanup.

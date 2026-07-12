@@ -129,9 +129,11 @@ recipes containing private purchase/account data.
 3. Inspect `git diff` for addresses, serials, tokens, and packet captures.
 4. Confirm coffee and tea load frames exclude their execute/start commands.
 5. Test `doctor`, `scan`, and `probe` on each supported OS when available.
-6. Test `scale` briefly without tare and confirm the command exits cleanly.
+6. Test `scale` with the platform empty; confirm `entering → ready → exited`, then place a known
+   object only after `ready` and verify its reading. Treat `--tare` as an additional re-tare.
 7. For a supported firmware, load a conservative recipe and then cancel without starting.
-8. Keep grinder, water, coffee start, and tea start out of unattended release tests.
+8. Pin RT's offline frame encoding to the app's 20 C sentinel, but keep grinder, water, coffee
+   start, and tea start out of unattended release tests.
 9. Never add firmware to the allowlist based only on a successful scan.
 10. Tag the release and record the vendored upstream commit in `THIRD_PARTY_NOTICES.md`.
 

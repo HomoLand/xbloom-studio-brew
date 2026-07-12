@@ -266,8 +266,9 @@ class Recipe:
                 errors.append(f"pour #{i}: ml {p.ml} out of range (1–4000)")
             # temp: settable 40–95 °C in 1 °C steps (xBloom Studio published spec).
             # The app also offers two special non-numeric settings, RT (room temp)
-            # and BP (boiling point); those are not expressible as a numeric value
-            # here, so the numeric validator range is 40–95.
+            # and BP (boiling point). FreeSolo RT is supported by the standalone
+            # water command, but coffee recipe-wire support remains outside this
+            # numeric recipe schema, so its validator stays at 40–95.
             if not (40 <= int(p.temp_c) <= 95):
                 errors.append(f"pour #{i}: temp_c {p.temp_c} out of range (40–95°C)")
             # rpm: agitation speed, 60–120 in 10-RPM steps — EXCEPT a `center` pour

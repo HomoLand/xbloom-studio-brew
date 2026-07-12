@@ -25,6 +25,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from .protocol import (
     CMD_TEA_RECIPE_CODE,
     CMD_TEA_RECIPE_MAKE,
+    ROOM_TEMPERATURE_C,
     build_brewer_enter,
     build_brewer_quit,
     build_brewer_start,
@@ -471,11 +472,18 @@ class XBloomClient:
         *,
         duration: float = 30.0,
         tare: bool = False,
+        on_ready: Callable[[], Awaitable[None] | None] | None = None,
     ) -> None:
         """Enter standalone scale mode, stream gram readings, then always exit.
 
-        Taring occurs only when ``tare=True``. The app's timer is local UI state,
-        so callers that need a timer should use event timestamps.
+        On tested Studio firmware, the official ``8003`` scale-enter command
+        automatically zeros whatever load is present at entry. ``tare=True``
+        sends an *additional* explicit ``8500`` tare after entry; it cannot
+        disable the firmware's entry auto-zero. To measure an object's absolute
+        weight, enter with the platform empty, wait for ``on_ready``, then place
+        the object. To measure net contents, enter with the empty vessel already
+        present. The app's timer is local UI state, so callers that need a timer
+        should use event timestamps.
         """
         if self._client is None or not self._client.is_connected:
             raise XBloomError("not connected")
@@ -495,6 +503,10 @@ class XBloomClient:
                     CHAR_COMMAND, build_scale_tare(), response=False
                 )
                 await asyncio.sleep(0.2)
+            if on_ready is not None:
+                result = on_ready()
+                if asyncio.iscoroutine(result):
+                    await result
 
             loop = asyncio.get_event_loop()
             deadline = loop.time() + float(duration)
@@ -605,8 +617,8 @@ class XBloomClient:
             raise XBloomError("not connected")
         if not 20 <= float(volume_ml) <= 360:
             raise XBloomError("water volume must be 20-360 ml")
-        if not 40 <= int(temp_c) <= 98:
-            raise XBloomError("water temperature must be 40-98 C")
+        if int(temp_c) != ROOM_TEMPERATURE_C and not 40 <= int(temp_c) <= 98:
+            raise XBloomError("water temperature must be RT or 40-98 C")
         flow10 = round(float(flow_ml_s) * 10)
         if flow10 not in range(30, 36) or abs(flow10 / 10 - float(flow_ml_s)) > 1e-6:
             raise XBloomError("water flow must be 3.0-3.5 ml/s in 0.1 steps")

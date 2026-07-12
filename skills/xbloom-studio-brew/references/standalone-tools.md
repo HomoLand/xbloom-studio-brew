@@ -6,24 +6,35 @@ while a recipe state record exists.
 
 ## Electronic scale
 
-Read without changing tare:
+Entering the official FreeSolo scale mode sends command `8003`. On tested firmware this command
+automatically zeros whatever load is already on the platform. This is separate from the explicit
+`8500` tare button command, but there is no decoded alternative that enters scale mode while
+preserving the pre-entry absolute load.
+
+To weigh an object's absolute mass, start with the platform empty:
 
 ```text
 python scripts/xbloom.py scale --duration 30
 ```
 
-Tare only when the user explicitly asks and the intended empty vessel is already in place:
+Wait for the JSON `"status": "ready"` event, then place the object. To weigh net contents instead,
+put the empty cup or vessel on the platform before running the command; entry will make that vessel
+the zero baseline, so add the contents only after `ready`.
+
+Send an additional explicit tare only when the user asks to re-zero the entry baseline:
 
 ```text
 python scripts/xbloom.py scale --tare --duration 30
 ```
 
-The command enters scale mode, emits timestamped gram readings, and sends scale-exit from a
+`--tare` sends `8500` after the mandatory entry auto-zero; omitting it is not a true
+"enter without tare" mode. The command emits timestamped gram readings and sends scale-exit from a
 `finally` block. The timer is maintained by the client/Agent; the Android app also implements its
 scale timer locally rather than with a machine command. Maximum rated load is 2 kg.
 
-Hardware status: enter, live 0.0 g readings, and clean exit were verified on firmware
-`V12.0D.500` on 2026-07-12. Tare was intentionally not changed during that check.
+Hardware status: enter, live readings, and clean exit were verified on firmware `V12.0D.500` on
+2026-07-12. A follow-up test with a cup already present confirmed the entry baseline: it read 0,
+removing the cup produced the corresponding negative value, and replacing it returned to 0.
 
 ## Standalone grinder
 
@@ -53,7 +64,7 @@ is intentionally not part of unattended release testing.
 The guarded FreeSolo brewer range is narrower than the app's published 500 ml maximum:
 
 - 20-360 ml.
-- 40-98 C, numeric temperatures only.
+- `RT` room-temperature/pass-through mode, or numeric 40-98 C.
 - 3.0-3.5 ml/s in 0.1 steps.
 - `center`, `spiral`, or `ring` pattern.
 
@@ -65,6 +76,18 @@ XBLOOM_ENABLE_REMOTE_START=I_UNDERSTAND_REMOTE_HOT_WATER
 python scripts/xbloom.py water --volume 250 --temp 85 --flow 3.5 --pattern center \
   --confirm-ready vessel-water-clear
 ```
+
+For unheated room-temperature water, use the explicit app token:
+
+```text
+python scripts/xbloom.py water --volume 250 --temp RT --flow 3.5 --pattern center \
+  --confirm-ready vessel-water-clear
+```
+
+The Android app maps RT to the J15 constant `20.0` and sends `200.0` in the temperature float field.
+This selects pass-through/unheated water; Studio does not cool warmer tank water to exactly 20 C.
+The water-action owner gate and readiness confirmation still apply because the machine physically
+dispenses water even when heating is off.
 
 Confirm the tank contains water, a sufficiently large heat-safe vessel is centered below the
 spout, the brewer/dripper path is appropriate for the intended action, and people/objects are clear.
@@ -80,6 +103,7 @@ an unattended self-test.
 ## Evidence boundary
 
 - Published limits and FreeSolo behavior: official xBloom documentation.
-- Command identifiers/argument encoding: interoperability analysis of the official Android app.
+- Command identifiers, RT sentinel, and argument encoding: interoperability analysis of the
+  official Android app.
 - 360 ml cap, explicit environment gates, readiness phrases, and persisted rest lock: this Skill's
   deliberately stricter safety policy.

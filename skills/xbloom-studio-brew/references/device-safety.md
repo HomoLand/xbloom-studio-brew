@@ -16,7 +16,7 @@ skill also completed its initial hardware validation on that firmware.
 | `tea-validate` | Parses a local Omni Tea Brewer recipe. | None |
 | `tea-load` | Uploads tea cup geometry and recipe data; does not execute it. | None |
 | `monitor` | Subscribes to state and scale notifications. | None |
-| `scale` | Enters the electronic-scale screen, optionally tares, streams grams, then exits. | No motor/water command |
+| `scale` | Enters the electronic-scale screen, auto-zeros the entry load, optionally re-tares, streams grams, then exits. | No motor/water command |
 | `save-slots` | Persistently overwrites all three on-machine A/B/C presets. Does not brew. | None |
 | `cancel` | Cancels/exits an armed or active operation. | `0x47` cancel |
 | `start` | Commits and starts an armed recipe; can grind and dispense near-boiling water. | `0x42`, sometimes `0x46` |
@@ -35,8 +35,9 @@ skill also completed its initial hardware validation on that firmware.
    and the user explicitly confirms the command-specific physical checklist in this interaction.
 7. Use `grind` only when its separate owner gate is enabled, the bean cup/chute are ready, and the
    persisted 60-second rest interval allows it. Never exceed 30 seconds.
-8. `scale` may read without a physical-action gate; send tare only when explicitly requested and
-   the intended empty vessel is in place. Always let the wrapper exit scale mode.
+8. `scale` may read without a physical-action gate, but `8003` automatically zeros the entry load.
+   Start empty for absolute weight or with an empty vessel for net weight. Send `--tare` only as an
+   explicitly requested additional re-tare. Always let the wrapper exit scale mode.
 9. Never schedule or infer a physical action. Presence, cup placement, and hot-water safety cannot
    be established from BLE telemetry alone.
 10. If the workflow is interrupted after load, offer or send `cancel`. Do not probe or replace an

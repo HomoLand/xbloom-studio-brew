@@ -5,7 +5,8 @@ project for decoded BLE behavior, and tasting feedback for recipe correction.
 
 ## Official xBloom material
 
-- [xBloom Studio product page](https://xbloom.com/products/xbloom-studio) — product capabilities.
+- [xBloom Studio product page](https://xbloom.com/products/xbloom-studio) — product capabilities,
+  including hot or room-temperature volume-controlled water.
 - [Getting started](https://tbdxsupport.zendesk.com/hc/en-us/articles/25198204646939-Getting-started) — operating limits, Bluetooth, vessel, and hot-water guidance.
 - [Brewing with the Omni Dripper 2](https://tbdxsupport.zendesk.com/hc/en-us/articles/25915864027675-How-do-I-brew-my-favorite-coffee-beans-with-the-Omni-Dripper-2) — dose and dripper workflow.
 - [Settings](https://tbdxsupport.zendesk.com/hc/en-us/articles/25198572238875-Settings) — firmware display and machine controls.
@@ -38,12 +39,13 @@ The port is pinned by tests for:
 - Generic J15 frame layout and CRC.
 - Scale enter/tare/exit and both weight-report identifiers.
 - Grinder enter/start/stop/quit arguments and cleanup ordering.
-- Brewer enter/start argument encoding and completion cleanup.
+- Brewer enter/start argument encoding, `TemperatureConstant.RT = 20.0`, and completion cleanup.
 - Tea cup setup, recipe upload, execute separation, official green-tea blob, and native minute-pause
   transformation.
 
 These are decoded, firmware-dependent behaviors, not an official xBloom API. Scale enter/read/exit
-has also been verified on `V12.0D.500`; unattended tests do not run the grinder or hot water.
+has also been verified on `V12.0D.500`; a follow-up hardware observation confirmed that the entry
+command zeros a load already present. Unattended tests do not run the grinder or dispense water.
 
 ## Public official tea templates
 

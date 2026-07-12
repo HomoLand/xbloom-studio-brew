@@ -248,7 +248,24 @@ def test_cancel_sends_0x47():
 
 
 # ── FreeSolo scale / grinder / brewer & dedicated tea path ────────────────
-def test_scale_stream_tares_reads_and_always_exits():
+def test_scale_stream_default_enters_without_extra_tare_and_signals_ready_first():
+    fake = FakeBleak()
+    fake.script_full[8003] = [COFFEE12]
+    c = _client(fake)
+    timeline = []
+    run(
+        c.stream_scale(
+            lambda event: timeline.append(("reading", event.scale_g)),
+            duration=0.1,
+            on_ready=lambda: timeline.append(("ready", None)),
+        )
+    )
+    assert _commands(fake) == [8003, 8014]
+    assert timeline[0] == ("ready", None)
+    assert ("reading", 12.12) in timeline
+
+
+def test_scale_stream_explicit_tare_is_additional_and_always_exits():
     fake = FakeBleak()
     fake.script_full[8003] = [COFFEE12]
     c = _client(fake)
@@ -299,6 +316,27 @@ def test_water_waits_for_completion_then_quits_without_forced_stop():
     assert event.command_code == 40511
     assert event.water_g == 120
     assert _commands(fake) == [8007, 4506, 8013]
+
+
+def test_water_accepts_official_rt_sentinel():
+    fake = FakeBleak()
+    fake.script_full[4506] = [
+        _water_volume_notification(120),
+        _command_notification(40511),
+    ]
+    c = _client(fake)
+    event = run(c.dispense_water(120, 20, timeout=5))
+    assert event.command_code == 40511
+    assert _commands(fake) == [8007, 4506, 8013]
+
+
+@pytest.mark.parametrize("temp_c", [19, 21, 39, 99])
+def test_water_rejects_values_outside_rt_or_numeric_range(temp_c):
+    fake = FakeBleak()
+    c = _client(fake)
+    with pytest.raises(XBloomError, match="RT or 40-98 C"):
+        run(c.dispense_water(120, temp_c, timeout=5))
+    assert _commands(fake) == []
 
 
 def test_water_early_stop_is_failure_and_forces_cleanup():

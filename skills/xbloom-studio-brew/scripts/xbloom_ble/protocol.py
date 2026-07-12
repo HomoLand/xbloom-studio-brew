@@ -80,6 +80,7 @@ from collections.abc import Iterable, Mapping
 __all__ = [
     "PATTERN_CODES",
     "MACHINE_PATTERN_CODES",
+    "ROOM_TEMPERATURE_C",
     "LOAD_SEQ",
     "crc16_kermit",
     "xbloom_frame",
@@ -168,6 +169,12 @@ MACHINE_PATTERN_CODES: dict[str, int] = {
     "circular": 1,
     "spiral": 2,
 }
+
+# Official Android ``TemperatureConstant.RT`` value for Studio/J15. FreeSolo
+# sends this through the normal brewer temperature fields as ``20 * 10``. It
+# selects the room-temperature/pass-through mode; it does not promise that the
+# delivered water is actively cooled to exactly 20 C.
+ROOM_TEMPERATURE_C = 20
 
 # Generic J15 command codes recovered from the official Android app. The two
 # bytes at offsets 3-4 are one little-endian u16 command, not semantically a
@@ -325,6 +332,7 @@ def build_grinder_quit() -> bytes:
 
 def build_brewer_enter(temp_c: int, pattern: str = "center") -> bytes:
     # HomeActivity passes pattern first, then Float.floatToIntBits(temp*10).
+    # RT uses the official 20 C sentinel, encoded through this same path.
     return j15_frame(
         CMD_BREWER_ENTER,
         [_machine_pattern(pattern), _float_bits(int(temp_c) * 10.0)],
@@ -343,7 +351,8 @@ def build_brewer_start(
 
     BrewerActivity encodes flow, volume, and temperature as Java float bit
     patterns after multiplying each by ten, followed by the configured water
-    source and machine pattern.
+    source and machine pattern. ``ROOM_TEMPERATURE_C`` selects the app's RT
+    pass-through setting; it is a mode token, not an active cooling target.
     """
     return j15_frame(
         CMD_BREWER_START,

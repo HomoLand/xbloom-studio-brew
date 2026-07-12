@@ -40,6 +40,7 @@ SUPPORTED_FIRMWARE = frozenset({"V12.0D.500"})
 UNTESTED_FIRMWARE_ENV = "XBLOOM_ALLOW_UNTESTED_FIRMWARE"
 UNTESTED_FIRMWARE_SENTINEL = "I_ACCEPT_UNTESTED_FIRMWARE"
 ACTIVE_STATES = frozenset({"armed", "awaiting_confirm", "starting", "brewing", "saving_slots"})
+ROOM_TEMPERATURE_C = 20
 
 
 def local_python() -> Path:
@@ -65,6 +66,30 @@ def reexec_in_local_runtime() -> None:
 
 def emit(data: dict[str, Any]) -> None:
     print(json.dumps(data, ensure_ascii=False, sort_keys=True))
+
+
+def parse_water_temperature(value: str) -> int:
+    """Parse the FreeSolo water temperature CLI value.
+
+    ``RT`` is the official room-temperature/pass-through mode and maps to the
+    Android app's 20 C protocol sentinel. Numeric temperatures remain 40-98 C.
+    Requiring the token instead of accepting numeric 20 avoids implying that
+    Studio actively cools the delivered water to an exact 20 C.
+    """
+    text = str(value).strip()
+    if text.upper() == "RT":
+        return ROOM_TEMPERATURE_C
+    try:
+        temp_c = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "temperature must be RT or an integer from 40 to 98 C"
+        ) from exc
+    if not 40 <= temp_c <= 98:
+        raise argparse.ArgumentTypeError(
+            "temperature must be RT or an integer from 40 to 98 C"
+        )
+    return temp_c
 
 
 def runtime_ready() -> bool:
@@ -381,10 +406,11 @@ async def async_scale(args: argparse.Namespace) -> int:
     emit(
         {
             "command": "scale",
-            "status": "listening",
+            "status": "entering",
             "machine": name,
             "firmware": firmware,
-            "tare_sent": bool(args.tare),
+            "entry_auto_zero": True,
+            "extra_tare_requested": bool(args.tare),
         }
     )
     last_emit = 0.0
@@ -403,8 +429,26 @@ async def async_scale(args: argparse.Namespace) -> int:
             }
         )
 
+    def on_ready() -> None:
+        emit(
+            {
+                "command": "scale",
+                "status": "ready",
+                "baseline_zeroed": True,
+                "extra_tare_sent": bool(args.tare),
+                "instruction": (
+                    "place-object-now-for-absolute-weight-or-add-contents-now-for-net-weight"
+                ),
+            }
+        )
+
     async with XBloomClient(address) as client:
-        await client.stream_scale(on_weight, duration=args.duration, tare=args.tare)
+        await client.stream_scale(
+            on_weight,
+            duration=args.duration,
+            tare=args.tare,
+            on_ready=on_ready,
+        )
     emit({"command": "scale", "status": "exited", "machine": name})
     return 0
 
@@ -465,8 +509,8 @@ async def async_water(args: argparse.Namespace) -> int:
         raise RuntimeError(f"--confirm-ready must equal {WATER_READY_SENTINEL}")
     if not 20 <= float(args.volume) <= 360:
         raise RuntimeError("water --volume must be 20-360 ml")
-    if not 40 <= int(args.temp) <= 98:
-        raise RuntimeError("water --temp must be 40-98 C")
+    if int(args.temp) != ROOM_TEMPERATURE_C and not 40 <= int(args.temp) <= 98:
+        raise RuntimeError("water --temp must be RT or 40-98 C")
     flow10 = round(float(args.flow) * 10)
     if flow10 not in range(30, 36) or abs(flow10 / 10 - float(args.flow)) > 1e-6:
         raise RuntimeError("water --flow must be 3.0-3.5 ml/s in 0.1 steps")
@@ -496,6 +540,14 @@ async def async_water(args: argparse.Namespace) -> int:
             "volume_ml": args.volume,
             "metered_volume_ml": event.water_g,
             "temp_c": args.temp,
+            "temp_setting": (
+                "RT" if args.temp == ROOM_TEMPERATURE_C else f"{args.temp} C"
+            ),
+            "heating_mode": (
+                "room-temperature-pass-through"
+                if args.temp == ROOM_TEMPERATURE_C
+                else "heated-target"
+            ),
             "flow_ml_s": args.flow,
             "pattern": args.pattern,
         }
@@ -708,10 +760,17 @@ def build_parser() -> argparse.ArgumentParser:
     load.add_argument("recipe")
     monitor = sub.add_parser("monitor", help="stream status/weights without starting")
     monitor.add_argument("--duration", type=float, default=300.0)
-    scale = sub.add_parser("scale", help="standalone electronic scale; optionally tare")
+    scale = sub.add_parser(
+        "scale",
+        help="standalone electronic scale; entry automatically zeros the current load",
+    )
     scale.add_argument("--duration", type=float, default=30.0)
     scale.add_argument("--interval", type=float, default=0.25, help="minimum seconds between JSON readings")
-    scale.add_argument("--tare", action="store_true", help="explicitly tare after entering scale mode")
+    scale.add_argument(
+        "--tare",
+        action="store_true",
+        help="send an additional tare after the firmware's mandatory entry auto-zero",
+    )
     grind = sub.add_parser("grind", help="explicitly gated standalone grinder")
     grind.add_argument("--size", type=int, required=True, help="grind setting 1-80")
     grind.add_argument("--rpm", type=int, default=100, help="60-120 RPM")
@@ -719,7 +778,12 @@ def build_parser() -> argparse.ArgumentParser:
     grind.add_argument("--confirm-ready", default="")
     water = sub.add_parser("water", help="explicitly gated temperature/volume water dispense")
     water.add_argument("--volume", type=float, required=True, help="20-360 ml")
-    water.add_argument("--temp", type=int, required=True, help="40-98 C")
+    water.add_argument(
+        "--temp",
+        type=parse_water_temperature,
+        required=True,
+        help="RT (room-temperature pass-through) or 40-98 C",
+    )
     water.add_argument("--flow", type=float, default=3.5, help="3.0-3.5 ml/s")
     water.add_argument("--pattern", choices=("center", "spiral", "ring"), default="center")
     water.add_argument("--timeout", type=float, default=None, help="completion timeout (5-600 s)")

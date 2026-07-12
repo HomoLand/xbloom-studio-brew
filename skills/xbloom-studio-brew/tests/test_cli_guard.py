@@ -12,6 +12,8 @@ def test_save_slots_parser_accepts_exactly_three_recipes():
 
 def test_freesolo_and_tea_parsers_expose_guarded_parameters():
     parser = xbloom.build_parser()
+    default_scale = parser.parse_args(["scale"])
+    assert default_scale.tare is False
     scale = parser.parse_args(["scale", "--tare", "--duration", "5"])
     assert scale.tare and scale.duration == 5
     grind = parser.parse_args(
@@ -20,8 +22,18 @@ def test_freesolo_and_tea_parsers_expose_guarded_parameters():
     assert (grind.size, grind.rpm, grind.seconds, grind.confirm_ready) == (62, 100, 10, "")
     water = parser.parse_args(["water", "--volume", "250", "--temp", "85"])
     assert (water.volume, water.temp, water.pattern) == (250, 85, "center")
+    water_rt = parser.parse_args(["water", "--volume", "250", "--temp", "RT"])
+    assert water_rt.temp == xbloom.ROOM_TEMPERATURE_C == 20
+    water_rt_lower = parser.parse_args(["water", "--volume", "250", "--temp", "rt"])
+    assert water_rt_lower.temp == xbloom.ROOM_TEMPERATURE_C
     tea = parser.parse_args(["tea-start", "green.yaml"])
     assert tea.recipe == "green.yaml" and tea.confirm_ready == ""
+
+
+@pytest.mark.parametrize("value", ["20", "39", "99", "room"])
+def test_water_parser_rejects_numeric_or_ambiguous_non_rt_values(value):
+    with pytest.raises(SystemExit):
+        xbloom.build_parser().parse_args(["water", "--volume", "120", "--temp", value])
 
 
 def test_physical_tools_are_disabled_before_any_ble_resolution(monkeypatch):

@@ -12,6 +12,7 @@ from xbloom_ble.protocol import (
     CMD_SCALE_TARE,
     CMD_TEA_RECIPE_CODE,
     CMD_TEA_RECIPE_MAKE,
+    ROOM_TEMPERATURE_C,
     build_brewer_enter,
     build_brewer_start,
     build_grinder_enter,
@@ -79,6 +80,16 @@ def test_brewer_frames_match_brewer_activity_float_bit_arguments():
     assert struct.unpack("<f", struct.pack("<I", volume_bits))[0] == 2500.0
     assert struct.unpack("<f", struct.pack("<I", temp_bits))[0] == 850.0
     assert (water_feed, pattern) == (0, 2)
+
+
+def test_brewer_rt_uses_official_room_temperature_sentinel():
+    enter = build_brewer_enter(ROOM_TEMPERATURE_C, "center")
+    _, enter_temp_bits = _words(enter)
+    assert struct.unpack("<f", struct.pack("<I", enter_temp_bits))[0] == 200.0
+
+    start = build_brewer_start(120, ROOM_TEMPERATURE_C, 3.5, "center")
+    _, _, start_temp_bits, _, _ = _words(start)
+    assert struct.unpack("<f", struct.pack("<I", start_temp_bits))[0] == 200.0
 
 
 def test_official_green_tea_blob_is_byte_exact():
