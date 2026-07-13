@@ -2,6 +2,9 @@
 
 [简体中文](README.zh-CN.md)
 
+[![validate-skill](https://github.com/HomoLand/xbloom-studio-brew/actions/workflows/test.yml/badge.svg)](https://github.com/HomoLand/xbloom-studio-brew/actions/workflows/test.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/HomoLand/xbloom-studio-brew)](https://github.com/HomoLand/xbloom-studio-brew/releases)
+
 A portable Agent Skill for designing bean-specific xBloom Studio coffee/tea recipes and using the
 machine's guarded local Bluetooth LE capabilities, including its scale, grinder, and brewer.
 
@@ -93,8 +96,10 @@ python scripts/xbloom.py catalog push recipe.yaml --region china
 The default catalog lives outside the installed Skill under
 `~/.xbloom-studio-brew/catalog/catalog.json`. Raw responses and credentials are not retained.
 xPod and J20 records stay reference-only; validated Studio coffee and tea records export through
-their respective guarded YAML schemas. Ephemeral login and read-only sync were live-service
-verified against the China tenant on 2026-07-14: the session and credentials remain memory-only.
+their respective guarded YAML schemas. Ephemeral login, all five default read categories, and two
+explicitly owner-approved add-only writes were live-service verified against the China tenant on
+2026-07-14, including cloud readback and no-write idempotent replay. Sessions and credentials remain
+memory-only.
 Set `XBLOOM_ACCOUNT_EMAIL` and `XBLOOM_ACCOUNT_PASSWORD` in the host environment; passwords are
 never accepted as command arguments. `catalog push` is preview-only unless the user explicitly
 adds both `--apply` and `--confirm-write own-account-cloud-recipe`; the live write endpoint is not

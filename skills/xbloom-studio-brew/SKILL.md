@@ -91,10 +91,12 @@ Treat “all” as all records in the supplied export or visible to the user's o
 not a global xBloom database. Keep the normalized catalog private: redistribution rights default
 to unknown. xPod and J20 entries are reference-only; tea exports use the dedicated tea path.
 
-`login-sync` reads all five account categories by default and was live-service verified against the
-China tenant on 2026-07-14. Supply email/password only through `XBLOOM_ACCOUNT_EMAIL` and
-`XBLOOM_ACCOUNT_PASSWORD` (or the hidden interactive password prompt); never print or persist them.
-The older explicit-form `sync` remains available through `--config`/`XBLOOM_CLOUD_CONFIG`.
+`login-sync` reads all five account categories by default. Those reads and two explicitly
+owner-approved add-only writes were live-service verified against the China tenant on 2026-07-14,
+including readback and no-write idempotent replay. Supply email/password only through
+`XBLOOM_ACCOUNT_EMAIL` and `XBLOOM_ACCOUNT_PASSWORD` (or the hidden interactive password prompt);
+never print or persist them. The older explicit-form `sync` remains available through
+`--config`/`XBLOOM_CLOUD_CONFIG`.
 
 `catalog push` is an offline preview by default. Remote use is add-only and idempotent: it refuses
 same-name/different-parameter conflicts. Run `--apply --confirm-write own-account-cloud-recipe`

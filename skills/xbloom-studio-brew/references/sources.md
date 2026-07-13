@@ -66,8 +66,10 @@ ephemeral owner-authorized China-tenant login verified read compatibility for
 `tuMyRecipeProduct.tuhtml` (6), and `tuMyRecipeShared.tuhtml` (0). The combined created endpoint
 contained both Studio coffee and tea; the older coffee-only created endpoint did not. Tokens, raw
 responses, member IDs, and credentials were not persisted. The add-only `tuRecipeAdd.tuhtml` form
-is decoded and tested against a mock, but has deliberately not been used as a release-time live
-account mutation.
+is decoded and mock-tested. Two owner-approved additions (one hot and one flash-brew extraction)
+were also created and read back on 2026-07-14; subsequent exact replays returned `already-present`
+without writing. That bounded owner action is compatibility evidence, not a release-time smoke test:
+automated and manual release validation must not create disposable account records.
 
 Scale enter/read/exit has also been verified on `V12.0D.500`; a follow-up hardware observation
 confirmed that the entry

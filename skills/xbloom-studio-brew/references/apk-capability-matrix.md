@@ -74,7 +74,7 @@ evidence.
 | FreeSolo brewer | Volume, RT/heated temperature, flow, circular/spiral/center pattern, tank/direct-feed source, pause/resume, live pattern/temp changes, stop, exit | **Available** for bounded dispense and bridge controls | Base dispense and running pattern switch are **D/T/H** on `V12.0D.500`; live temperature is **D/T**, not **P**; paused-state behavior is unmeasured; live volume/flow change is not exposed |
 | Omni Tea Brewer | Upload dedicated tea program, execute on the same or a later connection, and receive soak/pause/restart/finish reports | **Available** one-shot and through the bridge | Dedicated frames/templates are **D/T**. Programmed 80/90 ml fills are distinct from approximate 120 ml finished output; report `40520` is a firmware-owned siphon finish, not configurable coffee bypass; phase reports do not imply intervention commands |
 | Auto/Easy mode | Write the atomic A/B/C slot set, switch PRO/AUTO, and report order/count/mode | **Available** as one atomic A/B/C operation | **D/T/H** for the atomic batch and mode transition; command `11510` cannot represent bypass or tea, and arbitrary order/count editing is not public |
-| Private recipe catalog | Fetch official coffee/tea, combined Studio-created, Product/xPod, Shared, current Easy, and default Easy records; add a local created recipe | **Available** for authorized JSON/decoded-MMKV import, ephemeral own-account reads, and preview-first add-only upload | Import, normalization, app-compatible RSA envelope, secret non-persistence, idempotency, and conflict refusal are **D/T**; all five default read categories were live-service verified on the owner's China tenant on 2026-07-14. Live-service evidence is not hardware **H**; the add endpoint is mock-tested and intentionally not live-mutated; no global-catalog claim |
+| Private recipe catalog | Fetch official coffee/tea, combined Studio-created, Product/xPod, Shared, current Easy, and default Easy records; add a local created recipe | **Available** for authorized JSON/decoded-MMKV import, ephemeral own-account reads, and preview-first add-only upload | Import, normalization, app-compatible RSA envelope, secret non-persistence, idempotency, and conflict refusal are **D/T**. All five default reads plus two owner-approved additions, readback, stage ordering, and no-write replay were live-service verified on the China tenant on 2026-07-14. Live-service evidence is not hardware **H**; release tests still mock writes; no global-catalog claim |
 | Units, display, water source | Set weight unit, temperature unit, display brightness, persistent water source | **Available** with readback/rollback one-shot and through the bridge | **D/T**; physical setting changes have not been supervised by this project |
 | Pour radius and vibration amplitude | Read/write advanced mechanical tuning | **Available** with baseline-derived levels and rollback | **D/T**; APK UI ranges are enforced, physical writes remain unobserved |
 | Grinder calibration | Drive the grinder to its zero/calibration position | **Excluded by default** | Service-grade motor action; vendor app/physical procedure should own it |
@@ -186,10 +186,10 @@ outlet lag. Paused-state pattern/temperature behavior and the other pattern tran
 separate evidence gaps; do not generalize the verified running `center → spiral` result beyond
 firmware `V12.0D.500`. A later supervised pass can validate persistent settings and mechanical
 levels one field at a time against the UI; until then their public status stays command-derived.
-Tea intervention and deeper payload semantics remain separate follow-ups. The catalog read path now
-has a controlled China-tenant compatibility check; international-tenant drift and future service
-changes still require revalidation. The add form remains D/T until the owner deliberately chooses a
-real recipe upload—release validation must never create disposable cloud records.
+Tea intervention and deeper payload semantics remain separate follow-ups. The catalog read and
+owner-approved add-only paths now have a controlled China-tenant compatibility check; international-
+tenant drift and future service changes still require revalidation. Release validation must never
+create disposable cloud records.
 Calibration and OTA should remain a separate maintainer/service package even if their wire format
 is completely decoded. Cloud/account and NFC remain optional integrations, never hidden
 dependencies of the portable brewing Skill.

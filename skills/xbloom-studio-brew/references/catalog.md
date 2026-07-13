@@ -19,6 +19,12 @@ tea, combined Studio-created recipes, Product/xPod recipes, and an empty Shared 
 **live-service verified**, not **H**: hardware evidence labels apply only to Studio BLE behavior.
 Cloud contracts can still change, so authorized JSON/cache import remains a useful offline fallback.
 
+On the same date, two exact owner-approved local recipes (one hot and one flash-brew extraction)
+were added to the account, read back through the created endpoint, and then replayed through
+`catalog push` as `already-present` with `write_performed=false`. This also exposed the APK's
+stage-name sort rule now enforced by the form mapper. These are bounded live-service observations;
+release tests still mock every write and never mutate an account.
+
 The normalized catalog is private state, not a redistributable recipe pack. Every entry defaults
 to `redistribution: unknown`. Do not commit, publish, or bulk-share catalog contents without
 permission from the recipe owner.
@@ -200,7 +206,7 @@ The write path is deliberately **add-only**. It first reads the user's combined 
 an identical name and parameter fingerprint returns `already-present` without writing, while the
 same name with different parameters is refused rather than overwritten. Update, delete, share,
 pin, and profile mutation are not exposed. Release tests mock the add endpoint and never mutate a
-live account; the first real add remains an explicitly approved owner action.
+live account; every real addition remains an explicitly approved owner action.
 
 Cloud form conversion is stricter than local BLE execution. The Android created-recipe schema has
 one global grinder RPM, so a local coffee file with multiple non-zero RPM values is rejected rather
