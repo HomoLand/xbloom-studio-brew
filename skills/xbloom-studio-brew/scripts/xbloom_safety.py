@@ -20,6 +20,8 @@ ALLOWED_TOP_LEVEL = frozenset(
         "dose_g",
         "grind",
         "ratio",
+        # Deprecated read-only compatibility input. Recipe.from_dict accepts only
+        # the captured 110/90 command-8104 pair and omits it when serialising.
         "stage_temps",
         "bypass_ml",
         "bypass_temp_c",
@@ -34,7 +36,17 @@ ALLOWED_TOP_LEVEL = frozenset(
     }
 )
 ALLOWED_POUR_KEYS = frozenset(
-    {"label", "ml", "temp_c", "pattern", "agitation", "pause_s", "rpm", "flow_ml_s"}
+    {
+        "label",
+        "ml",
+        "temp_c",
+        "pattern",
+        "vibration",
+        "agitation",
+        "pause_s",
+        "rpm",
+        "flow_ml_s",
+    }
 )
 FORBIDDEN_PROTOCOL_KEYS = frozenset({"tail", "seq", "opcode", "raw", "frame"})
 
@@ -94,8 +106,6 @@ def strict_validate(recipe: Recipe) -> None:
         errors.append("grind must be 35-75, or 0 for pre-ground/grinder-off")
     if not 2 <= len(recipe.pours) <= 5:
         errors.append("pour count must be 2-5")
-    if tuple(recipe.stage_temps) != (110.0, 90.0):
-        errors.append("stage_temps must remain [110.0, 90.0]")
     if recipe.dripper and "omni" not in recipe.dripper.lower():
         errors.append("the guarded controller currently supports an Omni Dripper only")
 
@@ -110,7 +120,7 @@ def strict_validate(recipe: Recipe) -> None:
     ):
         errors.append("bypass temperature must be RT, 80-95 C, or BP")
 
-    agitation_count = 0
+    legacy_agitation_count = 0
     non_center_rpms: set[int] = set()
     for index, pour in enumerate(recipe.pours, start=1):
         if not 10 <= int(pour.ml) <= 127:
@@ -131,11 +141,11 @@ def strict_validate(recipe: Recipe) -> None:
         else:
             non_center_rpms.add(rpm)
         if pour.agitation:
-            agitation_count += 1
+            legacy_agitation_count += 1
             if index != 1:
-                errors.append("guarded recipes allow agitation on the first pour only")
-    if agitation_count > 1:
-        errors.append("guarded recipes allow at most one agitated pour")
+                errors.append("legacy agitation is allowed on the first pour only")
+    if legacy_agitation_count > 1:
+        errors.append("legacy agitation is allowed on at most one pour")
     if recipe.pours and recipe.pours[0].pattern == "center":
         errors.append("the first pour cannot use center; the decoded schema carries grinder RPM there")
     if len(non_center_rpms) > 1:
@@ -189,6 +199,7 @@ def recipe_summary(recipe: Recipe, path: str | Path) -> dict[str, Any]:
         "grind": int(recipe.grind),
         "hot_water_ml": recipe.total_water_ml,
         "bypass_ml": float(recipe.bypass_ml or 0.0),
+        "target_dispensed_water_ml": recipe.total_machine_water_ml,
         "bypass_temp_c": recipe.bypass_temp_c,
         "final_water_ml": int(
             recipe.water_ml

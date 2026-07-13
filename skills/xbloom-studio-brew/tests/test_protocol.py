@@ -192,6 +192,66 @@ def test_grind_byte_passthrough_and_no_grind_sentinel():
     assert build_41(pours, grind=0)[-1] == 0xA0
 
 
+@pytest.mark.parametrize(
+    ("vibration", "wire_value"),
+    [("none", 0), ("before", 1), ("after", 2), ("both", 3)],
+)
+def test_recipe_vibration_timing_has_four_independent_wire_states(
+    vibration, wire_value
+):
+    payload = build_41(
+        [
+            {
+                "ml": 40,
+                "temp": 90,
+                "pattern": "circular",
+                "vibration": vibration,
+                "pause": 20,
+                "rpm": 100,
+                "flow": 3.0,
+            }
+        ],
+        grind=55,
+    )
+    # payload prefix is 01 | segment-length; pattern/vibration are bytes 2/3
+    # inside the eight-byte pour segment.
+    assert payload[4:6] == bytes([1, wire_value])
+
+
+def test_modern_vibration_reproduces_published_legacy_recipe_bytes():
+    common = {
+        "ml": 40,
+        "temp": 92,
+        "pattern": "spiral",
+        "pause": 30,
+        "rpm": 100,
+        "flow": 3.0,
+    }
+    assert build_41([{**common, "agitation": True}], grind=55) == build_41(
+        [{**common, "vibration": "after"}], grind=55
+    )
+    circular = {**common, "pattern": "ring"}
+    assert build_41([{**circular, "agitation": False}], grind=55) == build_41(
+        [{**circular, "pattern": "circular", "vibration": "none"}], grind=55
+    )
+
+
+def test_recipe_encoder_rejects_conflicting_vibration_fields():
+    with pytest.raises(ValueError, match="both vibration and legacy agitation"):
+        build_41(
+            [
+                {
+                    "ml": 40,
+                    "temp": 92,
+                    "pattern": "spiral",
+                    "vibration": "none",
+                    "agitation": False,
+                }
+            ],
+            grind=55,
+        )
+
+
 def test_crc16_kermit_known_vector():
     """Known CRC-16/KERMIT check value: 0x2189 for b'123456789'."""
     assert crc16_kermit(b"123456789") == 0x2189

@@ -1,7 +1,7 @@
 """Recipe model, YAML loading, and validation for xBloom Studio brews.
 
-A recipe describes a pour-over: the dose, grind, optional stage temperatures,
-and an ordered list of pours. It is validated independently of any hardware so
+A recipe describes a pour-over: the dose, grind, and an ordered list of pours.
+It is validated independently of any hardware so
 that mistakes are caught before anything is sent over BLE.
 
 YAML schema
@@ -11,7 +11,6 @@ YAML schema
     name: Example
     dose_g: 16
     grind: 62
-    stage_temps: [110.0, 90.0]   # optional; defaults to [110.0, 90.0]
     ratio: 15                    # optional; if given, Σpours must equal dose_g*ratio
     bypass_ml: 40                # optional machine bypass, 5-100 ml
     bypass_temp_c: RT            # RT, BP, or a numeric brew temperature
@@ -25,8 +24,10 @@ YAML schema
       - {label: Bloom,  ml: 35,  temp_c: 90, pattern: spiral, pause_s: 40, rpm: 100, flow_ml_s: 3.0}
       - {label: Pour 1, ml: 115, temp_c: 90, pattern: spiral, pause_s: 5,  rpm: 100, flow_ml_s: 3.0}
 
-Patterns: ``spiral``, ``ring``, ``center``. Set ``agitation: true`` (only valid
-with ``spiral``) for an agitated bloom. Pour and bypass temperatures accept the
+Patterns: ``spiral``, ``circular``, ``center`` (legacy ``ring`` is accepted as
+an alias). ``vibration`` is independent and accepts ``none``, ``before``,
+``after``, or ``both``. The old ``agitation`` boolean remains readable for
+backward compatibility but should not be used in new recipes. Pour and bypass temperatures accept the
 official ``RT`` (room-temperature pass-through) and ``BP`` (boiling-point) tokens.
 The metadata fields (``dripper``, ``kind``,
 ``water_ml``, ``hot_water_ml``, ``ice_g``, ``time``, ``note``, and per-pour
@@ -42,7 +43,12 @@ from typing import Any
 
 import yaml
 
-from .protocol import PATTERN_CODES
+from .protocol import (
+    COFFEE_CUP_GEOMETRY_COMPAT,
+    MACHINE_PATTERN_CODES,
+    PATTERN_CODES,
+    VIBRATION_CODES,
+)
 
 __all__ = ["Pour", "Recipe", "RecipeError", "parse_temperature_setting"]
 
@@ -96,7 +102,11 @@ class Pour:
     ml: int
     temp_c: int
     pattern: str = "spiral"
-    agitation: bool = False
+    #: Exact APK vibration timing. ``None`` means the legacy ``agitation`` field
+    #: is in use; otherwise one of none/before/after/both.
+    vibration: str | None = "none"
+    #: Deprecated compatibility field from early Skill releases.
+    agitation: bool | None = None
     pause_s: int = 0
     rpm: int = 0
     flow_ml_s: float = 3.0
@@ -106,15 +116,19 @@ class Pour:
 
     def to_protocol_dict(self) -> dict[str, Any]:
         """Shape expected by :func:`xbloom_ble.protocol.build_41`."""
-        return {
+        data: dict[str, Any] = {
             "ml": self.ml,
             "temp": self.temp_c,
             "pattern": self.pattern,
-            "agitation": self.agitation,
             "pause": self.pause_s,
             "rpm": self.rpm,
             "flow": self.flow_ml_s,
         }
+        if self.vibration is not None:
+            data["vibration"] = self.vibration
+        if self.agitation is not None:
+            data["agitation"] = self.agitation
+        return data
 
     def to_dict(self) -> dict[str, Any]:
         """Serialise to the YAML pour shape (round-trips with :meth:`Recipe.from_dict`)."""
@@ -128,8 +142,11 @@ class Pour:
             pause_s=int(self.pause_s),
             rpm=int(self.rpm),
             flow_ml_s=float(self.flow_ml_s),
-            agitation=bool(self.agitation),
         )
+        if self.vibration is not None:
+            d["vibration"] = self.vibration
+        elif self.agitation is not None:
+            d["agitation"] = bool(self.agitation)
         return d
 
 
@@ -137,7 +154,7 @@ class Pour:
 class Recipe:
     """A full xBloom Studio recipe.
 
-    The core fields (``dose_g``/``grind``/``stage_temps``/``pours`` and optional
+    The core fields (``dose_g``/``grind``/``pours`` and optional
     ``bypass_ml``/``bypass_temp_c``) are what the machine brews. The remaining
     fields are **optional brew-level metadata** —
     informational context a UI or recipe site can render, but which is *never*
@@ -155,7 +172,6 @@ class Recipe:
     dose_g: int
     grind: int
     pours: list[Pour]
-    stage_temps: tuple[float, float] = (110.0, 90.0)
     ratio: float | None = None
     tail: int = 0xA0
     # Machine-executed post-brew bypass. Zero/None means disabled.
@@ -189,14 +205,43 @@ class Recipe:
             if not isinstance(rp, dict):
                 raise RecipeError(f"pour #{i + 1} must be a mapping")
             try:
+                if "vibration" in rp and "agitation" in rp:
+                    raise RecipeError(
+                        f"pour #{i + 1} cannot set both vibration and legacy agitation"
+                    )
+                legacy_agitation = rp.get("agitation") if "agitation" in rp else None
+                if legacy_agitation is not None and not isinstance(legacy_agitation, bool):
+                    raise RecipeError(f"pour #{i + 1} agitation must be true or false")
+                pattern = str(rp.get("pattern", "spiral")).strip().lower()
+                if legacy_agitation is not None:
+                    legacy_pattern = "ring" if pattern == "circular" else pattern
+                    key = (legacy_pattern, bool(legacy_agitation))
+                    try:
+                        _, vibration_code = PATTERN_CODES[key]
+                    except KeyError as exc:
+                        raise RecipeError(
+                            f"pour #{i + 1} legacy pattern/agitation pair {key!r} "
+                            "has no captured compatibility mapping"
+                        ) from exc
+                    vibration = next(
+                        name for name, code in VIBRATION_CODES.items()
+                        if code == vibration_code
+                    )
+                else:
+                    vibration = str(rp.get("vibration", "none")).strip().lower()
+                if pattern == "ring":
+                    pattern = "circular"
                 pours.append(
                     Pour(
                         ml=rp["ml"],
                         temp_c=parse_temperature_setting(
                             rp["temp_c"], field=f"pour #{i + 1} temp_c"
                         ),
-                        pattern=rp.get("pattern", "spiral"),
-                        agitation=bool(rp.get("agitation", False)),
+                        pattern=pattern,
+                        vibration=vibration,
+                        # Old YAML is normalised immediately to the exact four-state
+                        # field so `agitation: false` can never hide a vibration byte.
+                        agitation=None,
                         pause_s=rp.get("pause_s", 0),
                         rpm=rp.get("rpm", 0),
                         flow_ml_s=rp.get("flow_ml_s", 3.0),
@@ -206,9 +251,23 @@ class Recipe:
             except KeyError as exc:
                 raise RecipeError(f"pour #{i + 1} missing key {exc}") from exc
 
-        stage_temps = data.get("stage_temps", [110.0, 90.0])
-        if not isinstance(stage_temps, (list, tuple)) or len(stage_temps) != 2:
-            raise RecipeError("'stage_temps' must be a 2-element list [temp1, temp2]")
+        if "stage_temps" in data:
+            legacy_geometry = data["stage_temps"]
+            if not isinstance(legacy_geometry, (list, tuple)) or len(legacy_geometry) != 2:
+                raise RecipeError(
+                    "deprecated 'stage_temps' must be the captured [110.0, 90.0] pair"
+                )
+            try:
+                legacy_geometry_pair = tuple(float(value) for value in legacy_geometry)
+            except (TypeError, ValueError) as exc:
+                raise RecipeError(
+                    "deprecated 'stage_temps' must be the captured [110.0, 90.0] pair"
+                ) from exc
+            if legacy_geometry_pair != COFFEE_CUP_GEOMETRY_COMPAT:
+                raise RecipeError(
+                    "deprecated 'stage_temps' is command-8104 cup geometry, not a "
+                    "tunable temperature; remove it or keep exactly [110.0, 90.0]"
+                )
 
         for key in ("dose_g", "grind"):
             if key not in data:
@@ -219,7 +278,6 @@ class Recipe:
             dose_g=data["dose_g"],
             grind=data["grind"],
             pours=pours,
-            stage_temps=(float(stage_temps[0]), float(stage_temps[1])),
             ratio=data.get("ratio"),
             tail=data.get("tail", 0xA0),
             bypass_ml=float(data.get("bypass_ml", 0.0) or 0.0),
@@ -297,24 +355,33 @@ class Recipe:
                 f"or 0 for no-grind / pre-ground)"
             )
 
-        # stage temps (machine preheat/stage set-points; default 110/90). These
-        # are NOT the pour temperature and legitimately exceed the 95 °C pour cap,
-        # so they keep the wider 40–130 °C allowance.
-        for label, t in zip(("stage temp1", "stage temp2"), self.stage_temps, strict=False):
-            if not (40 <= float(t) <= 130):
-                errors.append(f"{label} {t}°C out of range (40–130°C)")
-
         # need at least a bloom + a first pour
         if len(self.pours) < 2:
             errors.append("recipe needs at least a bloom pour and a first pour (≥2 pours)")
 
         total_ml = 0
         for i, p in enumerate(self.pours, start=1):
-            if (p.pattern, bool(p.agitation)) not in PATTERN_CODES:
+            pattern = str(p.pattern).strip().lower()
+            if pattern not in MACHINE_PATTERN_CODES:
+                errors.append(
+                    f"pour #{i}: pattern {p.pattern!r} must be one of "
+                    f"{sorted(MACHINE_PATTERN_CODES)}"
+                )
+            if p.vibration is not None and p.agitation is not None:
+                errors.append(
+                    f"pour #{i}: cannot set both vibration and legacy agitation"
+                )
+            elif p.vibration is not None:
+                if str(p.vibration).strip().lower() not in VIBRATION_CODES:
+                    errors.append(
+                        f"pour #{i}: vibration {p.vibration!r} must be one of "
+                        f"{sorted(VIBRATION_CODES)}"
+                    )
+            elif ("ring" if pattern == "circular" else pattern, bool(p.agitation)) not in PATTERN_CODES:
                 valid = sorted({pat for pat, _ in PATTERN_CODES})
                 errors.append(
-                    f"pour #{i}: pattern/agitation ({p.pattern!r}, {p.agitation}) "
-                    f"not in known set {valid} (agitation only valid with 'spiral')"
+                    f"pour #{i}: legacy pattern/agitation ({p.pattern!r}, {p.agitation}) "
+                    f"not in known set {valid}"
                 )
             # A pour over 127 ml is auto-split by the protocol — that is fine,
             # not an error. ml just needs to be ≥1 and fit a sane upper bound.
@@ -423,7 +490,7 @@ class Recipe:
         return {
             "dose": int(self.dose_g),
             "grind": int(self.grind),
-            "stage_temps": tuple(self.stage_temps),
+            "cup_geometry_compat": COFFEE_CUP_GEOMETRY_COMPAT,
             "bypass_ml": float(self.bypass_ml or 0.0),
             "bypass_temp_c": float(self.bypass_temp_c or 0.0),
             "pours": [p.to_protocol_dict() for p in self.pours],
@@ -439,7 +506,6 @@ class Recipe:
                              "grind": int(self.grind)}
         if self.ratio is not None:
             d["ratio"] = self.ratio
-        d["stage_temps"] = [float(self.stage_temps[0]), float(self.stage_temps[1])]
         if self.bypass_ml:
             d["bypass_ml"] = float(self.bypass_ml)
             d["bypass_temp_c"] = _temperature_to_yaml(self.bypass_temp_c)

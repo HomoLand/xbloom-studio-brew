@@ -44,12 +44,12 @@ kind: tea
 leaf_g: 4
 output_ml_per_steep: 120
 pours:
-  - {label: Steep 1, ml: 90, temp_c: 85, pattern: ring, pause_s: 20, flow_ml_s: 3.5}
+  - {label: Steep 1, ml: 90, temp_c: 85, pattern: circular, pause_s: 20, flow_ml_s: 3.5}
   - {label: Steep 2, ml: 90, temp_c: 85, pattern: center, pause_s: 15, flow_ml_s: 3.5}
 ```
 
 Limits: 3-5 g leaves, 1-4 stages, 40-100 ml programmed per stage, 70-99 C, 1-120 s pause,
-3.0-3.5 ml/s, and `center`/`spiral`/`ring`. Unknown keys and raw protocol overrides are rejected.
+3.0-3.5 ml/s, and `center`/`spiral`/`circular` (`ring` remains a legacy alias). Unknown keys and raw protocol overrides are rejected.
 
 ## Validate, load, and start
 
@@ -75,9 +75,39 @@ python scripts/xbloom.py tea-start tea.yaml \
 The loaded file must be unchanged, on the same machine, and less than five minutes old. Never
 schedule unattended tea starts.
 
+For a single held connection, `tea-brew` performs the same guarded load and explicit execute steps:
+
+```text
+XBLOOM_ENABLE_REMOTE_START=I_UNDERSTAND_REMOTE_HOT_WATER
+python scripts/xbloom.py tea-brew tea.yaml \
+  --confirm-ready tea-brewer-water-cup-clear
+```
+
+If the persistent bridge is already running, keep it as the sole BLE owner:
+
+```text
+python scripts/xbloom.py bridge tea-load tea.yaml
+python scripts/xbloom.py bridge tea-start \
+  --confirm-ready tea-brewer-water-cup-clear
+python scripts/xbloom.py bridge events --since 0
+```
+
+The bridge preserves the same file hash, five-minute age, owner opt-in, and per-start readiness
+checks. `bridge cancel` exits a loaded or active tea workflow; tea phase reports are telemetry and
+do not create unsupported pause/resume controls.
+
+It emits separate `tea_loaded` and `start_accepted` events, then monitors to a terminal machine
+state. Telemetry may include `tea_phase` (`soaking`, `paused`, or `running`), changed soak seconds,
+the recipe's `target_dispensed_water_ml`, cumulative machine `dispensed_water_ml`, and cup-scale
+`cup_delta_g`. The latter two are observations of the current operation, not water-supply inventory.
+Do not equate programmed water with reported siphon output: water retained in leaves/accessory and
+the tea cycle's mechanics make them intentionally different quantities.
+
 ## Protocol verification boundary
 
 The Java tea-code builder and native pause encoding were independently ported from the official
 Android app. Golden tests pin the official green-tea blob, minute pause encoding, command frames,
-load/execute separation, and fake-BLE acknowledgements. The dedicated tea execution command has not
-been fired by unattended release tests; first physical runs must remain supervised at the machine.
+load/execute separation, fake-BLE acknowledgements, and named soak/pause/restart reports. The
+dedicated tea execution command has not been fired by unattended release tests; first physical
+runs must remain supervised at the machine. The APK exposes tea-phase reports, but this Skill does
+not invent unproven manual tea pause/resume commands from them.

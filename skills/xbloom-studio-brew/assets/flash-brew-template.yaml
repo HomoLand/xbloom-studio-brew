@@ -9,13 +9,12 @@ hot_water_ml: 150
 ice_g: 90
 time: "2:00-2:40"
 note: Put 90 g clean ice in the receiving vessel before loading this recipe.
-stage_temps: [110.0, 90.0]
 pours:
   - label: Bloom
     ml: 40
     temp_c: 94
     pattern: spiral
-    agitation: true
+    vibration: after
     pause_s: 35
     rpm: 100
     flow_ml_s: 3.0
@@ -23,15 +22,15 @@ pours:
     ml: 60
     temp_c: 93
     pattern: spiral
-    agitation: false
+    vibration: none
     pause_s: 8
     rpm: 100
     flow_ml_s: 3.2
   - label: Finish
     ml: 50
     temp_c: 92
-    pattern: ring
-    agitation: false
+    pattern: circular
+    vibration: none
     pause_s: 0
     rpm: 100
     flow_ml_s: 3.2

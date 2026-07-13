@@ -1,6 +1,6 @@
 ---
 name: xbloom-studio-brew
-description: Design bean-specific hot pour-over and Americano-style flash-brew recipes for xBloom Studio, research cited roaster/cafe/xPod references, run guarded Omni Tea Brewer recipes, dial in by taste, and operate bundled local BLE for diagnostics, scale, grinder, temperature/volume water, recipe load, presets, monitoring, cancel, and explicitly gated physical starts. Use for xBloom Studio, Omni Dripper, xPod/NFC Recipe Cards, Omni Tea Brewer, coffee or tea recipes, iced coffee, C40 conversion, WAIT troubleshooting, electronic-scale readings, standalone grinding/water, or direct xBloom Bluetooth control.
+description: Design bean-specific hot pour-over and Americano-style flash-brew recipes for xBloom Studio, research cited roaster/cafe/xPod references, run guarded Omni Tea Brewer recipes, dial in by taste, and operate bundled local BLE for diagnostics, settings, scale, grinder, temperature/volume water, recipe load, presets, monitoring, cancel, persistent pause/resume, and explicitly gated physical starts. Use for xBloom Studio, Omni Dripper, xPod/NFC Recipe Cards, Omni Tea Brewer, coffee or tea recipes, iced coffee, C40 conversion, WAIT troubleshooting, electronic-scale readings, standalone grinding/water, or direct xBloom Bluetooth control.
 ---
 
 # xBloom Studio Brew
@@ -27,8 +27,11 @@ Classify the request before acting:
 - **Scale:** account for the firmware's mandatory entry auto-zero; choose an empty-platform
   baseline for absolute object weight or a pre-positioned empty vessel for net contents.
 - **Standalone grinder/water:** use their specific owner gate, readiness phrase, and cleanup flow.
+- **Persistent bridge:** prefer the long-lived local bridge for device work so one process owns
+  BLE and serializes coffee, tea, scale, grinder, water, presets, settings, and tuning writes.
 - **Preset slots:** require explicit intent to overwrite all A/B/C presets.
-- **Diagnostics:** use read-only `doctor`, `scan`, `probe`, or `monitor`; use `cancel` for recovery.
+- **Diagnostics/settings:** use read-only `doctor`, `scan`, `probe`, `settings`, `advanced`, or
+  `monitor`; use `cancel` for recovery. Persistent writes require their own owner gate.
 
 Do not produce espresso recipes. xBloom Studio brews pour-over, not espresso. When the user asks
 for iced Americano, offer an **Americano-style flash brew** and state the distinction briefly.
@@ -52,7 +55,7 @@ Read `references/recipe-design.md` when creating or adjusting a recipe. Read
    machine water, not display-only metadata. Use `RT`/`BP` only when that mode is intentional.
 6. Copy `assets/hot-template.yaml` or `assets/flash-brew-template.yaml` to a user/workspace path.
    Never modify the installed template in place.
-7. Fill every field with a concrete value. Preserve `stage_temps: [110.0, 90.0]`.
+7. Fill every public field with a concrete value. Do not add undocumented protocol fields.
 8. Validate the finished local file:
 
 ```text
@@ -71,7 +74,8 @@ Read `references/device-safety.md` completely before the first BLE action in a t
 For a scale, grinder, or water request, also read `references/standalone-tools.md`. For tea, read
 `references/tea-brewing.md`.
 
-Bootstrap once per installed copy:
+Bootstrap once per user/Agent environment. The virtual environment is stored in the writable
+state directory, not inside the installed Skill, so upgrades and read-only package caches are safe:
 
 ```text
 python <skill-dir>/scripts/bootstrap.py
@@ -92,6 +96,23 @@ python <skill-dir>/scripts/xbloom.py --address <ble-address-or-uuid> probe
 ```
 
 Treat addresses and serials as private local identifiers. Do not reproduce them in public output.
+
+For pause/resume or control-grade telemetry, start the bundled loopback-only bridge. Starting the
+daemon does not scan, connect, grind, or dispense water:
+
+```text
+python <skill-dir>/scripts/xbloom.py bridge start
+python <skill-dir>/scripts/xbloom.py bridge status
+python <skill-dir>/scripts/xbloom.py bridge connect
+python <skill-dir>/scripts/xbloom.py bridge events --since 0
+```
+
+The bridge is the sole BLE owner while it runs. Direct one-shot BLE commands deliberately refuse
+to race it; use the matching `bridge` workflow or stop the idle daemon first. `bridge stop` refuses
+during an activity; `bridge stop --force` first sends that activity's guarded stop/cancel path.
+Bridge operations cover coffee, tea, scale, grinder, water, presets, persistent settings, advanced
+tuning, and continuous events. Read `references/deployment.md` for daemon state, external runtime,
+and deployment details.
 
 ## Load without starting
 
@@ -116,7 +137,7 @@ python <skill-dir>/scripts/xbloom.py cancel
 
 ## Start and monitor a coffee brew
 
-Remote start is a shipped core capability, not an add-on, but it has owner and per-brew gates.
+Remote start is an available core capability, not an add-on, but it has owner and per-brew gates.
 Never set the owner opt-in yourself. Never infer physical readiness from BLE.
 
 Only after the user explicitly confirms water, beans, filter, dripper, cup, and clear surroundings
@@ -141,7 +162,35 @@ If monitoring reaches its duration without a terminal machine state, `start` exi
 reports `completion_unconfirmed`, and preserves the machine binding for `monitor` or `cancel`.
 Never interpret that timeout as a failed brew or a completed brew.
 
+Interpret liquid telemetry as three separate measurements:
+
+- `target_dispensed_water_ml`: programmed recipe water, including machine bypass when present.
+- `dispensed_water_ml`: the machine's cumulative output for this operation (report `40523`), not
+  the amount remaining in a reservoir or direct-feed supply.
+- `cup_weight_g` / `cup_delta_g`: raw cup-scale weight and its net increase from the observed
+  operation baseline. Retained water, grounds, ice, evaporation, and timing can make this differ
+  from the machine meter.
+
+Do not claim the protocol exposes supply inventory; it only reports whether water is available and
+which source is selected.
+
 If anything is uncertain, cancel. Never schedule an unattended start.
+
+For a coffee brew that must support pause/resume, keep the whole load/start flow on the bridge:
+
+```text
+python <skill-dir>/scripts/xbloom.py bridge coffee-load <recipe.yaml>
+python <skill-dir>/scripts/xbloom.py bridge coffee-start \
+  --confirm-ready cup-filter-water-beans
+python <skill-dir>/scripts/xbloom.py bridge pause
+python <skill-dir>/scripts/xbloom.py bridge resume
+python <skill-dir>/scripts/xbloom.py bridge cancel
+```
+
+Only send pause/resume when bridge status shows a compatible running/paused activity. Command
+`40518` is state-sensitive: the same app command confirms start only after a fresh
+`awaiting_confirm` state and pauses while running. It is not an unconditional start opcode or a
+recipe rewrite.
 
 ## Use the Omni Tea Brewer
 
@@ -156,10 +205,30 @@ python <skill-dir>/scripts/xbloom.py tea-load <tea.yaml>
 
 `tea-load` only uploads the recipe. It must report `"status": "tea_loaded"` and
 `"remote_start_sent": false`. Execute only after the owner hot-water gate is enabled and the user
-currently confirms the Omni Tea Brewer, leaves, tank, receiving vessel, and clear surroundings:
+currently confirms the Omni Tea Brewer, leaves, selected water supply, receiving vessel, and clear
+surroundings:
 
 ```text
 python <skill-dir>/scripts/xbloom.py tea-start <same-tea.yaml> \
+  --confirm-ready tea-brewer-water-cup-clear
+```
+
+When load and execution should remain on one BLE connection, the same gates and checklist apply to:
+
+```text
+python <skill-dir>/scripts/xbloom.py tea-brew <tea.yaml> \
+  --confirm-ready tea-brewer-water-cup-clear
+```
+
+`tea-brew` still emits distinct `tea_loaded` and `start_accepted` states and preserves a recovery
+record until terminal telemetry. Soaking, paused, restarted, and soak-time reports are surfaced
+when firmware emits them.
+
+When the bridge is running, keep tea on that owner instead:
+
+```text
+python <skill-dir>/scripts/xbloom.py bridge tea-load <tea.yaml>
+python <skill-dir>/scripts/xbloom.py bridge tea-start \
   --confirm-ready tea-brewer-water-cup-clear
 ```
 
@@ -190,6 +259,15 @@ For an interactive absolute-weight request, keep the platform empty through entr
 when chat latency requires it and report only a stable, plausible positive reading. An all-zero
 session did not measure the object's absolute weight; explain the baseline and retry from empty.
 
+With a running bridge, the non-blocking equivalent keeps BLE ownership stable and permits an
+explicit re-tare or early exit:
+
+```text
+python <skill-dir>/scripts/xbloom.py bridge scale-start --duration 90
+python <skill-dir>/scripts/xbloom.py bridge scale-tare
+python <skill-dir>/scripts/xbloom.py bridge cancel
+```
+
 The grinder is a motor action. Never set its owner opt-in yourself. After current confirmation of
 beans, receiving cup, clear chute, and clear hands, an enabled deployment may run at most 30 s:
 
@@ -199,8 +277,9 @@ python <skill-dir>/scripts/xbloom.py grind --size 62 --rpm 100 --seconds 10 \
 ```
 
 Respect the persisted 60-second rest lock; do not delete it to retry. Standalone water is a
-hot-water action and uses the hot-water owner gate. Require a suitable centered vessel, filled tank,
-correct water path, and clear surroundings in the current interaction:
+hot-water action and uses the hot-water owner gate. Require a suitable centered vessel, available
+water at the selected source, the correct water path, and clear surroundings in the current
+interaction:
 
 ```text
 python <skill-dir>/scripts/xbloom.py water --volume 250 --temp 85 --flow 3.5 \
@@ -210,10 +289,73 @@ python <skill-dir>/scripts/xbloom.py water --volume 250 --temp 85 --flow 3.5 \
 Use `--temp RT` for the official room-temperature/pass-through setting. RT does not actively cool
 the source water to an exact 20 C, and it remains a guarded physical water-dispense action.
 `--water-source auto` follows the source reported by the machine; if that report is unavailable,
-require the user to select `tank` or `tap` explicitly instead of guessing.
+require the user to select `tank` or `tap` explicitly instead of guessing. Here `tap` is the
+protocol/CLI compatibility name for Studio's direct-feed/auto-refill source, not a promise about
+the installation's plumbing.
+
+Use the bridge when interactive grinder or FreeSolo-water pause/resume is required:
+
+```text
+python <skill-dir>/scripts/xbloom.py bridge grinder-start --size 62 --rpm 100 --seconds 10 \
+  --confirm-ready beans-cup-clear
+python <skill-dir>/scripts/xbloom.py bridge water-start --volume 250 --temp 85 --flow 3.5 \
+  --pattern center --water-source auto --confirm-ready vessel-water-clear
+python <skill-dir>/scripts/xbloom.py bridge pause
+python <skill-dir>/scripts/xbloom.py bridge resume
+```
+
+For bridge grinder control, a missing start/pause/resume ACK triggers fail-closed STOP/QUIT and
+must not be retried past the persisted rest lock. For bridge water, claim completion only when
+`last_operation.result` is `complete`. A result of `completion_unconfirmed` or
+`safety_timeout_stopped`, or a phase of `control_unconfirmed`/`stop_unconfirmed`, requires
+recovery and physical verification.
+
+The decoded FreeSolo live-temperature and live-pattern commands are intentionally separate from
+pause/resume. They change only the target for the remaining bounded water session: temperature has
+physical heating lag, pattern changes the outlet motion, and neither changes total volume or flow.
+They do not modify coffee recipe pours. A running `center → spiral` pattern change is physically
+verified on firmware `V12.0D.500`; command `8016` may apply without an echo, while report `8107` is
+optional and reported separately when observed. Live-temperature command encoding and its
+completed BLE write are verified, but physical outlet response is unmeasured.
+Keep both controls behind their owner gate and exact per-call confirmation, and report verification
+per control and firmware exactly as documented in `references/device-safety.md`.
 
 Never claim a grind or dispense completed unless its command reports success. On uncertainty, use
 the machine's physical stop/cancel after the wrapper's automatic STOP/QUIT cleanup.
+
+## Inspect or change Studio settings
+
+Read persistent user settings and APK-defined mechanical tuning without a write gate:
+
+```text
+python <skill-dir>/scripts/xbloom.py settings
+python <skill-dir>/scripts/xbloom.py advanced
+```
+
+If the bridge is running, use `bridge settings` and `bridge advanced` instead.
+
+Persistent changes are implemented with APK-exact commands, idle/firmware preflight,
+read-after-write comparison, and best-effort rollback. They have deterministic protocol coverage
+but have not been physically written by this project, so never set their owner opt-in on the
+user's behalf:
+
+```text
+XBLOOM_ENABLE_SETTINGS_WRITE=I_ACCEPT_PERSISTENT_MACHINE_SETTINGS
+python <skill-dir>/scripts/xbloom.py set-settings --weight-unit g \
+  --temperature-unit C --water-source tank --display medium \
+  --confirm-write persistent-machine-settings
+python <skill-dir>/scripts/xbloom.py set-advanced --pour-radius-level 3 \
+  --vibration-level 3 --confirm-write mechanical-tuning
+```
+
+For a running bridge, restart it while idle after setting the owner environment variable, then use
+the matching `bridge set-settings` or `bridge set-advanced` command. The daemon captures owner
+gates at startup.
+
+`set-advanced` derives five radius levels from the individual machine's reported baseline and uses
+the APK's six amplitude levels. Do not substitute raw values, write during a loaded/running
+workflow, or report success unless exact readback matches. These persistent controls are unrelated
+to per-recipe vibration timing and live FreeSolo pattern changes.
 
 ## Save A/B/C presets
 
@@ -224,12 +366,16 @@ Validate each file and write all three in A/B/C order:
 python <skill-dir>/scripts/xbloom.py save-slots <A.yaml> <B.yaml> <C.yaml>
 ```
 
+With a running bridge, use `bridge save-slots <A.yaml> <B.yaml> <C.yaml>` so the daemon remains the
+sole connection owner.
+
 Confirm JSON reports `"status": "saved"` and `"brew_started": false`. Do not use preset writes
 as a substitute for loading one temporary recipe.
 
 ## Handle failures
 
-- Runtime missing: run `scripts/bootstrap.py`; do not install packages globally.
+- Runtime missing: run `scripts/bootstrap.py`; do not install packages globally or inside a
+  read-only Skill cache.
 - No machine found: confirm Bluetooth is on, the Agent is executing locally, the phone app is not
   holding the connection, and the machine is nearby. Treat Studio BLE as single-controller in
   practice: have the user fully close/disconnect the phone app before Agent BLE work.
@@ -241,6 +387,11 @@ as a substitute for loading one temporary recipe.
   and cancel automatically reuse the recorded machine instead of scanning.
 - Tea-loaded-state record exists: execute the unchanged recipe while currently ready, or cancel.
 - Grinder cooldown active: wait for the reported remainder; never bypass the rest record.
+- Bridge running: do not start a direct BLE command. Use `bridge status`/`bridge events`, use the
+  matching bridge operation, or stop the idle daemon. If an activity is uncertain, keep the vessel
+  in place and use `bridge cancel` or the machine's physical control before `bridge stop --force`.
+- Bridge environment changed: restart the idle bridge; owner gates are captured by the daemon when
+  it starts. Never force-stop an activity merely to reload configuration.
 - `WAIT` or slow drawdown: follow the physical checks in `references/recipe-design.md`, then change
   one recipe variable.
 - Interrupted or unsafe operation: run `cancel` and use the machine's physical control if BLE fails.
@@ -253,13 +404,14 @@ Match the user's language. Keep the response compact but include:
 - For coffee: dose, extraction water, bypass/final water where applicable, grind, RPM, and expected time.
 - For tea: leaf mass, each steep's programmed water/temperature/pause, expected siphon output, and
   whether the recipe is official or adapted.
-- Every pour: ml, temperature, pattern, agitation, pause, and flow.
+- Every pour: ml, temperature, pattern, vibration timing, pause, and flow.
 - Validation result and file path.
 - Cited public sources, source brewer, original device, match quality, and every adaptation when
   web enrichment was used. Keep citations outside executable YAML.
 - Device state only if a BLE command was requested and actually run.
 - For scale/grinder/water, report the requested values and confirmed completion/exit without
-  publishing the machine identifier.
+  publishing the machine identifier. Keep recipe target, cumulative machine output, and cup-scale
+  increase separate; never describe any of them as water-supply inventory.
 - One taste-based next adjustment.
 
 Never say a brew started, completed, or was cancelled unless the corresponding command and machine

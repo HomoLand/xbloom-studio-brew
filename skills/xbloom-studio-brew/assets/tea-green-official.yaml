@@ -5,5 +5,5 @@ kind: tea
 leaf_g: 4
 output_ml_per_steep: 120
 pours:
-  - {label: Steep 1, ml: 90, temp_c: 85, pattern: ring,   pause_s: 20, flow_ml_s: 3.5}
+  - {label: Steep 1, ml: 90, temp_c: 85, pattern: circular, pause_s: 20, flow_ml_s: 3.5}
   - {label: Steep 2, ml: 90, temp_c: 85, pattern: center, pause_s: 15, flow_ml_s: 3.5}

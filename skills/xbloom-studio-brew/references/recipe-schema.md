@@ -23,8 +23,12 @@ schema and protocol; read `tea-brewing.md` and validate them with `tea-validate`
 | `ice_g` | Flash only | 40-180 g; forbidden on hot recipes except zero/omitted. |
 | `time` | Optional | Display-only expected range; quote it as a string. |
 | `note` | Optional | Display-only preparation or flavor note. |
-| `stage_temps` | Yes | Keep exactly `[110.0, 90.0]`; these are decoded staging fields, not pour temperatures. |
 | `pours` | Yes | Two to five ordered pour mappings. |
+
+The old public field `stage_temps: [110.0, 90.0]` is accepted only as a migration aid and omitted
+when the recipe is re-serialized. APK and capture comparison identify command `8104` as cup/staging
+geometry compatibility data, not tunable stage temperature. The encoder supplies the captured
+`110/90` values internally; recipes must not expose or tune them.
 
 For a hot recipe without bypass, sum of pours, `hot_water_ml`, and `water_ml` match. With bypass,
 `hot_water_ml` remains the extraction-pour total while `water_ml = hot_water_ml + bypass_ml`.
@@ -42,8 +46,9 @@ be 1:12 through 1:20.
 | `label` | Optional | Human-readable stage name. |
 | `ml` | Yes | 10-127 ml. Automatic protocol splitting is disabled. |
 | `temp_c` | Yes | `RT`, 80-95 C, or `BP`. |
-| `pattern` | Yes | `spiral`, `ring`, or `center`. First pour cannot be `center`. |
-| `agitation` | Yes | Boolean; allowed only for a spiral first pour and at most once. |
+| `pattern` | Yes | `spiral`, `circular`, or `center`. Legacy `ring` is accepted as an alias. First pour cannot be `center`. |
+| `vibration` | Recommended | Independent timing: `none`, `before`, `after`, or `both`; defaults to `none`. |
+| `agitation` | Deprecated | Legacy boolean accepted only for old files. Do not combine it with `vibration`. |
 | `pause_s` | Yes | 0-60 seconds after the pour. |
 | `rpm` | Yes | 60-120 in 10-RPM steps for non-center pours; `0` for center. Repeat one non-zero value. |
 | `flow_ml_s` | Yes | 3.0-3.5 ml/s in 0.1 increments. |
@@ -70,13 +75,12 @@ water_ml: 240
 hot_water_ml: 240
 time: "2:25-3:00"
 note: First-cup baseline; change one variable after tasting.
-stage_temps: [110.0, 90.0]
 pours:
   - label: Bloom
     ml: 45
     temp_c: 93
     pattern: spiral
-    agitation: true
+    vibration: after
     pause_s: 35
     rpm: 100
     flow_ml_s: 3.0
@@ -84,15 +88,15 @@ pours:
     ml: 105
     temp_c: 93
     pattern: spiral
-    agitation: false
+    vibration: none
     pause_s: 10
     rpm: 100
     flow_ml_s: 3.3
   - label: Finish
     ml: 90
     temp_c: 92
-    pattern: ring
-    agitation: false
+    pattern: circular
+    vibration: none
     pause_s: 0
     rpm: 100
     flow_ml_s: 3.3

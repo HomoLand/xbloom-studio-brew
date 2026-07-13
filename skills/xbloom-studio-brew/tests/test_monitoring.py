@@ -46,6 +46,55 @@ def test_monitor_aggregates_weights_and_returns_terminal_summary(monkeypatch):
     assert emitted[-1]["coffee_g"] == 12.12
 
 
+def test_monitor_keeps_recipe_target_machine_meter_and_cup_delta_distinct(monkeypatch):
+    emitted = []
+    monkeypatch.setattr(xbloom, "emit", emitted.append)
+    client = FakeTelemetryClient(
+        [
+            StatusEvent(state=0x22, state_name="starting", raw=b"state"),
+            StatusEvent(
+                state=None,
+                state_name="scale",
+                raw=b"cup-baseline",
+                cup_weight_g=28.0,
+            ),
+            StatusEvent(
+                state=None,
+                state_name="water_volume",
+                raw=b"water",
+                command_code=40523,
+                dispensed_water_ml=150.0,
+            ),
+            StatusEvent(
+                state=None,
+                state_name="scale",
+                raw=b"cup-final",
+                cup_weight_g=164.5,
+            ),
+            StatusEvent(state=0x24, state_name="ready", raw=b"ready"),
+        ]
+    )
+
+    result = asyncio.run(xbloom.monitor_client(client, 30, progress_interval=60))
+    comparison = xbloom.volume_comparison(
+        {"target_dispensed_water_ml": 152.0}, result
+    )
+
+    assert result.water_g == 150.0
+    assert result.coffee_g == 164.5
+    assert result.cup_delta_g == 136.5
+    assert comparison == {
+        "target_dispensed_water_ml": 152.0,
+        "dispensed_water_ml": 150.0,
+        "dispensed_vs_target_ml": -2.0,
+        "cup_delta_g": 136.5,
+        "cup_delta_to_dispensed_ratio": 0.91,
+    }
+    assert emitted[-1]["dispensed_water_ml"] == 150.0
+    assert emitted[-1]["cup_weight_g"] == 164.5
+    assert emitted[-1]["cup_delta_g"] == 136.5
+
+
 def test_monitor_does_not_treat_initial_idle_as_completion(monkeypatch):
     monkeypatch.setattr(xbloom, "emit", lambda _data: None)
     client = FakeTelemetryClient(
@@ -136,8 +185,8 @@ def test_monitor_reattach_uses_active_hint_and_clears_confirmed_state(
             terminal_state="ready",
             last_state="ready",
             saw_active=True,
-            water_g=150.0,
-            coffee_g=116.6,
+            dispensed_water_ml=150.0,
+            cup_weight_g=116.6,
             scale_g=None,
             events_seen=1,
             elapsed_s=0.1,
@@ -219,8 +268,8 @@ def test_start_clears_state_only_after_terminal_confirmation(
             terminal_state=terminal_state,
             last_state=terminal_state,
             saw_active=True,
-            water_g=150.0,
-            coffee_g=116.6,
+            dispensed_water_ml=150.0,
+            cup_weight_g=116.6,
             scale_g=None,
             events_seen=100,
             elapsed_s=10.0,

@@ -56,7 +56,7 @@ def test_inconsistent_recipe_rpm_is_rejected(tmp_path):
 def test_center_first_pour_is_rejected(tmp_path):
     data = _hot_mapping()
     data["pours"][0]["pattern"] = "center"
-    data["pours"][0]["agitation"] = False
+    data["pours"][0]["vibration"] = "none"
     data["pours"][0]["rpm"] = 0
     with pytest.raises(SafetyError, match="first pour cannot use center"):
         load_strict_recipe(_write(tmp_path, data))

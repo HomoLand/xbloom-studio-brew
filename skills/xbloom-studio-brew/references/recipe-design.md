@@ -48,10 +48,11 @@ Start with one of these pour structures:
 
 - Balanced 240 ml: 45 / 105 / 90 ml.
 - Layered 240 ml: 45 / 65 / 65 / 65 ml.
-- Lower-agitation 225 ml: 40 / 100 / 85 ml.
+- Lower-vibration 225 ml: 40 / 100 / 85 ml.
 
-Use a spiral bloom, spiral main pour, and spiral or ring finish. Enable agitation only on the
-first pour. Keep adjacent pour temperatures within 0-2 C unless a tasted result justifies more.
+Use a spiral bloom, spiral main pour, and spiral or circular finish. For the conservative baseline,
+use `vibration: after` on the bloom and `none` later; the protocol can independently encode
+`none`, `before`, `after`, or `both` on every stage. Keep adjacent pour temperatures within 0-2 C unless a tasted result justifies more.
 Use 3.0 ml/s for the bloom and 3.2-3.5 ml/s afterward. Prefer fewer pours for slow-draining,
 fine-heavy, dark, or strongly fermented coffees.
 
@@ -66,12 +67,12 @@ Apply only the smallest relevant adjustment to the chosen roast profile.
 
 - Washed and high-density: keep the base temperature; use the finer half of the grind range
   when the target is clarity and the drawdown is not slow.
-- Honey: begin with the base row; favor three pours and bloom-only agitation.
+- Honey: begin with the base row; favor three pours and bloom-only vibration.
 - Natural: begin 1-2 steps coarser or 1 C cooler than a comparable washed coffee when the cup
   risks dryness or fermented heaviness. Do not suppress a clean, floral natural automatically.
-- Anaerobic or fermentation-heavy: use three pours, bloom-only agitation, and the lower half
+- Anaerobic or fermentation-heavy: use three pours, bloom-only vibration, and the lower half
   of the profile's temperature range.
-- Dark roast: avoid combining fine grind, high temperature, long pauses, and agitation.
+- Dark roast: avoid combining fine grind, high temperature, long pauses, and strong vibration.
 
 ### Roast age
 
@@ -102,7 +103,7 @@ Design from final beverage water first:
 3. Brew the remaining 60-65% as hot water through the coffee.
 4. Use a grind 2-4 steps finer and a temperature 1-2 C hotter than the comparable hot recipe,
    while staying inside the guarded limits.
-5. Use three pours and bloom-only agitation.
+5. Use three pours and bloom-only vibration.
 
 Reliable 15 g starting point:
 
@@ -144,18 +145,18 @@ stop and explain if the converted setting falls outside that operational envelop
 
 ## Diagnose by changing one variable
 
-Use taste plus flow behavior. Never change grind, temperature, agitation, and ratio together.
+Use taste plus flow behavior. Never change grind, temperature, vibration, and ratio together.
 
 | Result | First correction | If still present |
 | --- | --- | --- |
 | Sharp, hollow, sour; fast drawdown | Grind 2 steps finer | Add 3-5 s to bloom pause |
 | Sour but slow or flooded | Raise temperature 1 C | Reduce early water or check filter/setup |
-| Bitter, dry, astringent | Grind 2 steps coarser | Remove agitation, then lower 1 C |
+| Bitter, dry, astringent | Grind 2 steps coarser | Remove vibration, then lower 1 C |
 | Muted but otherwise clean | Grind 1-2 steps finer | Raise 1 C |
 | Heavy fermented note | Lower 1-2 C | Grind 2 steps coarser |
 | Thin flash brew | Grind 2 steps finer | Raise hot-water temperature 1 C |
 | Harsh flash brew | Grind 2 steps coarser | Lower hot-water temperature 1 C |
-| `WAIT`, flooding, or very slow drawdown | Check physical setup, then grind 2-4 steps coarser | Use fewer pours and no agitation |
+| `WAIT`, flooding, or very slow drawdown | Check physical setup, then grind 2-4 steps coarser | Use fewer pours and no vibration |
 
 For `WAIT`, first confirm the scale tape is removed, the cup is not touching the machine, the
 cup was not moved, the correct dripper is selected, and the filter is seated and draining.

@@ -24,7 +24,7 @@ TOP_LEVEL_KEYS = frozenset(
     {"name", "kind", "leaf_g", "output_ml_per_steep", "pours"}
 )
 POUR_KEYS = frozenset({"label", "ml", "temp_c", "pattern", "pause_s", "flow_ml_s"})
-PATTERNS = frozenset({"center", "spiral", "ring"})
+PATTERNS = frozenset({"center", "spiral", "circular", "ring"})
 
 
 @dataclass(frozen=True)
@@ -33,7 +33,7 @@ class TeaPour:
 
     ml: int
     temp_c: int
-    pattern: str = "ring"
+    pattern: str = "circular"
     pause_s: int = 20
     flow_ml_s: float = 3.5
     label: str | None = None
@@ -96,7 +96,11 @@ class TeaRecipe:
                     TeaPour(
                         ml=int(raw["ml"]),
                         temp_c=int(raw["temp_c"]),
-                        pattern=str(raw.get("pattern", "ring")).strip().lower(),
+                        pattern=(
+                            "circular"
+                            if str(raw.get("pattern", "circular")).strip().lower() == "ring"
+                            else str(raw.get("pattern", "circular")).strip().lower()
+                        ),
                         pause_s=int(raw.get("pause_s", 20)),
                         flow_ml_s=float(raw.get("flow_ml_s", 3.5)),
                         label=str(raw["label"]) if raw.get("label") is not None else None,

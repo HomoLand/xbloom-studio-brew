@@ -1,7 +1,7 @@
 """Guarded xBloom Studio CLI for Agent Skills.
 
 Common flow: doctor -> scan -> probe -> validate -> load -> monitor/cancel.
-Remote start exists behind two independent opt-ins and is never the default.
+Physical actions and experimental live adjustment use independent owner gates.
 """
 
 from __future__ import annotations
@@ -20,9 +20,17 @@ import sys
 import time
 from typing import Any
 
+from xbloom_paths import (
+    legacy_runtime_python,
+    preferred_runtime_python,
+    runtime_python_path,
+    skill_runtime_dir,
+    skill_state_dir,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
-STATE_DIR = Path(os.environ.get("XBLOOM_SKILL_STATE_DIR", Path.home() / ".xbloom-studio-brew"))
+STATE_DIR = skill_state_dir()
 STATE_FILE = STATE_DIR / "armed-state.json"
 TEA_STATE_FILE = STATE_DIR / "tea-loaded-state.json"
 GRINDER_STATE_FILE = STATE_DIR / "grinder-rest-state.json"
@@ -30,6 +38,12 @@ REMOTE_START_ENV = "XBLOOM_ENABLE_REMOTE_START"
 REMOTE_START_SENTINEL = "I_UNDERSTAND_REMOTE_HOT_WATER"
 REMOTE_GRINDER_ENV = "XBLOOM_ENABLE_REMOTE_GRINDER"
 REMOTE_GRINDER_SENTINEL = "I_UNDERSTAND_REMOTE_GRINDER"
+LIVE_ADJUST_ENV = "XBLOOM_ENABLE_LIVE_ADJUST"
+LIVE_ADJUST_SENTINEL = "I_ACCEPT_UNVERIFIED_LIVE_ADJUST"
+SETTINGS_WRITE_ENV = "XBLOOM_ENABLE_SETTINGS_WRITE"
+SETTINGS_WRITE_SENTINEL = "I_ACCEPT_PERSISTENT_MACHINE_SETTINGS"
+SETTINGS_CONFIRM_SENTINEL = "persistent-machine-settings"
+ADVANCED_CONFIRM_SENTINEL = "mechanical-tuning"
 READY_SENTINEL = "cup-filter-water-beans"
 WATER_READY_SENTINEL = "vessel-water-clear"
 GRINDER_READY_SENTINEL = "beans-cup-clear"
@@ -47,9 +61,9 @@ UNCONFIRMED_COMPLETION_EXIT = 3
 
 
 def local_python() -> Path:
-    if os.name == "nt":
-        return ROOT / ".venv" / "Scripts" / "python.exe"
-    return ROOT / ".venv" / "bin" / "python"
+    """External runtime, with a temporary fallback for pre-migration installs."""
+
+    return preferred_runtime_python(ROOT)
 
 
 def reexec_in_local_runtime() -> None:
@@ -155,6 +169,10 @@ def require_grinder_rest() -> None:
         raise RuntimeError(
             "grinder rest record is unreadable; do not grind until an owner inspects it"
         ) from exc
+    if data.get("in_progress"):
+        raise RuntimeError(
+            "a previous grinder session has no verified stop; inspect/recover before grinding"
+        )
     remaining = float(data.get("blocked_until", 0)) - time.time()
     if remaining > 0:
         raise RuntimeError(
@@ -316,13 +334,37 @@ def load_recipe(path: str | Path):
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
+    bridge_running = False
+    if runtime_ready():
+        from xbloom_ble.bridge import bridge_is_running as check_bridge_running
+
+        bridge_running = check_bridge_running()
+
+    selected_runtime = local_python()
+    external_runtime = runtime_python_path(skill_runtime_dir())
+    legacy_runtime = legacy_runtime_python(ROOT)
+    try:
+        runtime_location = (
+            "external"
+            if selected_runtime.resolve() == external_runtime.resolve()
+            else "legacy_skill_local"
+        )
+    except OSError:
+        runtime_location = "external"
+
     report: dict[str, Any] = {
         "command": "doctor",
         "ok": runtime_ready(),
         "python": sys.version.split()[0],
         "platform": platform.system().lower(),
-        "local_runtime": str(local_python()),
-        "local_runtime_exists": local_python().exists(),
+        "runtime_python": str(selected_runtime),
+        "runtime_exists": selected_runtime.exists(),
+        "runtime_location": runtime_location,
+        "state_dir": str(STATE_DIR),
+        # Compatibility aliases retained for first-generation Agent consumers.
+        "local_runtime": str(selected_runtime),
+        "local_runtime_exists": selected_runtime.exists(),
+        "legacy_runtime_exists": legacy_runtime.exists(),
         "bleak": importlib.util.find_spec("bleak") is not None,
         "pyyaml": importlib.util.find_spec("yaml") is not None,
         "vendored_protocol": (ROOT / "scripts" / "xbloom_ble" / "protocol.py").exists(),
@@ -336,11 +378,53 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "temperature_water": True,
             "temperature_water_modes": ["RT", "40-98 C"],
             "water_sources": ["tank", "tap"],
+            "water_source_semantics": {"tank": "reservoir", "tap": "direct_feed"},
             "machine_info": True,
+            "persistent_bridge": (
+                ROOT / "scripts" / "xbloom_ble" / "bridge.py"
+            ).exists(),
+            "interactive_pause_resume": True,
+            "persistent_bridge_operations": [
+                "coffee",
+                "tea",
+                "scale",
+                "grinder",
+                "water",
+                "presets",
+                "settings",
+                "advanced_tuning",
+            ],
+            "easy_mode_scope": "atomic_abc_only",
+            "freesolo_live_adjust_protocol": True,
+            "freesolo_live_adjust_hardware_verified": False,
+            "freesolo_live_pattern_hardware_verified": True,
+            "freesolo_live_temperature_command_verified": True,
+            "freesolo_live_temperature_outlet_effect_measured": False,
+            "freesolo_live_temperature_hardware_verified": False,
+            "persistent_settings_protocol": True,
+            "persistent_settings_hardware_write_tested": False,
+            "advanced_tuning_protocol": True,
+            "advanced_tuning_hardware_write_tested": False,
+            "four_state_recipe_vibration": ["none", "before", "after", "both"],
+            "telemetry": [
+                "target_dispensed_water_ml",
+                "dispensed_water_ml",
+                "cup_weight_g",
+                "cup_delta_g",
+                "tea_phase",
+                "errors",
+            ],
         },
+        "bridge_running": bridge_running,
         "physical_actions_enabled": {
             "hot_water": os.environ.get(REMOTE_START_ENV) == REMOTE_START_SENTINEL,
             "grinder": os.environ.get(REMOTE_GRINDER_ENV) == REMOTE_GRINDER_SENTINEL,
+            "live_adjust_unverified": (
+                os.environ.get(LIVE_ADJUST_ENV) == LIVE_ADJUST_SENTINEL
+            ),
+            "persistent_settings": (
+                os.environ.get(SETTINGS_WRITE_ENV) == SETTINGS_WRITE_SENTINEL
+            ),
         },
     }
     if args.scan and runtime_ready():
@@ -379,6 +463,110 @@ async def async_probe(args: argparse.Namespace) -> int:
     return 0
 
 
+def require_settings_write_gate(confirmation: str, expected: str) -> None:
+    if os.environ.get(SETTINGS_WRITE_ENV) != SETTINGS_WRITE_SENTINEL:
+        raise RuntimeError(
+            f"persistent machine writes disabled; administrator must set "
+            f"{SETTINGS_WRITE_ENV}={SETTINGS_WRITE_SENTINEL}"
+        )
+    if confirmation != expected:
+        raise RuntimeError(f"--confirm-write must equal {expected}")
+
+
+async def _ephemeral_bridge_rpc(
+    address: str, method: str, params: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Use the same state machine as the daemon for a one-shot connection."""
+
+    from xbloom_ble.bridge import BridgeCore
+
+    core = BridgeCore(default_address=address, state_dir=STATE_DIR)
+    try:
+        return await core.rpc(method, params)
+    finally:
+        await core.shutdown()
+
+
+async def async_settings(args: argparse.Namespace) -> int:
+    """Read persistent user settings without changing the machine."""
+
+    ensure_no_loaded_workflow()
+    address, name = await resolve_address(args.address, args.scan_timeout)
+    result = await _ephemeral_bridge_rpc(address, "settings.read")
+    emit({"command": "settings", "machine": name, **result})
+    return 0
+
+
+async def async_set_settings(args: argparse.Namespace) -> int:
+    """Persist selected settings with readback and best-effort rollback."""
+
+    require_settings_write_gate(args.confirm_write, SETTINGS_CONFIRM_SENTINEL)
+    requested = {
+        key: value
+        for key, value in {
+            "weight_unit": args.weight_unit,
+            "temperature_unit": args.temperature_unit,
+            "water_source": args.water_source,
+            "display": args.display,
+        }.items()
+        if value is not None
+    }
+    if not requested:
+        raise RuntimeError("set-settings needs at least one setting option")
+    ensure_no_loaded_workflow()
+    address, name = await resolve_address(args.address, args.scan_timeout)
+    result = await _ephemeral_bridge_rpc(
+        address,
+        "settings.write",
+        {**requested, "confirmation": args.confirm_write},
+    )
+    emit(
+        {
+            "command": "set-settings",
+            "machine": name,
+            **result,
+        }
+    )
+    return 0
+
+
+async def async_advanced(args: argparse.Namespace) -> int:
+    """Read APK-defined mechanical tuning values."""
+
+    ensure_no_loaded_workflow()
+    address, name = await resolve_address(args.address, args.scan_timeout)
+    result = await _ephemeral_bridge_rpc(address, "advanced.read")
+    emit({"command": "advanced", "machine": name, **result})
+    return 0
+
+
+async def async_set_advanced(args: argparse.Namespace) -> int:
+    """Write UI-level mechanical tuning with exact readback and rollback."""
+
+    require_settings_write_gate(args.confirm_write, ADVANCED_CONFIRM_SENTINEL)
+    if args.pour_radius_level is None and args.vibration_level is None:
+        raise RuntimeError("set-advanced needs at least one level option")
+    ensure_no_loaded_workflow()
+    address, name = await resolve_address(args.address, args.scan_timeout)
+    result = await _ephemeral_bridge_rpc(
+        address,
+        "advanced.write",
+        {
+            "pour_radius_level": args.pour_radius_level,
+            "vibration_level": args.vibration_level,
+            "confirmation": args.confirm_write,
+        },
+    )
+    emit(
+        {
+            "command": "set-advanced",
+            "machine": name,
+            **result,
+        }
+    )
+    return 0
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     path, _recipe, summary = load_recipe(args.recipe)
     emit({"command": "validate", "ok": True, "path": str(path), **summary})
@@ -406,6 +594,7 @@ async def async_load(args: argparse.Namespace) -> int:
             "loaded_at": time.time(),
             "status": "armed",
             "firmware": firmware,
+            "target_dispensed_water_ml": summary["target_dispensed_water_ml"],
         }
     )
     emit(
@@ -431,15 +620,32 @@ class MonitorResult:
     terminal_state: str | None
     last_state: str | None
     saw_active: bool
-    water_g: float | None
-    coffee_g: float | None
+    dispensed_water_ml: float | None
+    cup_weight_g: float | None
     scale_g: float | None
     events_seen: int
     elapsed_s: float
+    cup_delta_g: float | None = None
+    last_report: str | None = None
+    tea_phase: str | None = None
+    pour_stage: int | None = None
+    errors: tuple[str, ...] = ()
 
     @property
     def completion_confirmed(self) -> bool:
         return self.terminal_confirmed and self.terminal_state in {"ready", "complete"}
+
+    @property
+    def water_g(self) -> float | None:
+        """Deprecated v1 alias for ``dispensed_water_ml``."""
+
+        return self.dispensed_water_ml
+
+    @property
+    def coffee_g(self) -> float | None:
+        """Deprecated v1 alias for ``cup_weight_g``."""
+
+        return self.cup_weight_g
 
     def summary(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -453,13 +659,50 @@ class MonitorResult:
             data["terminal_state"] = self.terminal_state
         if self.last_state is not None:
             data["last_state"] = self.last_state
-        if self.water_g is not None:
-            data["water_g"] = self.water_g
-        if self.coffee_g is not None:
-            data["coffee_g"] = self.coffee_g
+        if self.dispensed_water_ml is not None:
+            data["dispensed_water_ml"] = self.dispensed_water_ml
+            data["water_g"] = self.dispensed_water_ml  # compatibility alias
+        if self.cup_weight_g is not None:
+            data["cup_weight_g"] = self.cup_weight_g
+            data["coffee_g"] = self.cup_weight_g  # compatibility alias
+        if self.cup_delta_g is not None:
+            data["cup_delta_g"] = self.cup_delta_g
         if self.scale_g is not None:
             data["scale_g"] = self.scale_g
+        if self.last_report is not None:
+            data["last_report"] = self.last_report
+        if self.tea_phase is not None:
+            data["tea_phase"] = self.tea_phase
+        if self.pour_stage is not None:
+            data["pour_stage"] = self.pour_stage
+        if self.errors:
+            data["errors"] = list(self.errors)
         return data
+
+
+def volume_comparison(
+    state: dict[str, Any], result: MonitorResult
+) -> dict[str, float]:
+    """Compare recipe target, machine meter, and cup-scale net increase."""
+    data: dict[str, float] = {}
+    target = state.get("target_dispensed_water_ml")
+    if isinstance(target, (int, float)):
+        data["target_dispensed_water_ml"] = float(target)
+    if result.dispensed_water_ml is not None:
+        data["dispensed_water_ml"] = float(result.dispensed_water_ml)
+        if "target_dispensed_water_ml" in data:
+            data["dispensed_vs_target_ml"] = round(
+                float(result.dispensed_water_ml) - data["target_dispensed_water_ml"], 2
+            )
+    if result.cup_delta_g is not None:
+        data["cup_delta_g"] = float(result.cup_delta_g)
+        if result.dispensed_water_ml not in (None, 0):
+            # Mass and volume are deliberately not subtracted as if they shared
+            # units. This ratio is a descriptive g/ml capture indicator only.
+            data["cup_delta_to_dispensed_ratio"] = round(
+                float(result.cup_delta_g) / float(result.dispensed_water_ml), 4
+            )
+    return data
 
 
 def mark_workflow_started(
@@ -513,22 +756,49 @@ async def monitor_client(
     last_emitted_state: str | None = None
     last_state: str | None = None
     terminal_state: str | None = None
-    water_g: float | None = None
-    coffee_g: float | None = None
+    dispensed_water_ml: float | None = None
+    cup_weight_g: float | None = None
     scale_g: float | None = None
+    cup_baseline_g: float | None = None
+    cup_delta_g: float | None = None
+    cup_delta_peak_g: float | None = None
+    last_report: str | None = None
+    tea_phase: str | None = None
+    pour_stage: int | None = None
+    error_reports: list[str] = []
     events_seen = 0
 
     def on_event(event: Any) -> None:
         nonlocal saw_active, last_progress_emit, last_emitted_state, last_state
-        nonlocal terminal_state, water_g, coffee_g, scale_g, events_seen
+        nonlocal terminal_state, dispensed_water_ml, cup_weight_g, scale_g, events_seen
+        nonlocal cup_baseline_g, cup_delta_g, cup_delta_peak_g
+        nonlocal last_report, tea_phase, pour_stage
         events_seen += 1
         now = time.monotonic()
-        if event.water_g is not None:
-            water_g = event.water_g
-        if event.coffee_g is not None:
-            coffee_g = event.coffee_g
+        dispensed = event.dispensed_water_ml
+        cup_weight = event.cup_weight_g
+        if dispensed is not None:
+            dispensed_water_ml = max(dispensed_water_ml or 0.0, float(dispensed))
+        if cup_weight is not None:
+            cup_weight_g = cup_weight
+            value = float(cup_weight)
+            cup_baseline_g = value if cup_baseline_g is None else min(cup_baseline_g, value)
+            cup_delta_g = round(max(0.0, value - cup_baseline_g), 2)
+            cup_delta_peak_g = max(cup_delta_peak_g or 0.0, cup_delta_g)
         if event.scale_g is not None:
             scale_g = event.scale_g
+        if event.report_name is not None:
+            last_report = event.report_name
+        if event.report_name == "tea_soaking":
+            tea_phase = "soaking"
+        elif event.report_name == "tea_paused":
+            tea_phase = "paused"
+        elif event.report_name == "tea_restarted":
+            tea_phase = "running"
+        if event.report_name == "pour_stage" and event.report_value is not None:
+            pour_stage = int(event.report_value)
+        if getattr(event, "is_error", False) and event.report_name:
+            error_reports.append(event.report_name)
         if event.state in active_states:
             saw_active = True
         if event.state is not None:
@@ -536,7 +806,7 @@ async def monitor_client(
         terminal = saw_active and event.state in terminal_states
         state_changed = event.state is not None and event.state_name != last_emitted_state
         has_weight = any(
-            value is not None for value in (event.water_g, event.coffee_g, event.scale_g)
+            value is not None for value in (dispensed, cup_weight, event.scale_g)
         )
         if terminal or state_changed or (has_weight and now - last_progress_emit >= progress_interval):
             data: dict[str, Any] = {
@@ -544,12 +814,26 @@ async def monitor_client(
                 "time": round(time.time(), 3),
                 "state": event.state_name if event.state is not None else (last_state or "scale"),
             }
-            if water_g is not None:
-                data["water_g"] = water_g
-            if coffee_g is not None:
-                data["coffee_g"] = coffee_g
+            if dispensed_water_ml is not None:
+                data["dispensed_water_ml"] = dispensed_water_ml
+                # Keep the original public field while callers migrate to the
+                # more precise name above.
+                data["water_g"] = dispensed_water_ml
+            if cup_weight_g is not None:
+                data["cup_weight_g"] = cup_weight_g
+                # Legacy alias: this is the raw cup-scale reading, not coffee
+                # beverage mass after subtracting the brewer hardware.
+                data["coffee_g"] = cup_weight_g
+            if cup_delta_g is not None:
+                data["cup_delta_g"] = cup_delta_g
             if scale_g is not None:
                 data["scale_g"] = scale_g
+            if last_report is not None:
+                data["report"] = last_report
+            if tea_phase is not None:
+                data["tea_phase"] = tea_phase
+            if pour_stage is not None:
+                data["pour_stage"] = pour_stage
             emit(data)
             last_progress_emit = now
             if event.state is not None:
@@ -568,11 +852,16 @@ async def monitor_client(
         terminal_state=terminal_state,
         last_state=last_state,
         saw_active=saw_active,
-        water_g=water_g,
-        coffee_g=coffee_g,
+        dispensed_water_ml=dispensed_water_ml,
+        cup_weight_g=cup_weight_g,
         scale_g=scale_g,
         events_seen=events_seen,
         elapsed_s=round(time.monotonic() - started, 2),
+        cup_delta_g=cup_delta_peak_g,
+        last_report=last_report,
+        tea_phase=tea_phase,
+        pour_stage=pour_stage,
+        errors=tuple(dict.fromkeys(error_reports)),
     )
 
 
@@ -619,6 +908,11 @@ async def async_monitor(args: argparse.Namespace) -> int:
             ),
             "state_records_cleared": state_records_cleared,
             **result.summary(),
+            **(
+                volume_comparison(workflow_records[0][1], result)
+                if len(workflow_records) == 1
+                else {}
+            ),
         }
     )
     return 0
@@ -780,8 +1074,12 @@ async def async_water(args: argparse.Namespace) -> int:
             ),
             "machine": name,
             "firmware": firmware,
-            "volume_ml": args.volume,
-            "metered_volume_ml": event.water_g,
+            "target_dispensed_water_ml": args.volume,
+            "dispensed_water_ml": event.dispensed_water_ml,
+            "dispensed_vs_target_ml": round(
+                float(event.dispensed_water_ml or 0.0) - float(args.volume), 2
+            ),
+            "cup_delta_g": (event.report_values or {}).get("cup_delta_g"),
             "temp_c": args.temp,
             "temp_setting": (
                 "RT" if args.temp == ROOM_TEMPERATURE_C else f"{args.temp} C"
@@ -835,6 +1133,7 @@ async def async_tea_load(args: argparse.Namespace) -> int:
             "loaded_at": time.time(),
             "status": "tea_loaded",
             "firmware": firmware,
+            "target_dispensed_water_ml": summary["programmed_water_ml"],
         },
         TEA_STATE_FILE,
     )
@@ -901,6 +1200,7 @@ async def async_tea_start(args: argparse.Namespace) -> int:
             client,
             args.duration,
             progress_interval=args.progress_interval,
+            active_already=True,
         )
     state_record_cleared = finalize_workflow_state(state, TEA_STATE_FILE, result)
     output = {
@@ -910,6 +1210,92 @@ async def async_tea_start(args: argparse.Namespace) -> int:
         ),
         "state_record_cleared": state_record_cleared,
         **result.summary(),
+        **volume_comparison(state, result),
+    }
+    if not result.terminal_confirmed:
+        output["next_action"] = "run monitor or cancel; do not assume tea completed"
+    emit(output)
+    return 0 if result.terminal_confirmed else UNCONFIRMED_COMPLETION_EXIT
+
+
+async def async_tea_brew(args: argparse.Namespace) -> int:
+    """Load then explicitly execute tea in one connected, recoverable workflow."""
+    from xbloom_ble.client import XBloomClient
+
+    if os.environ.get(REMOTE_START_ENV) != REMOTE_START_SENTINEL:
+        raise RuntimeError(
+            f"hot-water actions disabled; administrator must set "
+            f"{REMOTE_START_ENV}={REMOTE_START_SENTINEL}"
+        )
+    if args.confirm_ready != TEA_READY_SENTINEL:
+        raise RuntimeError(f"--confirm-ready must equal {TEA_READY_SENTINEL}")
+    if not 1 <= float(args.duration) <= 3600:
+        raise RuntimeError("tea-brew --duration must be 1-3600 seconds")
+    if not 0.1 <= float(args.progress_interval) <= 60:
+        raise RuntimeError("tea-brew --progress-interval must be 0.1-60 seconds")
+
+    path, recipe, summary = load_tea_recipe(args.recipe)
+    ensure_no_loaded_workflow()
+    address, name = await resolve_address(args.address, args.scan_timeout)
+    preflight = await inspect_machine(address)
+    firmware = require_write_preflight(preflight)
+    state = {
+        "address": address,
+        "machine": name,
+        "recipe_path": str(path),
+        "recipe_sha256": summary["recipe_sha256"],
+        "loaded_at": time.time(),
+        "status": "tea_loaded",
+        "firmware": firmware,
+        "target_dispensed_water_ml": summary["programmed_water_ml"],
+    }
+
+    async with XBloomClient(address) as client:
+        load_ack = await client.load_tea_recipe(recipe)
+        state_write(state, TEA_STATE_FILE)
+        emit(
+            {
+                "command": "tea-brew",
+                "status": "tea_loaded",
+                "machine": name,
+                "firmware": firmware,
+                "verified_by_command": (
+                    f"0x{load_ack.command_code:04x}"
+                    if load_ack.command_code is not None
+                    else None
+                ),
+                **summary,
+            }
+        )
+        start_ack = await client.start_tea()
+        state = mark_workflow_started(state, TEA_STATE_FILE, "start_accepted")
+        emit(
+            {
+                "command": "tea-brew",
+                "status": "start_accepted",
+                "verified_by_command": (
+                    f"0x{start_ack.command_code:04x}"
+                    if start_ack.command_code is not None
+                    else None
+                ),
+            }
+        )
+        result = await monitor_client(
+            client,
+            args.duration,
+            progress_interval=args.progress_interval,
+            active_already=True,
+        )
+
+    state_record_cleared = finalize_workflow_state(state, TEA_STATE_FILE, result)
+    output = {
+        "command": "tea-brew",
+        "status": (
+            result.terminal_state if result.terminal_confirmed else "completion_unconfirmed"
+        ),
+        "state_record_cleared": state_record_cleared,
+        **result.summary(),
+        **volume_comparison(state, result),
     }
     if not result.terminal_confirmed:
         output["next_action"] = "run monitor or cancel; do not assume tea completed"
@@ -995,6 +1381,7 @@ async def async_start(args: argparse.Namespace) -> int:
         ),
         "state_record_cleared": state_record_cleared,
         **result.summary(),
+        **volume_comparison(state, result),
     }
     if not result.terminal_confirmed:
         output["next_action"] = "run monitor or cancel; do not assume brew completed"
@@ -1025,6 +1412,202 @@ async def async_save_slots(args: argparse.Namespace) -> int:
     return 0
 
 
+DIRECT_BLE_COMMANDS = frozenset(
+    {
+        "probe",
+        "settings",
+        "set-settings",
+        "advanced",
+        "set-advanced",
+        "load",
+        "monitor",
+        "scale",
+        "grind",
+        "water",
+        "tea-load",
+        "tea-start",
+        "tea-brew",
+        "cancel",
+        "start",
+        "save-slots",
+    }
+)
+
+
+def ensure_bridge_not_running(command: str) -> None:
+    """Prevent a one-shot client from racing the long-lived BLE owner."""
+    if command not in DIRECT_BLE_COMMANDS:
+        return
+    from xbloom_ble.bridge import bridge_is_running
+
+    if bridge_is_running():
+        raise RuntimeError(
+            "the local BLE bridge is running and owns Studio access; use `bridge ...` "
+            "commands or stop the bridge before using one-shot BLE commands"
+        )
+
+
+def cmd_bridge(args: argparse.Namespace) -> int:
+    from xbloom_ble.bridge import (
+        BridgeError,
+        bridge_call,
+        bridge_is_running,
+        bridge_record_path,
+        serve_bridge,
+        start_bridge_daemon,
+    )
+
+    action = args.bridge_action
+    if action == "serve":
+        asyncio.run(serve_bridge(address=args.address))
+        return 0
+    if action == "start":
+        result = start_bridge_daemon(Path(__file__), address=args.address)
+    elif action == "status":
+        if not bridge_is_running():
+            result = {
+                "running": False,
+                "connected": False,
+                "record": str(bridge_record_path()),
+            }
+        else:
+            result = bridge_call("status")
+    elif action == "stop":
+        if not bridge_is_running():
+            result = {"running": False, "status": "already_stopped"}
+        else:
+            result = bridge_call("shutdown", {"force": bool(args.force)})
+    elif action == "connect":
+        result = bridge_call(
+            "connect",
+            {"address": args.address, "scan_timeout": args.scan_timeout},
+        )
+    elif action == "disconnect":
+        result = bridge_call("disconnect")
+    elif action == "events":
+        result = bridge_call("events", {"since": args.since})
+    elif action == "settings":
+        result = bridge_call(
+            "settings.read",
+            {"address": args.address, "scan_timeout": args.scan_timeout},
+        )
+    elif action == "set-settings":
+        result = bridge_call(
+            "settings.write",
+            {
+                "weight_unit": args.weight_unit,
+                "temperature_unit": args.temperature_unit,
+                "water_source": args.water_source,
+                "display": args.display,
+                "confirmation": args.confirm_write,
+                "address": args.address,
+                "scan_timeout": args.scan_timeout,
+            },
+        )
+    elif action == "advanced":
+        result = bridge_call(
+            "advanced.read",
+            {"address": args.address, "scan_timeout": args.scan_timeout},
+        )
+    elif action == "set-advanced":
+        result = bridge_call(
+            "advanced.write",
+            {
+                "pour_radius_level": args.pour_radius_level,
+                "vibration_level": args.vibration_level,
+                "confirmation": args.confirm_write,
+                "address": args.address,
+                "scan_timeout": args.scan_timeout,
+            },
+        )
+    elif action == "coffee-load":
+        recipe = str(Path(args.recipe).expanduser().resolve(strict=True))
+        result = bridge_call(
+            "coffee.load",
+            {"recipe": recipe, "address": args.address, "scan_timeout": args.scan_timeout},
+        )
+    elif action == "coffee-start":
+        result = bridge_call(
+            "coffee.start", {"confirmation": args.confirm_ready}, timeout=args.timeout
+        )
+    elif action == "tea-load":
+        recipe = str(Path(args.recipe).expanduser().resolve(strict=True))
+        result = bridge_call(
+            "tea.load",
+            {"recipe": recipe, "address": args.address, "scan_timeout": args.scan_timeout},
+        )
+    elif action == "tea-start":
+        result = bridge_call(
+            "tea.start", {"confirmation": args.confirm_ready}, timeout=args.timeout
+        )
+    elif action == "scale-start":
+        result = bridge_call(
+            "scale.start",
+            {
+                "duration_s": args.duration,
+                "tare": bool(args.tare),
+                "address": args.address,
+                "scan_timeout": args.scan_timeout,
+            },
+        )
+    elif action == "scale-tare":
+        result = bridge_call("scale.tare")
+    elif action == "save-slots":
+        recipes = [
+            str(Path(path).expanduser().resolve(strict=True)) for path in args.recipes
+        ]
+        result = bridge_call(
+            "presets.save",
+            {
+                "recipes": recipes,
+                "address": args.address,
+                "scan_timeout": args.scan_timeout,
+            },
+        )
+    elif action == "grinder-start":
+        result = bridge_call(
+            "grinder.start",
+            {
+                "size": args.size,
+                "rpm": args.rpm,
+                "seconds": args.seconds,
+                "confirmation": args.confirm_ready,
+                "address": args.address,
+                "scan_timeout": args.scan_timeout,
+            },
+        )
+    elif action == "water-start":
+        result = bridge_call(
+            "water.start",
+            {
+                "volume_ml": args.volume,
+                "temp_c": args.temp,
+                "flow_ml_s": args.flow,
+                "pattern": args.pattern,
+                "water_source": args.water_source,
+                "confirmation": args.confirm_ready,
+                "address": args.address,
+                "scan_timeout": args.scan_timeout,
+            },
+        )
+    elif action in {"pause", "resume", "cancel"}:
+        result = bridge_call(action)
+    elif action == "water-temperature":
+        result = bridge_call(
+            "water.set_temperature",
+            {"temp_c": args.temp, "confirmation": args.confirm_live_adjust},
+        )
+    elif action == "water-pattern":
+        result = bridge_call(
+            "water.set_pattern",
+            {"pattern": args.pattern, "confirmation": args.confirm_live_adjust},
+        )
+    else:  # pragma: no cover - argparse guarantees the action
+        raise BridgeError(f"unknown bridge action {action}")
+    emit({"command": "bridge", "action": action, **result})
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--address", help="BLE address/identifier; defaults to XBLOOM_ADDRESS or scan")
@@ -1035,6 +1618,22 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--scan", action="store_true", help="also scan without connecting")
     sub.add_parser("scan", help="discover nearby xBloom machines without writing")
     sub.add_parser("probe", help="safe session/status probe; never use while a recipe is armed")
+    sub.add_parser("settings", help="read persistent unit, water-source, and display settings")
+    set_settings = sub.add_parser(
+        "set-settings", help="explicitly gated persistent machine settings with readback"
+    )
+    set_settings.add_argument("--weight-unit", choices=("ml", "g", "oz"))
+    set_settings.add_argument("--temperature-unit", choices=("C", "F"))
+    set_settings.add_argument("--water-source", choices=("tank", "tap"))
+    set_settings.add_argument("--display", choices=("low", "medium", "high"))
+    set_settings.add_argument("--confirm-write", default="")
+    sub.add_parser("advanced", help="read pour-radius and vibration-amplitude tuning")
+    set_advanced = sub.add_parser(
+        "set-advanced", help="explicitly gated mechanical tuning with readback"
+    )
+    set_advanced.add_argument("--pour-radius-level", type=int, choices=range(1, 6))
+    set_advanced.add_argument("--vibration-level", type=int, choices=range(1, 7))
+    set_advanced.add_argument("--confirm-write", default="")
     validate = sub.add_parser("validate", help="strictly validate a local recipe")
     validate.add_argument("recipe")
     load = sub.add_parser("load", help="load and arm a recipe; never starts brewing")
@@ -1072,7 +1671,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="RT (room-temperature pass-through) or 40-98 C",
     )
     water.add_argument("--flow", type=float, default=3.5, help="3.0-3.5 ml/s")
-    water.add_argument("--pattern", choices=("center", "spiral", "ring"), default="center")
+    water.add_argument(
+        "--pattern", choices=("center", "spiral", "circular", "ring"), default="center"
+    )
     water.add_argument(
         "--water-source",
         choices=("auto", "tank", "tap"),
@@ -1095,6 +1696,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_PROGRESS_INTERVAL,
         help="minimum seconds between aggregated weight updates (0.1-60)",
     )
+    tea_brew = sub.add_parser(
+        "tea-brew", help="explicitly load and start one tea recipe in a single connection"
+    )
+    tea_brew.add_argument("recipe")
+    tea_brew.add_argument("--confirm-ready", default="")
+    tea_brew.add_argument("--duration", type=float, default=600.0)
+    tea_brew.add_argument(
+        "--progress-interval", type=float, default=DEFAULT_PROGRESS_INTERVAL
+    )
     sub.add_parser("cancel", help="cancel/exit an armed or running brew")
     start = sub.add_parser("start", help="explicitly gated remote start")
     start.add_argument("recipe")
@@ -1108,6 +1718,115 @@ def build_parser() -> argparse.ArgumentParser:
     )
     slots = sub.add_parser("save-slots", help="write guarded recipes to A/B/C; never brews")
     slots.add_argument("recipes", nargs=3, metavar="RECIPE")
+    bridge = sub.add_parser(
+        "bridge",
+        help="manage the local long-lived BLE owner and interactive controls",
+    )
+    bridge_sub = bridge.add_subparsers(dest="bridge_action", required=True)
+    bridge_sub.add_parser("start", help="start the local daemon; does not connect or actuate")
+    bridge_sub.add_parser("status", help="read connection, activity, and telemetry snapshot")
+    bridge_stop = bridge_sub.add_parser("stop", help="stop an idle daemon")
+    bridge_stop.add_argument(
+        "--force",
+        action="store_true",
+        help="first stop/cancel a bridge-owned activity, then shut down",
+    )
+    bridge_sub.add_parser("serve", help="internal foreground bridge service")
+    bridge_sub.add_parser("connect", help="connect and hold an app-style BLE session")
+    bridge_sub.add_parser("disconnect", help="disconnect an idle bridge")
+    bridge_events = bridge_sub.add_parser("events", help="poll control-grade telemetry events")
+    bridge_events.add_argument("--since", type=int, default=0)
+    bridge_sub.add_parser("settings", help="read persistent machine settings")
+    bridge_set_settings = bridge_sub.add_parser(
+        "set-settings", help="gated persistent settings with readback and rollback"
+    )
+    bridge_set_settings.add_argument("--weight-unit", choices=("ml", "g", "oz"))
+    bridge_set_settings.add_argument("--temperature-unit", choices=("C", "F"))
+    bridge_set_settings.add_argument("--water-source", choices=("tank", "tap"))
+    bridge_set_settings.add_argument("--display", choices=("low", "medium", "high"))
+    bridge_set_settings.add_argument("--confirm-write", default="")
+    bridge_sub.add_parser("advanced", help="read mechanical tuning values")
+    bridge_set_advanced = bridge_sub.add_parser(
+        "set-advanced", help="gated mechanical tuning with readback and rollback"
+    )
+    bridge_set_advanced.add_argument(
+        "--pour-radius-level", type=int, choices=range(1, 6)
+    )
+    bridge_set_advanced.add_argument(
+        "--vibration-level", type=int, choices=range(1, 7)
+    )
+    bridge_set_advanced.add_argument("--confirm-write", default="")
+    bridge_load = bridge_sub.add_parser(
+        "coffee-load", help="load and arm coffee through the persistent connection"
+    )
+    bridge_load.add_argument("recipe")
+    bridge_coffee_start = bridge_sub.add_parser(
+        "coffee-start", help="explicitly gated start of the bridge-loaded coffee recipe"
+    )
+    bridge_coffee_start.add_argument("--confirm-ready", default="")
+    bridge_coffee_start.add_argument("--timeout", type=float, default=60.0)
+    bridge_tea_load = bridge_sub.add_parser(
+        "tea-load", help="upload a tea recipe through the persistent connection"
+    )
+    bridge_tea_load.add_argument("recipe")
+    bridge_tea_start = bridge_sub.add_parser(
+        "tea-start", help="explicitly gated start of the bridge-loaded tea recipe"
+    )
+    bridge_tea_start.add_argument("--confirm-ready", default="")
+    bridge_tea_start.add_argument("--timeout", type=float, default=60.0)
+    bridge_scale = bridge_sub.add_parser(
+        "scale-start", help="start a non-blocking standalone scale session"
+    )
+    bridge_scale.add_argument("--duration", type=float, default=30.0)
+    bridge_scale.add_argument(
+        "--tare",
+        action="store_true",
+        help="additional tare after mandatory scale-entry auto-zero",
+    )
+    bridge_sub.add_parser("scale-tare", help="re-tare a running scale session")
+    bridge_slots = bridge_sub.add_parser(
+        "save-slots", help="write all three guarded A/B/C recipes; never brews"
+    )
+    bridge_slots.add_argument("recipes", nargs=3, metavar="RECIPE")
+    bridge_grinder = bridge_sub.add_parser(
+        "grinder-start", help="start a timed interactive FreeSolo grinder session"
+    )
+    bridge_grinder.add_argument("--size", type=int, required=True)
+    bridge_grinder.add_argument("--rpm", type=int, default=100)
+    bridge_grinder.add_argument("--seconds", type=float, required=True)
+    bridge_grinder.add_argument("--confirm-ready", default="")
+    bridge_water = bridge_sub.add_parser(
+        "water-start", help="start bounded interactive FreeSolo water"
+    )
+    bridge_water.add_argument("--volume", type=float, required=True)
+    bridge_water.add_argument("--temp", type=parse_water_temperature, required=True)
+    bridge_water.add_argument("--flow", type=float, default=3.5)
+    bridge_water.add_argument(
+        "--pattern", choices=("center", "spiral", "circular", "ring"), default="center"
+    )
+    bridge_water.add_argument(
+        "--water-source", choices=("auto", "tank", "tap"), default="auto"
+    )
+    bridge_water.add_argument("--confirm-ready", default="")
+    bridge_sub.add_parser("pause", help="pause bridge-owned coffee/grinder/water")
+    bridge_sub.add_parser("resume", help="resume the bridge-owned paused activity")
+    bridge_sub.add_parser(
+        "cancel", help="stop/cancel the bridge-owned coffee/tea/scale/grinder/water activity"
+    )
+    bridge_temp = bridge_sub.add_parser(
+        "water-temperature",
+        help="APK-verified FreeSolo live temperature command; outlet effect is not measured",
+    )
+    bridge_temp.add_argument("--temp", type=parse_water_temperature, required=True)
+    bridge_temp.add_argument("--confirm-live-adjust", default="")
+    bridge_pattern = bridge_sub.add_parser(
+        "water-pattern",
+        help="hardware-verified FreeSolo live pattern change",
+    )
+    bridge_pattern.add_argument(
+        "--pattern", choices=("center", "spiral", "circular", "ring"), required=True
+    )
+    bridge_pattern.add_argument("--confirm-live-adjust", default="")
     return parser
 
 
@@ -1118,10 +1837,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "doctor":
             return cmd_doctor(args)
         require_runtime()
+        if args.command == "bridge":
+            return cmd_bridge(args)
+        ensure_bridge_not_running(args.command)
         if args.command == "scan":
             return asyncio.run(async_scan(args))
         if args.command == "probe":
             return asyncio.run(async_probe(args))
+        if args.command == "settings":
+            return asyncio.run(async_settings(args))
+        if args.command == "set-settings":
+            return asyncio.run(async_set_settings(args))
+        if args.command == "advanced":
+            return asyncio.run(async_advanced(args))
+        if args.command == "set-advanced":
+            return asyncio.run(async_set_advanced(args))
         if args.command == "validate":
             return cmd_validate(args)
         if args.command == "load":
@@ -1140,6 +1870,8 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(async_tea_load(args))
         if args.command == "tea-start":
             return asyncio.run(async_tea_start(args))
+        if args.command == "tea-brew":
+            return asyncio.run(async_tea_brew(args))
         if args.command == "cancel":
             return asyncio.run(async_cancel(args))
         if args.command == "start":

@@ -37,6 +37,8 @@ def test_skill_references_and_assets_exist():
         "assets/tea-oolong-official.yaml",
         "scripts/xbloom.py",
         "scripts/bootstrap.py",
+        "scripts/xbloom_paths.py",
+        "scripts/xbloom_ble/bridge.py",
         "agents/openai.yaml",
         "LICENSE",
         "THIRD_PARTY_NOTICES.md",
@@ -46,7 +48,11 @@ def test_skill_references_and_assets_exist():
 
 def test_openai_interface_invokes_the_skill_name():
     interface = yaml.safe_load((ROOT / "agents" / "openai.yaml").read_text(encoding="utf-8"))
-    assert "$xbloom-studio-brew" in interface["interface"]["default_prompt"]
+    assert set(interface) == {"interface"}
+    metadata = interface["interface"]
+    assert set(metadata) == {"display_name", "short_description", "default_prompt"}
+    assert 25 <= len(metadata["short_description"]) <= 64
+    assert "$xbloom-studio-brew" in metadata["default_prompt"]
 
 
 def test_runtime_requirements_are_pinned():
@@ -57,3 +63,11 @@ def test_runtime_requirements_are_pinned():
     ]
     assert lines
     assert all("==" in line for line in lines)
+
+
+def test_bootstrap_uses_external_runtime_not_installed_skill():
+    bootstrap = (ROOT / "scripts" / "bootstrap.py").read_text(encoding="utf-8")
+    paths = (ROOT / "scripts" / "xbloom_paths.py").read_text(encoding="utf-8")
+    assert 'skill_runtime_dir()' in bootstrap
+    assert 'Path(skill_root) / ".venv"' not in bootstrap
+    assert 'RUNTIME_DIR_ENV = "XBLOOM_SKILL_RUNTIME_DIR"' in paths

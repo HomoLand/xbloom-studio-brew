@@ -22,12 +22,17 @@ validation, and bundled BLE control. It works with Hermes and other Agent Skills
   explicitly for loose-bean Omni brews.
 - Includes five xBloom-published Omni Tea Brewer templates and a dedicated guarded tea protocol.
 - Shows a conservative Skill baseline plus cited adaptations for the user to compare.
-- Validates dose, extraction/final ratios, bypass, water totals, grind, temperature modes, flow,
-  RPM, and BLE opcodes before writes.
+- Validates dose, extraction/final ratios, bypass, water totals, grind, temperature modes, pattern,
+  four-state vibration timing, flow, RPM, and BLE opcodes before writes.
 - Scans, probes, loads, monitors, cancels, saves A/B/C presets, and supports gated remote start.
 - Uses the FreeSolo scale with explicit entry auto-zero semantics, the standalone grinder, and
-  volume-controlled tank/tap water at RT or 40-98 C.
-- Reads a redacted Studio machine-info/settings snapshot during diagnostics.
+  volume-controlled tank/direct-feed water at RT or 40-98 C.
+- Includes a loopback-only persistent BLE bridge that serializes coffee, tea, scale, grinder,
+  water, presets, settings, and tuning operations plus bounded event telemetry.
+- Separates recipe target water, cumulative machine output, and cup-scale net increase; it does not
+  mislabel any of them as water-supply inventory.
+- Reads redacted Studio machine info plus persistent settings/mechanical tuning, with separately
+  gated readback/rollback writes for units, display, source, pour radius, and vibration amplitude.
 - Runs locally without xBloom cloud credentials or an app account.
 
 ## How recipes are produced
@@ -83,7 +88,9 @@ python scripts/xbloom.py probe
 ```
 
 Bluetooth commands must execute on a local computer near the machine. Cloud sandboxes cannot reach
-a home BLE adapter without a separately secured local bridge.
+a home BLE adapter. The bundled bridge stays on that host and is not exposed as a LAN service.
+Bootstrap stores its virtual environment under `~/.xbloom-studio-brew/runtime` by default, outside
+the installed Skill, so read-only Agent caches and upgrades do not destroy it.
 
 ## Use
 
@@ -105,19 +112,36 @@ Basic local commands:
 
 ```text
 python scripts/xbloom.py scale --duration 30
+python scripts/xbloom.py settings
+python scripts/xbloom.py advanced
 python scripts/xbloom.py tea-validate assets/tea-green-official.yaml
 python scripts/xbloom.py tea-load assets/tea-green-official.yaml
+python scripts/xbloom.py bridge start
+python scripts/xbloom.py bridge status
+python scripts/xbloom.py bridge scale-start --duration 90
+python scripts/xbloom.py bridge tea-load assets/tea-green-official.yaml
+python scripts/xbloom.py bridge stop
 ```
 
 Scale entry automatically zeros the load already present. Start with an empty platform for an
 object's absolute weight, or pre-position an empty vessel when measuring net contents; `--tare`
 sends an additional re-tare. FreeSolo room-temperature water uses `water --temp RT` and remains
 behind the same physical water-action gates as heated water. `--water-source auto` follows the
-machine's current tank/tap setting; an explicit source is required if it cannot be read.
+machine's current tank/direct-feed setting (`tap` is the CLI compatibility name); an explicit
+source is required if it cannot be read.
 
-`grind`, `water`, coffee `start`, and `tea-start` are included but disabled until the deployment
+`grind`, `water`, coffee `start`, `tea-start`, and one-connection `tea-brew` are included but
+disabled until the deployment
 owner enables their documented safety gate. See [standalone tools](skills/xbloom-studio-brew/references/standalone-tools.md)
 and [tea brewing](skills/xbloom-studio-brew/references/tea-brewing.md).
+
+Prefer the persistent bridge for device work. It supports coffee, tea, scale, grinder, FreeSolo
+water, presets, settings, and tuning; while it runs, direct BLE commands refuse to race its
+connection. Live FreeSolo temperature and
+pattern targets are also protocol-implemented behind a separate owner gate. A running
+`center → spiral` pattern change is hardware-verified on firmware `V12.0D.500`; live temperature
+command encoding and its completed BLE write are verified, while physical outlet response remains
+unmeasured. They do not change mid-run volume/flow or edit coffee recipe steps.
 
 ## Safety model
 
@@ -135,6 +159,14 @@ and [tea brewing](skills/xbloom-studio-brew/references/tea-brewing.md).
 - Every external or generated recipe must pass the same validator.
 - Grinder runs are limited to 30 seconds with a persisted 60-second rest lock; stop/quit cleanup is
   attempted even on ordinary interruption.
+- The persistent bridge binds only to loopback, authenticates local requests with a random token,
+  owns one BLE connection, and serializes writes. Starting it alone does not connect or actuate.
+- Interactive grinder control fails closed to STOP/QUIT on missing ACKs. Interactive water has a
+  host-side safety timeout and requires an in-tolerance peak meter report before claiming natural
+  completion. Explicit STOP is confirmed separately from the firmware's natural-completion report.
+- Persistent machine-setting writes have their own owner/per-call gates, require an idle supported
+  firmware, verify exact readback, and attempt baseline rollback. They are command-tested but not
+  physically written by this project.
 
 Read the complete [device safety policy](skills/xbloom-studio-brew/references/device-safety.md).
 
@@ -143,7 +175,8 @@ Read the complete [device safety policy](skills/xbloom-studio-brew/references/de
 The audited Android app contains more than Studio BLE control: it also includes cloud/account UI,
 NFC lookup, store content, high-risk maintenance, and xBloom Original (`J20`) paths. The
 [command-by-command APK capability matrix](skills/xbloom-studio-brew/references/apk-capability-matrix.md)
-separates what is shipped, what needs a long-lived BLE bridge, what is deliberately excluded, and
+separates what is available directly or through the bundled bridge, what remains hardware-unobserved,
+what is deliberately excluded, and
 what is not a Studio device feature.
 
 ## Development
@@ -153,9 +186,9 @@ cd skills/xbloom-studio-brew
 python scripts/bootstrap.py --dev
 ```
 
-The current suite contains 176 passing tests and 4 hardware/platform skips. Release tests never
-activate the grinder or dispense hot water; the scale enter/read/exit path is hardware-verified on
-firmware `V12.0D.500`.
+Release tests use scripted BLE and never activate the grinder or dispense water. The scale
+enter/read/exit path and a running FreeSolo pattern change have separate supervised hardware
+evidence on firmware `V12.0D.500`; see the capability matrix for exact evidence levels.
 
 ## Acknowledgements
 

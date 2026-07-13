@@ -9,24 +9,41 @@ so the decoder is pinned to real hardware output.
 
 import struct
 
-from xbloom_ble.telemetry import parse_machine_info_payload, parse_notification
+import pytest
+
+from xbloom_ble.protocol import crc16_kermit
+from xbloom_ble.telemetry import (
+    NotificationFrameStream,
+    notification_frame_is_valid,
+    parse_machine_info_payload,
+    parse_notification,
+)
+
+
+def _finish(body: bytes) -> bytes:
+    return body + struct.pack("<H", crc16_kermit(body))
 
 
 def _notif(ftype: int, state: int | None = None, sub: int = 0x1F) -> bytes:
     """Build a real-shape ``58 02 07`` notification.
 
     A ``0x57`` status frame carries ``c1 <state> 00 00 00``; other TYPEs (ACK
-    echoes, heartbeats) carry just the ``c1`` marker. CRC is a dummy (the parser
-    does not verify it).
+    echoes, heartbeats) carry just the ``c1`` marker.
     """
     head = bytes([0x58, 0x02, 0x07, ftype, sub])
     payload = bytes([0xC1]) + (bytes([state, 0, 0, 0]) if state is not None else b"")
     total = len(head) + 4 + len(payload) + 2
-    return head + struct.pack("<I", total) + payload + b"\x00\x00"
+    return _finish(head + struct.pack("<I", total) + payload)
 
 
 def _status(state: int) -> bytes:
     return _notif(0x57, state=state)
+
+
+def _report(command: int, payload: bytes = b"") -> bytes:
+    head = bytes.fromhex("580207") + struct.pack("<H", command)
+    total = len(head) + 4 + 1 + len(payload) + 2
+    return _finish(head + struct.pack("<I", total) + b"\xc1" + payload)
 
 
 # --- state decoding (0x57 status frames) ----------------------------------
@@ -65,19 +82,20 @@ def test_unknown_state():
     assert parse_notification(_status(0x77)).state_name == "unknown_0x77"
 
 
-# --- live scale streams (0x4b water, 0x15 coffee) & ACKs -------------------
+# --- cumulative water (0x4b), cup scale (0x15), and ACKs ------------------
 
-def test_water_scale_decodes_grams():
-    # 0x4b = water: float32 LE in MILLIgrams. 0x4708b800 = 35000.0 -> 35.0 g (bloom).
-    ev = parse_notification("5802074b9e10000000c100b808470000")
+def test_machine_water_report_decodes_cumulative_millilitres():
+    # 0x4b = report 40523: float32 LE stores ml * 1000.
+    ev = parse_notification(_report(40523, struct.pack("<f", 35_000.0)))
     assert ev.water_g == 35.0
+    assert ev.dispensed_water_ml == 35.0
     assert ev.coffee_g is None
     assert not ev.is_heartbeat
 
 
-def test_coffee_scale_decodes_grams():
-    # 0x15 = coffee: float32 LE already in grams. 0x4141ef9e = 12.121 g (bloom plateau).
-    ev = parse_notification("580207155010000000c19eef41410000")
+def test_cup_scale_decodes_grams():
+    # 0x15 = report 20501: raw cup-scale float32 LE in grams.
+    ev = parse_notification(_report(20501, struct.pack("<f", 12.12)))
     assert ev.coffee_g == 12.12
     assert ev.scale_g == 12.12  # same 20501 report powers standalone scale mode
     assert ev.water_g is None
@@ -85,27 +103,26 @@ def test_coffee_scale_decodes_grams():
 
 def test_dedicated_scale_report_10507_decodes_grams():
     # Full report command is 10507 = 0x290b, with float32 LE after c1.
-    ev = parse_notification("5802070b2910000000c1000048410000")  # 12.5f
+    ev = parse_notification(_report(10507, struct.pack("<f", 12.5)))
     assert ev.command_code == 10507
     assert ev.scale_g == 12.5
     assert ev.coffee_g is None
 
 
-def test_scale_end_of_brew_values():
-    # end-of-brew captures: water 256.0 g (= the 256 ml total), coffee 226.45 g.
-    assert parse_notification("5802074b9e10000000c100007a480000").water_g == 256.0
-    assert parse_notification("580207155010000000c12d7262430000").coffee_g == 226.45
+def test_end_of_brew_liquid_values():
+    # end-of-brew captures: 256.0 ml dispensed, 226.45 g raw cup reading.
+    assert parse_notification(_report(40523, struct.pack("<f", 256_000.0))).water_g == 256.0
+    assert parse_notification(_report(20501, struct.pack("<f", 226.45))).coffee_g == 226.45
 
 
 def test_scale_zero_and_negative_readings_are_kept():
-    # A genuine 0.0 g reading (empty scale at brew start) is kept…
-    assert parse_notification("5802074b9e10000000c100000000fd32").water_g == 0.0
+    # A genuine 0.0 ml cumulative report at brew start is kept…
+    assert parse_notification(_report(40523, struct.pack("<f", 0.0))).water_g == 0.0
     # …and cup removal after the mandatory entry auto-zero remains visible.
-    negative = parse_notification("580207155010000000c1d7a319c20000")
+    negative = parse_notification(_report(20501, struct.pack("<f", -38.41)))
     assert negative.coffee_g == negative.scale_g == -38.41
 
-    dedicated = bytearray.fromhex("5802070b2910000000c1000000000000")
-    struct.pack_into("<f", dedicated, 10, -12.5)
+    dedicated = _report(10507, struct.pack("<f", -12.5))
     assert parse_notification(dedicated).scale_g == -12.5
 
 
@@ -140,9 +157,7 @@ def test_machine_info_report_matches_app_fixed_width_layout():
         "vibration_init": 9,
     }
 
-    head = bytes([0x58, 0x02, 0x07]) + struct.pack("<H", 40521)
-    total = len(head) + 4 + 1 + len(payload) + 2
-    report = head + struct.pack("<I", total) + b"\xc1" + payload + b"\x00\x00"
+    report = _report(40521, bytes(payload))
     event = parse_notification(report)
     assert event.command_code == 40521
     assert event.state_name == "machine_info"
@@ -158,6 +173,133 @@ def test_command_echo_is_ack():
         assert ev.state_name == f"ack_0x{cmd:02x}"
         assert ev.raw[3] == cmd  # this is how the client matches an ACK
         assert ev.command_code == 0x1F00 | cmd
+
+
+def test_control_grade_freesolo_reports_are_named_and_decoded():
+    paused = parse_notification(_report(9010))
+    assert paused.report_name == paused.state_name == "brewer_paused"
+
+    pattern = parse_notification(_report(8107, struct.pack("<I", 2)))
+    assert pattern.report_name == "brewer_pattern"
+    assert pattern.brewer_pattern == "spiral"
+
+    temperature = parse_notification(_report(8108, struct.pack("<I", 85)))
+    assert temperature.report_name == "brewer_temperature"
+    assert temperature.brewer_temperature_value == 85
+
+
+def test_water_volume_is_machine_dispensed_volume_not_tank_inventory():
+    event = parse_notification(_report(40523, struct.pack("<f", 123_400.0)))
+    assert event.command_code == 40523
+    assert event.report_name == "water_volume"
+    assert event.dispensed_water_ml == 123.4
+    assert event.water_g == 123.4  # retained compatibility alias
+    assert event.cup_weight_g is None
+
+
+def test_persistent_settings_report_decodes_three_independent_values():
+    event = parse_notification(_report(8015, struct.pack("<III", 2, 0, 1)))
+    assert event.report_name == event.state_name == "settings_changed"
+    assert event.report_values == {
+        "weight_unit": "oz",
+        "temperature_unit": "F",
+        "water_source": "tap",
+    }
+
+
+@pytest.mark.parametrize(
+    ("command", "name", "value"),
+    [
+        (11506, "pour_radius", 720),
+        (11507, "pour_radius_written", 720),
+        (11508, "vibration_amplitude", 1300),
+        (11509, "vibration_amplitude_written", 1300),
+    ],
+)
+def test_advanced_setting_reports_decode_u32(command, name, value):
+    event = parse_notification(_report(command, struct.pack("<I", value)))
+    assert event.report_name == event.state_name == name
+    assert event.report_value == value
+
+
+@pytest.mark.parametrize(
+    ("command", "name"),
+    [(9012, "tea_soaking"), (40515, "tea_paused"), (9011, "tea_restarted")],
+)
+def test_tea_phase_reports_are_named(command, name):
+    event = parse_notification(_report(command))
+    assert event.report_name == event.state_name == name
+
+
+def test_tea_soak_time_error_and_xpod_reports_are_structured():
+    soak = parse_notification(_report(8113, struct.pack("<I", 45)))
+    assert soak.report_name == "tea_soak_time_changed"
+    assert soak.report_value == 45
+
+    error = parse_notification(_report(40522, struct.pack("<I", 1)))
+    assert error.report_name == "no_water_report"
+    assert error.report_value == 1
+    assert error.is_error is True
+
+    xpod = parse_notification(_report(40501, b"AB12CD"))
+    assert xpod.report_name == "xpod_detected"
+    assert xpod.report_values == {"xid": "AB12CD"}
+
+
+def test_full_command_dispatch_prevents_low_byte_report_collisions():
+    awake = parse_notification(_report(8011))  # 0x1f4b shares 0x4b with water
+    assert awake.command_code == 8011
+    assert awake.state_name == awake.report_name == "machine_awake"
+    assert awake.dispensed_water_ml is None
+
+    activity = parse_notification(_report(8023, struct.pack("<I", 7)))
+    assert activity.command_code == 8023
+    assert activity.report_name == "machine_activity"
+    assert activity.report_value == 7
+    assert activity.state == 7
+    assert activity.state_name == "unknown_0x07"
+
+    unrelated_status_low_byte = parse_notification(
+        _report(10583, struct.pack("<I", 7))
+    )
+    assert unrelated_status_low_byte.command_code == 10583
+    assert unrelated_status_low_byte.state is None
+
+
+def test_notification_stream_reassembles_split_and_coalesced_frames():
+    stream = NotificationFrameStream()
+    armed = _status(0x1F)
+    awake = _report(8011)
+
+    assert stream.feed(armed[:6]) == []
+    assert stream.pending_bytes == 6
+    assert stream.feed(armed[6:] + awake) == [armed, awake]
+    assert stream.pending_bytes == 0
+    assert stream.stats.frames_emitted == 2
+
+
+def test_notification_stream_resynchronises_and_rejects_bad_frames():
+    stream = NotificationFrameStream()
+    valid = _status(0x01)
+    corrupt_crc = bytearray(_status(0x1F))
+    corrupt_crc[-1] ^= 0xFF
+    invalid_length = bytearray(_report(8011))
+    struct.pack_into("<I", invalid_length, 5, 1)
+
+    assert stream.feed(b"noise\x58" + b"\x02") == []
+    frames = stream.feed(b"\x07" + bytes(corrupt_crc[3:]) + bytes(invalid_length) + valid)
+    assert frames == [valid]
+    assert stream.stats.invalid_crc_frames >= 1
+    assert stream.stats.invalid_length_frames >= 1
+    assert stream.stats.bytes_discarded > 0
+
+
+def test_direct_parser_is_crc_strict_with_explicit_forensic_escape_hatch():
+    frame = bytearray(_report(8011))
+    assert notification_frame_is_valid(frame)
+    frame[-1] ^= 0xFF
+    assert parse_notification(frame) is None
+    assert parse_notification(frame, validate_crc=False).report_name == "machine_awake"
 
 
 # --- misc ------------------------------------------------------------------
@@ -182,8 +324,8 @@ def test_golden_captured_frames():
         ("580207571f10000000c11e0000007542", "awaiting_confirm", 0x1E),
         ("580207a61f0c000000c12b8f", "ack_0xa6", None),   # a6 (dose) ACK
         ("580207411f0c000000c1ab6a", "ack_0x41", None),   # 41 (pours) ACK
-        ("5802074b9e10000000c100000000fd32", "scale", None),   # 0x4b water: 0.0 g
-        ("580207155010000000c10000000016b5", "scale", None),   # 0x15 coffee: 0.0 g
+        ("5802074b9e10000000c100000000fd32", "scale", None),   # 40523: 0.0 ml
+        ("580207155010000000c10000000016b5", "scale", None),   # 20501 cup: 0.0 g
     ]
     for hx, name, state in cases:
         ev = parse_notification(hx)

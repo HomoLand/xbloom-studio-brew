@@ -53,7 +53,8 @@ Capture only available facts:
 
 - Author/publisher and direct URL.
 - Original brewer and filter.
-- Dose, total water, ratio, water temperature, grind reference, pour structure, agitation, time,
+- Dose, total water, ratio, water temperature, grind reference, pour structure, agitation or
+  xBloom vibration timing, time,
   water chemistry, and stated flavor goal.
 - Whether it is native xBloom, flat-bottom manual, cone manual, or a general technique.
 
@@ -83,11 +84,12 @@ roaster's intended recipe rather than a generic model guess. xBloom states that 
 NFC Recipe Card per bag (older individual xPods carried NFC). Use the printed/app-visible recipe and
 flavor information when the user can provide it.
 
-Do not claim the NFC tag itself contains the full recipe. Public material confirms that tapping the
-card selects the paired recipe, but does not establish whether the NDEF payload stores all parameters
-or only an identifier resolved elsewhere. A future direct-import workflow must first capture a
-user-owned card's NDEF records and compare them with the app-visible recipe. Until then, treat NFC as
-a recipe-selection source, not a decoded executable format.
+Do not claim the NFC tag itself contains the full recipe. Android interoperability analysis shows
+the Studio/app path reporting a six-character xPod XID and resolving recipe content through xBloom's
+cloud; the XID is a lookup pointer, not a portable pour program. A future direct-import connector
+would therefore need user-authorized cloud/app data or a public recipe source in addition to NFC
+access. Until then, treat NFC as a high-value recipe-selection reference, not a decoded executable
+format.
 
 ## Present choices
 

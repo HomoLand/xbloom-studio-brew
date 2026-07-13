@@ -10,6 +10,8 @@ permissions:
 
 jobs:
   test:
+    env:
+      XBLOOM_SKILL_STATE_DIR: ${{ runner.temp }}/xbloom-studio-brew-state
     strategy:
       fail-fast: false
       matrix:
@@ -26,9 +28,21 @@ jobs:
         working-directory: skills/xbloom-studio-brew
       - run: python -m pytest -q
         working-directory: skills/xbloom-studio-brew
+      - run: python -m compileall -q scripts tests
+        working-directory: skills/xbloom-studio-brew
       - run: python scripts/xbloom.py doctor
         working-directory: skills/xbloom-studio-brew
       - run: python scripts/xbloom.py validate assets/hot-template.yaml
         working-directory: skills/xbloom-studio-brew
       - run: python scripts/xbloom.py validate assets/flash-brew-template.yaml
+        working-directory: skills/xbloom-studio-brew
+      - run: python scripts/xbloom.py tea-validate assets/tea-green-official.yaml
+        working-directory: skills/xbloom-studio-brew
+      - run: python scripts/xbloom.py tea-validate assets/tea-white-official.yaml
+        working-directory: skills/xbloom-studio-brew
+      - run: python scripts/xbloom.py tea-validate assets/tea-flower-official.yaml
+        working-directory: skills/xbloom-studio-brew
+      - run: python scripts/xbloom.py tea-validate assets/tea-black-official.yaml
+        working-directory: skills/xbloom-studio-brew
+      - run: python scripts/xbloom.py tea-validate assets/tea-oolong-official.yaml
         working-directory: skills/xbloom-studio-brew

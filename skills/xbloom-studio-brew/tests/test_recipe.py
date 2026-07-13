@@ -51,6 +51,48 @@ def test_bad_pattern_raises():
         Recipe.from_dict(bad)
 
 
+@pytest.mark.parametrize("vibration", ["none", "before", "after", "both"])
+def test_circular_pattern_and_vibration_roundtrip(vibration):
+    data = _with(
+        pours=[
+            {**VALID["pours"][0], "pattern": "circular", "vibration": vibration},
+            {**VALID["pours"][1], "vibration": "none"},
+        ]
+    )
+    recipe = Recipe.from_dict(data)
+    assert recipe.pours[0].pattern == "circular"
+    assert recipe.pours[0].vibration == vibration
+    assert recipe.to_dict()["pours"][0]["vibration"] == vibration
+    assert recipe.to_protocol_dict()["pours"][0]["vibration"] == vibration
+
+
+def test_modern_ring_alias_is_serialized_as_circular():
+    data = _with(
+        pours=[
+            {**VALID["pours"][0], "pattern": "ring", "vibration": "before"},
+            VALID["pours"][1],
+        ]
+    )
+    recipe = Recipe.from_dict(data)
+    assert recipe.pours[0].pattern == "circular"
+    assert recipe.to_dict()["pours"][0]["pattern"] == "circular"
+
+
+def test_recipe_rejects_both_vibration_and_legacy_agitation():
+    data = _with(
+        pours=[
+            {
+                **VALID["pours"][0],
+                "vibration": "after",
+                "agitation": True,
+            },
+            VALID["pours"][1],
+        ]
+    )
+    with pytest.raises(RecipeError, match="both vibration and legacy agitation"):
+        Recipe.from_dict(data)
+
+
 def test_agitation_only_with_spiral_raises():
     bad = _with(pours=[
         {"ml": 35, "temp_c": 90, "pattern": "center", "agitation": True,
@@ -308,7 +350,7 @@ def test_enriched_metadata_ignored_by_protocol():
     assert set(proto) == {
         "dose",
         "grind",
-        "stage_temps",
+        "cup_geometry_compat",
         "bypass_ml",
         "bypass_temp_c",
         "pours",
@@ -333,6 +375,41 @@ def test_plain_recipe_omits_absent_metadata():
     for k in ("kind", "dripper", "water_ml", "hot_water_ml", "ice_g", "time", "note"):
         assert k not in d
     assert "label" not in d["pours"][0]
+
+
+def test_deprecated_stage_temps_are_accepted_but_not_republished():
+    data = _with(stage_temps=[110.0, 90.0])
+    recipe = Recipe.from_dict(data)
+    assert "stage_temps" not in recipe.to_dict()
+    assert recipe.to_protocol_dict()["cup_geometry_compat"] == (110.0, 90.0)
+
+
+def test_deprecated_stage_temps_cannot_be_tuned_as_temperatures():
+    with pytest.raises(RecipeError, match="cup geometry, not a tunable temperature"):
+        Recipe.from_dict(_with(stage_temps=[108.0, 88.0]))
+
+
+@pytest.mark.parametrize(
+    ("pattern", "agitation", "expected_pattern", "expected_vibration"),
+    [
+        ("spiral", True, "spiral", "after"),
+        ("spiral", False, "spiral", "none"),
+        ("ring", False, "circular", "none"),
+        ("center", False, "center", "before"),
+    ],
+)
+def test_legacy_agitation_is_normalized_to_exact_vibration(
+    pattern, agitation, expected_pattern, expected_vibration
+):
+    pours = [dict(VALID["pours"][0]), dict(VALID["pours"][1])]
+    pours[0].update(pattern=pattern, agitation=agitation)
+    pours[0].pop("vibration", None)
+    recipe = Recipe.from_dict(_with(pours=pours))
+    first = recipe.pours[0]
+    assert first.pattern == expected_pattern
+    assert first.vibration == expected_vibration
+    assert first.agitation is None
+    assert "agitation" not in recipe.to_dict()["pours"][0]
 
 
 def test_negative_water_ml_raises():

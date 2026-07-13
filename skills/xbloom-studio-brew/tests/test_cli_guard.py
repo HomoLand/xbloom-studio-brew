@@ -1,8 +1,11 @@
 import asyncio
+import json
+from types import SimpleNamespace
 
 import pytest
 
 import xbloom
+import xbloom_ble.bridge as bridge_module
 
 
 def test_emit_falls_back_to_ascii_for_legacy_windows_console(monkeypatch):
@@ -58,6 +61,68 @@ def test_freesolo_and_tea_parsers_expose_guarded_parameters():
     assert water_rt_lower.temp == xbloom.ROOM_TEMPERATURE_C
     tea = parser.parse_args(["tea-start", "green.yaml"])
     assert tea.recipe == "green.yaml" and tea.confirm_ready == ""
+    tea_brew = parser.parse_args(["tea-brew", "green.yaml"])
+    assert tea_brew.recipe == "green.yaml" and tea_brew.confirm_ready == ""
+
+    settings = parser.parse_args(
+        [
+            "set-settings",
+            "--weight-unit",
+            "g",
+            "--temperature-unit",
+            "C",
+            "--water-source",
+            "tap",
+            "--display",
+            "high",
+            "--confirm-write",
+            xbloom.SETTINGS_CONFIRM_SENTINEL,
+        ]
+    )
+    assert (settings.weight_unit, settings.temperature_unit) == ("g", "C")
+    assert (settings.water_source, settings.display) == ("tap", "high")
+
+    advanced = parser.parse_args(
+        [
+            "set-advanced",
+            "--pour-radius-level",
+            "2",
+            "--vibration-level",
+            "4",
+            "--confirm-write",
+            xbloom.ADVANCED_CONFIRM_SENTINEL,
+        ]
+    )
+    assert (advanced.pour_radius_level, advanced.vibration_level) == (2, 4)
+
+
+def test_bridge_parser_exposes_interactive_controls():
+    parser = xbloom.build_parser()
+    assert parser.parse_args(["bridge", "start"]).bridge_action == "start"
+    water = parser.parse_args(
+        ["bridge", "water-start", "--volume", "100", "--temp", "RT"]
+    )
+    assert (water.volume, water.temp, water.pattern) == (100, 20, "center")
+    adjust = parser.parse_args(
+        ["bridge", "water-pattern", "--pattern", "spiral"]
+    )
+    assert adjust.bridge_action == "water-pattern"
+    scale = parser.parse_args(["bridge", "scale-start", "--duration", "5"])
+    assert (scale.bridge_action, scale.duration, scale.tare) == (
+        "scale-start",
+        5,
+        False,
+    )
+    tea = parser.parse_args(["bridge", "tea-load", "tea.yaml"])
+    assert (tea.bridge_action, tea.recipe) == ("tea-load", "tea.yaml")
+    slots = parser.parse_args(
+        ["bridge", "save-slots", "a.yaml", "b.yaml", "c.yaml"]
+    )
+    assert slots.recipes == ["a.yaml", "b.yaml", "c.yaml"]
+    settings = parser.parse_args(
+        ["bridge", "set-settings", "--display", "high"]
+    )
+    assert (settings.bridge_action, settings.display) == ("set-settings", "high")
 
 
 @pytest.mark.parametrize("value", ["20", "39", "99", "room"])
@@ -81,6 +146,34 @@ def test_physical_tools_are_disabled_before_any_ble_resolution(monkeypatch):
     with pytest.raises(RuntimeError, match="hot-water actions disabled"):
         asyncio.run(xbloom.async_water(water))
 
+    tea_brew = xbloom.build_parser().parse_args(
+        [
+            "tea-brew",
+            "green.yaml",
+            "--confirm-ready",
+            xbloom.TEA_READY_SENTINEL,
+        ]
+    )
+    with pytest.raises(RuntimeError, match="hot-water actions disabled"):
+        asyncio.run(xbloom.async_tea_brew(tea_brew))
+
+
+def test_persistent_setting_writes_require_owner_and_per_call_gates(monkeypatch):
+    monkeypatch.delenv(xbloom.SETTINGS_WRITE_ENV, raising=False)
+    with pytest.raises(RuntimeError, match="persistent machine writes disabled"):
+        xbloom.require_settings_write_gate(
+            xbloom.SETTINGS_CONFIRM_SENTINEL, xbloom.SETTINGS_CONFIRM_SENTINEL
+        )
+
+    monkeypatch.setenv(
+        xbloom.SETTINGS_WRITE_ENV, xbloom.SETTINGS_WRITE_SENTINEL
+    )
+    with pytest.raises(RuntimeError, match="--confirm-write"):
+        xbloom.require_settings_write_gate("wrong", xbloom.SETTINGS_CONFIRM_SENTINEL)
+    xbloom.require_settings_write_gate(
+        xbloom.SETTINGS_CONFIRM_SENTINEL, xbloom.SETTINGS_CONFIRM_SENTINEL
+    )
+
 
 def test_grinder_rest_interval_is_persisted(monkeypatch, tmp_path):
     path = tmp_path / "grinder.json"
@@ -96,6 +189,46 @@ def test_corrupt_grinder_rest_record_blocks_motor(monkeypatch, tmp_path):
     monkeypatch.setattr(xbloom, "GRINDER_STATE_FILE", path)
     with pytest.raises(RuntimeError, match="rest record is unreadable"):
         xbloom.require_grinder_rest()
+
+
+def test_unverified_bridge_grinder_stop_record_blocks_motor(monkeypatch, tmp_path):
+    path = tmp_path / "grinder.json"
+    path.write_text('{"in_progress": true}', encoding="utf-8")
+    monkeypatch.setattr(xbloom, "GRINDER_STATE_FILE", path)
+    with pytest.raises(RuntimeError, match="no verified stop"):
+        xbloom.require_grinder_rest()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "water",
+        "tea-brew",
+        "settings",
+        "set-settings",
+        "advanced",
+        "set-advanced",
+    ],
+)
+def test_one_shot_ble_commands_refuse_a_running_bridge(monkeypatch, command):
+    monkeypatch.setattr(bridge_module, "bridge_is_running", lambda: True)
+    with pytest.raises(RuntimeError, match="owns Studio access"):
+        xbloom.ensure_bridge_not_running(command)
+    xbloom.ensure_bridge_not_running("validate")
+
+
+def test_doctor_reports_unverified_live_adjust_gate(monkeypatch, capsys):
+    monkeypatch.setenv(xbloom.LIVE_ADJUST_ENV, xbloom.LIVE_ADJUST_SENTINEL)
+    monkeypatch.setattr(bridge_module, "bridge_is_running", lambda: False)
+    assert xbloom.cmd_doctor(SimpleNamespace(scan=False, scan_timeout=0.1)) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["physical_actions_enabled"]["live_adjust_unverified"] is True
+    assert report["capabilities"]["freesolo_live_adjust_hardware_verified"] is False
+    assert report["capabilities"]["freesolo_live_pattern_hardware_verified"] is True
+    assert (
+        report["capabilities"]["freesolo_live_temperature_hardware_verified"]
+        is False
+    )
 
 
 def test_supported_firmware_passes_preflight(monkeypatch):

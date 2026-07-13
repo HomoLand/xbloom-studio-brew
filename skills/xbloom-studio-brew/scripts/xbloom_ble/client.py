@@ -23,36 +23,74 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 from .protocol import (
+    CMD_BREWER_PAUSE,
+    CMD_BREWER_RESUME,
+    CMD_BREWER_STOP,
+    CMD_COFFEE_PAUSE,
+    CMD_COFFEE_RESUME,
+    CMD_GRINDER_PAUSE,
+    CMD_GRINDER_RESUME,
     CMD_TEA_RECIPE_CODE,
     CMD_TEA_RECIPE_MAKE,
+    CMD_READ_POUR_RADIUS,
+    CMD_READ_VIBRATION_AMPLITUDE,
+    CMD_SET_DISPLAY,
+    CMD_SET_TEMPERATURE_UNIT,
+    CMD_SET_WATER_SOURCE,
+    CMD_SET_WEIGHT_UNIT,
+    CMD_WRITE_POUR_RADIUS,
+    CMD_WRITE_VIBRATION_AMPLITUDE,
     ROOM_TEMPERATURE_C,
     build_brewer_enter,
+    build_brewer_pause,
     build_brewer_quit,
+    build_brewer_resume,
+    build_brewer_set_pattern,
+    build_brewer_set_temperature,
     build_brewer_start,
     build_brewer_stop,
     build_cancel,
+    build_coffee_pause,
+    build_coffee_resume,
     build_commit,
     build_grinder_enter,
+    build_grinder_pause,
     build_grinder_quit,
+    build_grinder_resume,
     build_grinder_start,
     build_grinder_stop,
     build_load_frames,
     build_recipe_start_quit,
+    build_read_pour_radius,
+    build_read_vibration_amplitude,
     build_save_slot,
     build_scale_enter,
     build_scale_exit,
     build_scale_tare,
     build_session_start,
     build_set_mode,
+    build_set_display,
+    build_set_temperature_unit,
+    build_set_water_source,
+    build_set_weight_unit,
     build_start,
     build_status_query,
     build_tea_load_frames,
     build_tea_start,
+    build_write_pour_radius,
+    build_write_vibration_amplitude,
     frame_command,
 )
 from .recipe import Recipe
 from .tea import TeaRecipe
-from .telemetry import StatusEvent, parse_notification
+from .telemetry import (
+    BREWER_MODE_COMMAND,
+    BREWER_TEMPERATURE_COMMAND,
+    MACHINE_INFO_COMMAND,
+    NotificationFrameStream,
+    StatusEvent,
+    parse_notification,
+)
 
 log = logging.getLogger("xbloom_ble")
 
@@ -65,6 +103,7 @@ NAME_PREFIX = "XBLOOM"
 
 # State byte that means "recipe loaded / armed".
 STATE_ARMED = 0x1F
+STATE_AWAITING_CONFIRM = 0x1E
 # Brew lifecycle states: 0x22 starting/grinding, 0x3b brewing. On some machines commit
 # auto-proceeds through these; on others the machine waits in awaiting-confirm (0x1e)
 # and needs the 0x46 start frame.
@@ -83,6 +122,14 @@ REPORT_BREWER_STOP = 40511
 
 class XBloomError(RuntimeError):
     """Raised on BLE / protocol errors in the client."""
+
+
+def _require_event(event: StatusEvent | None, operation: str) -> StatusEvent:
+    """Require an ACK event without relying on removable Python assertions."""
+
+    if event is None:
+        raise XBloomError(f"{operation} returned no acknowledgement event")
+    return event
 
 
 async def scan(timeout: float = 8.0):
@@ -119,6 +166,7 @@ class XBloomClient:
         self.address = address
         self.ack_timeout = ack_timeout
         self._client = None
+        self._notification_stream = NotificationFrameStream()
         self._notif_queue: asyncio.Queue[StatusEvent] = asyncio.Queue()
         # Held-session state (see open_session): once a session is open we keep the
         # ffe2 subscription up so the machine shows "connected", but we only *queue*
@@ -127,6 +175,11 @@ class XBloomClient:
         self._subscribed = False       # ffe2 notify subscription is active
         self._session_active = False   # hold the subscription across operations
         self._consuming = False        # an operation wants frames queued right now
+        self._write_lock = asyncio.Lock()
+        self._event_listeners: set[
+            Callable[[StatusEvent], Awaitable[None] | None]
+        ] = set()
+        self._command_waiters: dict[int, set[asyncio.Future[StatusEvent]]] = {}
 
     # ------------------------------------------------------------------
     # Connection
@@ -145,6 +198,7 @@ class XBloomClient:
         if self.is_connected:
             return
         log.info("connecting to %s…", self.address)
+        self._notification_stream.reset()
         self._client = BleakClient(self.address)
         await self._client.connect()
         if not self._client.is_connected:
@@ -155,10 +209,16 @@ class XBloomClient:
         if self._client is not None and self._client.is_connected:
             await self._client.disconnect()
             log.info("disconnected")
+        for waiters in self._command_waiters.values():
+            for future in waiters:
+                if not future.done():
+                    future.cancel()
+        self._command_waiters.clear()
         self._client = None
         self._subscribed = False
         self._session_active = False
         self._consuming = False
+        self._notification_stream.reset()
 
     async def open_session(self, *, settle: float = 0.3) -> None:
         """Register as an app-style session so the machine shows it's **connected**.
@@ -201,22 +261,119 @@ class XBloomClient:
     # Notifications
     # ------------------------------------------------------------------
     def _on_notify(self, _sender, data: bytearray) -> None:
-        raw = bytes(data)
-        event = parse_notification(raw)
-        # Full raw chatter at DEBUG (enable with `--debug`) — this is how we capture
-        # the brew-record frames we don't parse yet, so they can be decoded later.
-        log.debug("← %s%s", raw.hex(), f"  [{event.state_name}]" if event is not None else "")
-        if event is None:
-            return
+        chunk = bytes(data)
+        crc_before = self._notification_stream.stats.invalid_crc_frames
+        length_before = self._notification_stream.stats.invalid_length_frames
+        frames = self._notification_stream.feed(chunk)
+        crc_rejected = self._notification_stream.stats.invalid_crc_frames - crc_before
+        length_rejected = (
+            self._notification_stream.stats.invalid_length_frames - length_before
+        )
+        if crc_rejected or length_rejected:
+            log.warning(
+                "rejected malformed xBloom notification data (crc=%d length=%d)",
+                crc_rejected,
+                length_rejected,
+            )
+        if not frames:
+            log.debug(
+                "← chunk %s (pending=%d)",
+                chunk.hex(),
+                self._notification_stream.pending_bytes,
+            )
+        for raw in frames:
+            event = parse_notification(raw)
+            # Full raw chatter at DEBUG (enable with `--debug`) — this is how we
+            # retain still-unknown reports for later evidence-based decoding.
+            log.debug(
+                "← %s%s",
+                raw.hex(),
+                f"  [{event.state_name}]" if event is not None else "",
+            )
+            if event is not None:
+                self._dispatch_event(event)
+
+    def _dispatch_event(self, event: StatusEvent) -> None:
+        """Deliver one validated event to ACK waiters, listeners, and consumers."""
+
+        waiters = self._command_waiters.get(event.command_code or -1, set()).copy()
+        for future in waiters:
+            if not future.done():
+                future.set_result(event)
+        for listener in tuple(self._event_listeners):
+            try:
+                result = listener(event)
+                if asyncio.iscoroutine(result):
+                    asyncio.create_task(result)
+            except Exception:  # pragma: no cover - observers must never break BLE I/O
+                log.exception("xBloom event listener failed")
         # Only queue while an operation is consuming. During an idle held session the
         # machine streams status continuously (heartbeats, scale, idle-state frames) —
         # dropping those here keeps the queue bounded instead of growing unbounded.
         if self._consuming:
             self._notif_queue.put_nowait(event)
 
+    def add_event_listener(
+        self, listener: Callable[[StatusEvent], Awaitable[None] | None]
+    ) -> None:
+        """Observe every decoded notification without consuming operation queues."""
+        self._event_listeners.add(listener)
+
+    def remove_event_listener(
+        self, listener: Callable[[StatusEvent], Awaitable[None] | None]
+    ) -> None:
+        self._event_listeners.discard(listener)
+
+    async def send_command(
+        self,
+        frame: bytes,
+        *,
+        expect_command: int | None = None,
+        timeout: float | None = None,
+        response_optional: bool = False,
+    ) -> StatusEvent | None:
+        """Serialize one write and optionally await its matching report/ACK.
+
+        Waiters are registered before the write so immediate notifications cannot
+        race past a persistent bridge. The normal operation queue still receives
+        the same event; observing an ACK here never steals it from another workflow.
+        When ``response_optional`` is true, a completed BLE write with no matching
+        report returns ``None`` instead of pretending that the physical write failed.
+        """
+        if self._client is None or not self._client.is_connected:
+            raise XBloomError("not connected")
+        await self._ensure_subscribed()
+        future: asyncio.Future[StatusEvent] | None = None
+        if expect_command is not None:
+            future = asyncio.get_running_loop().create_future()
+            self._command_waiters.setdefault(int(expect_command), set()).add(future)
+        try:
+            async with self._write_lock:
+                await self._client.write_gatt_char(CHAR_COMMAND, bytes(frame), response=False)
+            if future is None:
+                return None
+            try:
+                return await asyncio.wait_for(
+                    future, timeout=self.ack_timeout if timeout is None else float(timeout)
+                )
+            except asyncio.TimeoutError:
+                if response_optional:
+                    return None
+                raise XBloomError(
+                    f"timed out waiting for command 0x{int(expect_command):04x}"
+                ) from None
+        finally:
+            if future is not None:
+                waiters_for_command = self._command_waiters.get(int(expect_command))
+                if waiters_for_command is not None:
+                    waiters_for_command.discard(future)
+                    if not waiters_for_command:
+                        self._command_waiters.pop(int(expect_command), None)
+
     async def _ensure_subscribed(self) -> None:
         """Subscribe to ffe2 status notifications (idempotent)."""
-        assert self._client is not None
+        if self._client is None or not self._client.is_connected:
+            raise XBloomError("not connected")
         if self._subscribed:
             return
         await self._client.start_notify(CHAR_STATUS, self._on_notify)
@@ -242,6 +399,7 @@ class XBloomClient:
             except Exception:  # pragma: no cover - best-effort cleanup
                 pass
         self._subscribed = False
+        self._notification_stream.reset()
 
     async def _drain_until_state(self, state: int, timeout: float) -> StatusEvent:
         """Wait for a status event whose state byte equals ``state``."""
@@ -291,6 +449,8 @@ class XBloomClient:
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
         latest_ml: float | None = None
+        cup_baseline_g: float | None = None
+        cup_delta_peak_g: float | None = None
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
@@ -299,11 +459,20 @@ class XBloomClient:
                 event = await asyncio.wait_for(self._notif_queue.get(), timeout=remaining)
             except asyncio.TimeoutError:
                 return None
-            if event.water_g is not None:
+            dispensed = event.dispensed_water_ml
+            if dispensed is not None:
                 # Report 40523 is named WaterVolume by the app; it transports
-                # millilitres as a float scaled by 1000. Water density makes the
-                # existing water_g field numerically equivalent here.
-                latest_ml = event.water_g
+                # cumulative millilitres as a float scaled by 1000. ``water_g``
+                # is populated only as a deprecated compatibility alias.
+                latest_ml = max(latest_ml or 0.0, float(dispensed))
+            cup_weight = event.cup_weight_g
+            if cup_weight is not None:
+                value = float(cup_weight)
+                cup_baseline_g = (
+                    value if cup_baseline_g is None else min(cup_baseline_g, value)
+                )
+                delta = max(0.0, value - cup_baseline_g)
+                cup_delta_peak_g = max(cup_delta_peak_g or 0.0, delta)
             if event.command_code != REPORT_BREWER_STOP:
                 continue
             if latest_ml is None:
@@ -320,6 +489,12 @@ class XBloomClient:
                     f"brewer reported {latest_ml:.1f} ml; target was {target_ml:.1f} ml"
                 )
             event.water_g = latest_ml
+            event.dispensed_water_ml = latest_ml
+            if cup_delta_peak_g is not None:
+                event.report_values = {
+                    **(event.report_values or {}),
+                    "cup_delta_g": round(cup_delta_peak_g, 2),
+                }
             return event
 
     # ------------------------------------------------------------------
@@ -329,7 +504,8 @@ class XBloomClient:
         """Load ``recipe`` onto the machine and return once it is armed.
 
         Writes the LOAD frames to ``ffe1`` — ``a4`` (session start), a ``0x56``
-        status handshake, then ``a6`` (dose), ``a8`` (temps) and the pours frame
+        status handshake, then ``a6`` (dose/bypass), ``a8`` (fixed captured cup-
+        geometry compatibility data), and the pours frame
         (``0x41``, or ``0x44`` for a no-grind recipe) — waiting for each ACK on
         ``ffe2``, and returns the ``StatusEvent`` once the machine reaches STATE
         ``0x1f`` (armed / loaded). **This never starts a brew** — the human
@@ -365,7 +541,7 @@ class XBloomClient:
             await asyncio.sleep(0.5)
             await self._client.write_gatt_char(CHAR_COMMAND, build_status_query(), response=False)
             await asyncio.sleep(settle)
-            # 2. Dose, temps, pours — the pours frame drives the machine to armed.
+            # 2. Dose/bypass, fixed cup geometry, pours — the pours frame arms it.
             for i, frame in enumerate(load_frames):
                 log.info("→ load frame %d/%d (cmd=0x%02x)", i + 2, len(load_frames) + 1, frame[3])
                 await self._client.write_gatt_char(CHAR_COMMAND, frame, response=False)
@@ -412,8 +588,8 @@ class XBloomClient:
         * Only if it **stalls in awaiting-confirm** do we send the ``0x46`` start frame
           to nudge it (this is what the vendor app's capture needed).
 
-        Returns best-effort once brewing/grinding is seen; never raises just because a
-        state wasn't observed (the caller streams telemetry for the live state).
+        The state-sensitive 40518 compatibility frame is sent only after a fresh
+        ``awaiting_confirm`` report. A silent/unknown commit outcome fails closed.
 
         ⚠️ This physically dispenses near-boiling water. Only call it when the machine
         is ready (water/beans/cup in) and someone intends to brew.
@@ -426,23 +602,27 @@ class XBloomClient:
             log.info("→ 0x42 commit (start the brew)")
             await self._client.write_gatt_char(CHAR_COMMAND, build_commit(), response=False)
             # After commit the machine either acts (auto-proceeds to grinding/brewing, or
-            # refuses with no-water/no-beans), or just sits in awaiting-confirm. In ANY
-            # "acted" case we must NOT send 0x46 — sending it into a running brew aborts
-            # it, and it's pointless on a refusal. Only nudge with 0x46 if it stalls.
+            # refuses with no-water/no-beans), or reports awaiting-confirm. In ANY
+            # "acted" case we must NOT send 40518 — the APK names it pause, and hardware
+            # proves that sending it into a running brew aborts back to armed.
             acted = {STATE_STARTING, STATE_BREWING, STATE_NO_WATER, STATE_NO_BEANS}
-            ev = await self._drain_for_any(acted, settle)
-            if ev is not None:
+            ev = await self._drain_for_any(acted | {STATE_AWAITING_CONFIRM}, settle)
+            if ev is None:
+                raise XBloomError(
+                    "commit outcome is unconfirmed; refusing state-sensitive 40518 control"
+                )
+            if ev.state in acted:
                 log.info("machine acted on commit (%s) — not sending 0x46", ev.state_name)
                 return ev
-            # It stalled in awaiting-confirm — nudge it with the start frame.
-            log.info("machine waiting in confirm — → 0x46 start")
+            # A fresh awaiting-confirm state makes the hardware-derived start meaning
+            # unambiguous for this instant; only then emit the APK's pause command.
+            log.info("machine explicitly awaiting confirm — → state-sensitive 40518")
             await self._client.write_gatt_char(CHAR_COMMAND, build_start(), response=False)
             ev = await self._drain_for_any(acted, 5.0)
             if ev is not None:
                 log.info("brew started (%s)", ev.state_name)
                 return ev
-            log.info("start sent — streaming telemetry for live state")
-            return StatusEvent(state=STATE_BREWING, state_name="brewing", raw=b"")
+            raise XBloomError("40518 was sent from awaiting-confirm, but start is unconfirmed")
         finally:
             await self._stop_notify()
 
@@ -462,6 +642,105 @@ class XBloomClient:
             raise XBloomError("not connected")
         log.info("→ 0x47 cancel (aborting brew)")
         await self._client.write_gatt_char(CHAR_COMMAND, build_cancel(), response=False)
+
+    async def request_status(self) -> None:
+        """Ask the connected Studio to emit its current state and machine info."""
+        await self.send_command(build_status_query())
+
+    async def read_machine_info(self, *, timeout: float | None = None) -> dict[str, object]:
+        """Request and return the decoded Studio settings/identity report 40521."""
+        event = await self.send_command(
+            build_status_query(),
+            expect_command=MACHINE_INFO_COMMAND,
+            timeout=self.ack_timeout if timeout is None else timeout,
+        )
+        if event is None or not event.machine_info:
+            raise XBloomError("machine-info report 40521 had no decodable payload")
+        return dict(event.machine_info)
+
+    async def set_machine_settings(
+        self,
+        *,
+        weight_unit: str | None = None,
+        temperature_unit: str | None = None,
+        water_source: str | None = None,
+        display: str | None = None,
+    ) -> dict[str, object]:
+        """Persist selected Studio settings and return a 40521 readback.
+
+        This is deliberately a thin, exact transport operation. CLI/Agent
+        callers own authorization, idle-state checks, rollback, and comparison
+        with the returned readback.
+        """
+        commands: list[tuple[int, bytes]] = []
+        if weight_unit is not None:
+            commands.append((CMD_SET_WEIGHT_UNIT, build_set_weight_unit(weight_unit)))
+        if temperature_unit is not None:
+            commands.append(
+                (CMD_SET_TEMPERATURE_UNIT, build_set_temperature_unit(temperature_unit))
+            )
+        if water_source is not None:
+            commands.append((CMD_SET_WATER_SOURCE, build_set_water_source(water_source)))
+        if display is not None:
+            commands.append((CMD_SET_DISPLAY, build_set_display(display)))
+        if not commands:
+            raise ValueError("at least one machine setting is required")
+        for command, frame in commands:
+            await self.send_command(frame, expect_command=command)
+        return await self.read_machine_info()
+
+    async def read_advanced_settings(self) -> dict[str, int]:
+        """Read current pour-radius and vibration-amplitude values."""
+        radius = await self.send_command(
+            build_read_pour_radius(), expect_command=CMD_READ_POUR_RADIUS
+        )
+        vibration = await self.send_command(
+            build_read_vibration_amplitude(),
+            expect_command=CMD_READ_VIBRATION_AMPLITUDE,
+        )
+        if radius is None or radius.report_value is None:
+            raise XBloomError("pour-radius report 11506 had no value")
+        if vibration is None or vibration.report_value is None:
+            raise XBloomError("vibration-amplitude report 11508 had no value")
+        return {
+            "pour_radius": int(radius.report_value),
+            "vibration_amplitude": int(vibration.report_value),
+        }
+
+    async def write_advanced_settings(
+        self,
+        *,
+        pour_radius: int | None = None,
+        vibration_amplitude: int | None = None,
+    ) -> dict[str, int]:
+        """Persist selected mechanical tuning values, then read them back."""
+        if pour_radius is None and vibration_amplitude is None:
+            raise ValueError("at least one advanced setting is required")
+        if pour_radius is not None:
+            await self.send_command(
+                build_write_pour_radius(pour_radius),
+                expect_command=CMD_WRITE_POUR_RADIUS,
+            )
+        if vibration_amplitude is not None:
+            await self.send_command(
+                build_write_vibration_amplitude(vibration_amplitude),
+                expect_command=CMD_WRITE_VIBRATION_AMPLITUDE,
+            )
+        return await self.read_advanced_settings()
+
+    async def pause_coffee(self) -> StatusEvent:
+        """Pause a running automatic coffee recipe (not a FreeSolo dispense)."""
+        event = await self.send_command(
+            build_coffee_pause(), expect_command=CMD_COFFEE_PAUSE
+        )
+        return _require_event(event, "coffee pause")
+
+    async def resume_coffee(self) -> StatusEvent:
+        """Resume a paused automatic coffee recipe."""
+        event = await self.send_command(
+            build_coffee_resume(), expect_command=CMD_COFFEE_RESUME
+        )
+        return _require_event(event, "coffee resume")
 
     # ------------------------------------------------------------------
     # FreeSolo tools: scale, grinder, and volume-limited water dispense
@@ -535,6 +814,17 @@ class XBloomClient:
                     log.warning("failed to exit scale mode cleanly: %s", exc)
             await self._stop_notify()
 
+    async def tare_scale(self) -> None:
+        """Send the official explicit re-tare command in an active scale session.
+
+        Firmware does not provide a dependable dedicated acknowledgement for
+        this UI action. A successful serialized BLE write is therefore reported
+        as command acceptance; the following scale readings are the observable
+        result.
+        """
+
+        await self.send_command(build_scale_tare())
+
     async def grind(self, grind: int, rpm: int, *, seconds: float) -> StatusEvent:
         """Run the standalone grinder for at most 30 seconds, then stop and quit.
 
@@ -599,6 +889,49 @@ class XBloomClient:
             raise XBloomError("grinder stop acknowledgement missing")
         return stop_ack
 
+    async def start_grinder_session(self, grind: int, rpm: int) -> StatusEvent:
+        """Enter and start FreeSolo grinding without owning its runtime timer.
+
+        A long-lived bridge must call :meth:`stop_grinder_session` eventually.
+        Public Agent workflows must retain the normal runtime and cooldown gates.
+        """
+        if not 1 <= int(grind) <= 80:
+            raise XBloomError("grind must be 1-80")
+        if not 60 <= int(rpm) <= 120:
+            raise XBloomError("rpm must be 60-120")
+        await self.send_command(
+            build_grinder_enter(grind, rpm), expect_command=8006
+        )
+        await asyncio.sleep(0.3)
+        event = await self.send_command(
+            build_grinder_start(grind, rpm), expect_command=3500
+        )
+        return _require_event(event, "grinder start")
+
+    async def pause_grinder(self) -> StatusEvent:
+        event = await self.send_command(
+            build_grinder_pause(), expect_command=CMD_GRINDER_PAUSE
+        )
+        return _require_event(event, "grinder pause")
+
+    async def resume_grinder(self) -> StatusEvent:
+        event = await self.send_command(
+            build_grinder_resume(), expect_command=CMD_GRINDER_RESUME
+        )
+        return _require_event(event, "grinder resume")
+
+    async def stop_grinder_session(self) -> StatusEvent:
+        event: StatusEvent | None = None
+        try:
+            event = await self.send_command(build_grinder_stop(), expect_command=3505)
+        finally:
+            try:
+                await asyncio.sleep(0.2)
+                await self.send_command(build_grinder_quit())
+            finally:
+                await self._stop_notify()
+        return _require_event(event, "grinder stop")
+
     async def dispense_water(
         self,
         volume_ml: float,
@@ -623,8 +956,11 @@ class XBloomClient:
         flow10 = round(float(flow_ml_s) * 10)
         if flow10 not in range(30, 36) or abs(flow10 / 10 - float(flow_ml_s)) > 1e-6:
             raise XBloomError("water flow must be 3.0-3.5 ml/s in 0.1 steps")
-        if pattern not in {"center", "spiral", "ring"}:
-            raise XBloomError("water pattern must be center, spiral, or ring")
+        pattern = str(pattern).strip().lower()
+        if pattern == "ring":
+            pattern = "circular"
+        if pattern not in {"center", "spiral", "circular"}:
+            raise XBloomError("water pattern must be center, spiral, or circular")
         if int(water_feed) not in {0, 1}:
             raise XBloomError("water source must be 0 (tank) or 1 (tap)")
         wait_timeout = (
@@ -683,6 +1019,98 @@ class XBloomClient:
                         log.warning("failed to quit brewer mode cleanly: %s", exc)
             await self._stop_notify()
 
+    async def start_water_session(
+        self,
+        volume_ml: float,
+        temp_c: int,
+        *,
+        flow_ml_s: float = 3.5,
+        pattern: str = "center",
+        water_feed: int = 0,
+    ) -> None:
+        """Start bounded FreeSolo water while keeping the session interactive."""
+        if not 20 <= float(volume_ml) <= 360:
+            raise XBloomError("water volume must be 20-360 ml")
+        if int(temp_c) != ROOM_TEMPERATURE_C and not 40 <= int(temp_c) <= 98:
+            raise XBloomError("water temperature must be RT or 40-98 C")
+        flow10 = round(float(flow_ml_s) * 10)
+        if flow10 not in range(30, 36) or abs(flow10 / 10 - float(flow_ml_s)) > 1e-6:
+            raise XBloomError("water flow must be 3.0-3.5 ml/s in 0.1 steps")
+        pattern = str(pattern).strip().lower()
+        if pattern == "ring":
+            pattern = "circular"
+        if pattern not in {"center", "spiral", "circular"}:
+            raise XBloomError("water pattern must be center, spiral, or circular")
+        if int(water_feed) not in {0, 1}:
+            raise XBloomError("water source must be 0 (tank) or 1 (tap)")
+        await self.send_command(build_brewer_enter(temp_c, pattern))
+        await asyncio.sleep(0.4)
+        await self.send_command(
+            build_brewer_start(
+                volume_ml,
+                temp_c,
+                flow_ml_s,
+                pattern,
+                water_feed=int(water_feed),
+            )
+        )
+
+    async def pause_water(self) -> StatusEvent:
+        event = await self.send_command(
+            build_brewer_pause(), expect_command=CMD_BREWER_PAUSE
+        )
+        return _require_event(event, "water pause")
+
+    async def resume_water(self) -> StatusEvent:
+        event = await self.send_command(
+            build_brewer_resume(), expect_command=CMD_BREWER_RESUME
+        )
+        return _require_event(event, "water resume")
+
+    async def set_water_pattern(self, pattern: str) -> StatusEvent | None:
+        """Set FreeSolo pattern and optionally observe its separate mode report.
+
+        Firmware ``V12.0D.500`` applies command 8016 but does not echo 8016. The
+        app defines 8107 as the corresponding machine report, so absence of that
+        optional report is not a failed BLE write.
+        """
+        return await self.send_command(
+            build_brewer_set_pattern(pattern),
+            expect_command=BREWER_MODE_COMMAND,
+            timeout=min(1.5, self.ack_timeout),
+            response_optional=True,
+        )
+
+    async def set_water_temperature(self, temp_c: int) -> StatusEvent | None:
+        """Set FreeSolo temperature and optionally observe report 8108."""
+        return await self.send_command(
+            build_brewer_set_temperature(temp_c),
+            expect_command=BREWER_TEMPERATURE_COMMAND,
+            timeout=min(1.5, self.ack_timeout),
+            response_optional=True,
+        )
+
+    async def stop_water_session(self) -> StatusEvent:
+        """Stop an interactive dispense and require the explicit 4507 echo.
+
+        Report 40511 belongs to natural brewer completion. A controlled hardware
+        stop on ``V12.0D.500`` instead echoes APP_BREWER_STOP (4507), then accepts
+        APP_BREWER_QUIT (8013) and returns idle.
+        """
+        try:
+            event = await self.send_command(
+                build_brewer_stop(), expect_command=CMD_BREWER_STOP
+            )
+        finally:
+            await self.quit_water_session()
+        return _require_event(event, "water stop")
+
+    async def quit_water_session(self) -> None:
+        """Leave FreeSolo brewer mode after a natural or requested stop."""
+        await asyncio.sleep(0.2)
+        await self.send_command(build_brewer_quit())
+        await self._stop_notify()
+
     # ------------------------------------------------------------------
     # Omni Tea Brewer: load and execute remain separate
     # ------------------------------------------------------------------
@@ -714,8 +1142,7 @@ class XBloomClient:
                 await self._client.write_gatt_char(CHAR_COMMAND, frame, response=False)
                 last = await self._drain_for_command(command, 30.0)
                 await asyncio.sleep(0.3)
-            assert last is not None
-            return last
+            return _require_event(last, "tea recipe load")
         finally:
             await self._stop_notify()
 

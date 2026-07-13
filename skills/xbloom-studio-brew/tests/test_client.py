@@ -15,37 +15,56 @@ import struct
 import pytest
 
 from xbloom_ble.client import CHAR_STATUS, XBloomClient, XBloomError, scan
-from xbloom_ble.protocol import frame_command
+from xbloom_ble.protocol import crc16_kermit, frame_command
 from xbloom_ble.recipe import Recipe
 from xbloom_ble.tea import TeaRecipe
 
 # ── real-shape frames (0x57 status = 580207571f10000000c1<state>000000<crc>) ──
 ARMED = "580207571f10000000c11f000000ce5e"       # 0x1f
+AWAITING_CONFIRM = "580207571f10000000c11e0000007542"  # 0x1e
 STARTING = "580207571f10000000c122000000b399"    # 0x22
 READY = "580207571f10000000c12400000029d2"       # 0x24  (coffee-ready beep, terminal)
 IDLE = "580207571f10000000c1010000002d33"        # 0x01
 NO_WATER = "580207571f10000000c10c000000a2b8"    # 0x0c
-NO_BEANS = "580207571f10000000c10f0000000000"    # 0x0f  (dummy crc; parser ignores it)
-SLOTS_SAVED = "580207571f10000000c1250000000000"  # 0x25
+NO_BEANS = "580207571f10000000c10f0000006f9d"    # 0x0f
+SLOTS_SAVED = "580207571f10000000c12500000092ce"  # 0x25
 ACK_42 = "580207421f0c000000c1c5c2"              # commit echo
-WATER35 = "5802074b9e10000000c100b8084759b4"     # 0x4b water 35.0 g
+WATER35 = "5802074b9e10000000c100b808470686"     # 40523 water 35.0 ml
 COFFEE12 = "580207155010000000c19eef4141ceba"    # 0x15 coffee 12.12 g
 
 
 def _command_notification(command: int, payload: bytes = b"") -> str:
-    body = (
+    body_without_crc = (
         bytes.fromhex("580207")
         + struct.pack("<H", command)
         + struct.pack("<I", 12 + len(payload))
         + b"\xc1"
         + payload
-        + b"\x00\x00"
     )
+    body = body_without_crc + struct.pack("<H", crc16_kermit(body_without_crc))
     return body.hex()
 
 
 def _water_volume_notification(ml: float) -> str:
     return _command_notification(40523, struct.pack("<f", float(ml) * 1000.0))
+
+
+def _machine_info_notification(
+    *, water_source: int = 1, display: int = 15, temperature_unit: int = 1,
+    weight_unit: int = 1, radius: int = 720, vibration: int = 1300
+) -> str:
+    payload = bytearray(63)
+    payload[0:13] = b"SN12345678901"
+    payload[13:19] = b"J15   "
+    payload[19:29] = b"V12.0D.500"
+    struct.pack_into("<f", payload, 29, 42.5)
+    payload[33:42] = bytes(
+        [1, 2, 1, water_source, 92, display, 24, temperature_unit, weight_unit]
+    )
+    payload[51:55] = bytes.fromhex("91327856")
+    struct.pack_into("<I", payload, 55, radius)
+    struct.pack_into("<I", payload, 59, vibration)
+    return _command_notification(40521, bytes(payload))
 
 RECIPE = Recipe.from_dict({
     "name": "T", "dose_g": 16, "grind": 55, "ratio": 15,
@@ -58,7 +77,7 @@ RECIPE = Recipe.from_dict({
 TEA_RECIPE = TeaRecipe.from_dict({
     "name": "Green", "kind": "tea", "leaf_g": 4, "output_ml_per_steep": 120,
     "pours": [
-        {"ml": 90, "temp_c": 85, "pattern": "ring", "pause_s": 20, "flow_ml_s": 3.5},
+        {"ml": 90, "temp_c": 85, "pattern": "circular", "pause_s": 20, "flow_ml_s": 3.5},
         {"ml": 90, "temp_c": 85, "pattern": "center", "pause_s": 15, "flow_ml_s": 3.5},
     ],
 })
@@ -205,7 +224,7 @@ def test_start_acts_on_commit_without_0x46():
 
 def test_start_nudges_with_0x46_when_stalled():
     fake = FakeBleak()
-    fake.script[0x42] = [ACK_42]        # commit acked but machine stalls (no state)
+    fake.script[0x42] = [ACK_42, AWAITING_CONFIRM]
     fake.script[0x46] = [STARTING]      # the nudge gets it going
     c = _client(fake)
     ev = run(c.start(settle=0.05))
@@ -221,14 +240,23 @@ def test_start_returns_refusal_state():
     assert ev.state_name == "no_water"
 
 
-def test_start_falls_back_to_synthetic_when_silent():
+def test_start_refuses_state_sensitive_40518_when_commit_state_is_silent():
     fake = FakeBleak()
-    fake.script[0x42] = []              # commit produces nothing
-    fake.script[0x46] = []              # nudge produces nothing either
+    fake.script[0x42] = []
     c = _client(fake)
-    ev = run(c.start(settle=0.02))
-    assert ev.state_name == "brewing"   # best-effort synthetic; raw is empty
-    assert ev.raw == b""
+    with pytest.raises(XBloomError, match="commit outcome is unconfirmed"):
+        run(c.start(settle=0.02))
+    assert 0x46 not in _cmds(fake)
+
+
+def test_start_fails_if_40518_outcome_is_unconfirmed():
+    fake = FakeBleak()
+    fake.script[0x42] = [AWAITING_CONFIRM]
+    fake.script[0x46] = []
+    c = _client(fake)
+    with pytest.raises(XBloomError, match="start is unconfirmed"):
+        run(c.start(settle=0.02))
+    assert 0x46 in _cmds(fake)
 
 
 # ── brew (load + start) & cancel ───────────────────────────────────────────
@@ -276,6 +304,13 @@ def test_scale_stream_explicit_tare_is_additional_and_always_exits():
     assert commands[:2] == [8003, 8500]
     assert commands[-1] == 8014
     assert any(event.scale_g == 12.12 for event in events)
+
+
+def test_active_scale_retare_is_a_serialized_write_without_fake_ack():
+    fake = FakeBleak()
+    c = _client(fake)
+    run(c.tare_scale())
+    assert _commands(fake) == [8500]
 
 
 def test_grinder_stops_and_quits_after_timed_run():
@@ -342,6 +377,19 @@ def test_water_passes_selected_tap_source_to_start_frame():
     start = next(frame for frame in fake.writes if frame_command(frame) == 4506)
     words = struct.unpack(f"<{(len(start[10:-2]) // 4)}I", start[10:-2])
     assert words[-2] == 1
+
+
+def test_water_accepts_canonical_circular_pattern_and_encodes_value_one():
+    fake = FakeBleak()
+    fake.script_full[4506] = [
+        _water_volume_notification(120),
+        _command_notification(40511),
+    ]
+    c = _client(fake)
+    run(c.dispense_water(120, 85, pattern="circular", timeout=5))
+    start = next(frame for frame in fake.writes if frame_command(frame) == 4506)
+    words = struct.unpack(f"<{(len(start[10:-2]) // 4)}I", start[10:-2])
+    assert words[-1] == 1
 
 
 @pytest.mark.parametrize("temp_c", [19, 21, 39, 99])
@@ -452,6 +500,125 @@ def test_open_session_subscribes_and_sends_a4():
     assert fake._cb is not None                 # subscribed to ffe2
     assert _cmds(fake) == [0xA4]                 # exactly the session-start frame
     assert c._session_active and c._subscribed
+
+
+def test_persistent_control_waiters_and_listeners_do_not_steal_acks():
+    fake = FakeBleak()
+    c = _client(fake)
+    observed = []
+    c.add_event_listener(observed.append)
+    for command in (40518, 40524, 8018, 8020, 8019, 8021):
+        fake.script_full[command] = [_command_notification(command)]
+    fake.script_full[8016] = [_command_notification(8107, struct.pack("<I", 2))]
+    fake.script_full[4510] = [_command_notification(8108, struct.pack("<I", 85))]
+
+    async def go():
+        assert (await c.pause_coffee()).command_code == 40518
+        assert (await c.resume_coffee()).command_code == 40524
+        assert (await c.pause_grinder()).command_code == 8018
+        assert (await c.resume_grinder()).command_code == 8020
+        assert (await c.pause_water()).command_code == 8019
+        assert (await c.resume_water()).command_code == 8021
+        assert (await c.set_water_pattern("spiral")).command_code == 8107
+        assert (await c.set_water_temperature(85)).command_code == 8108
+
+    run(go())
+    assert [event.command_code for event in observed] == [
+        40518,
+        40524,
+        8018,
+        8020,
+        8019,
+        8021,
+        8107,
+        8108,
+    ]
+    assert not c._command_waiters
+
+
+def test_persistent_settings_write_each_exact_command_then_read_back_40521():
+    fake = FakeBleak()
+    c = _client(fake)
+    for command in (8005, 8010, 4508, 8103):
+        fake.script_full[command] = [_command_notification(command)]
+    fake.script_full[8022] = [_machine_info_notification()]
+
+    result = run(
+        c.set_machine_settings(
+            weight_unit="g",
+            temperature_unit="C",
+            water_source="tap",
+            display="high",
+        )
+    )
+
+    assert _commands(fake) == [8005, 8010, 4508, 8103, 8022]
+    assert result["weight_unit"] == "g"
+    assert result["temperature_unit"] == "C"
+    assert result["water_source"] == "tap"
+    assert result["display"] == "high"
+
+
+def test_advanced_settings_write_and_readback_use_all_four_code_module2_commands():
+    fake = FakeBleak()
+    c = _client(fake)
+    fake.script_full[11507] = [
+        _command_notification(11507, struct.pack("<I", 720))
+    ]
+    fake.script_full[11509] = [
+        _command_notification(11509, struct.pack("<I", 1300))
+    ]
+    fake.script_full[11506] = [
+        _command_notification(11506, struct.pack("<I", 720))
+    ]
+    fake.script_full[11508] = [
+        _command_notification(11508, struct.pack("<I", 1300))
+    ]
+
+    result = run(
+        c.write_advanced_settings(pour_radius=720, vibration_amplitude=1300)
+    )
+
+    assert _commands(fake) == [11507, 11509, 11506, 11508]
+    assert result == {"pour_radius": 720, "vibration_amplitude": 1300}
+
+
+def test_setting_and_advanced_writes_require_at_least_one_requested_value():
+    fake = FakeBleak()
+    c = _client(fake)
+    with pytest.raises(ValueError, match="at least one machine setting"):
+        run(c.set_machine_settings())
+    with pytest.raises(ValueError, match="at least one advanced setting"):
+        run(c.write_advanced_settings())
+    assert fake.writes == []
+
+
+def test_live_pattern_write_succeeds_when_optional_8107_report_is_absent():
+    fake = FakeBleak()
+    c = _client(fake)
+    c.ack_timeout = 0.01
+    assert run(c.set_water_pattern("spiral")) is None
+    assert _commands(fake) == [8016]
+
+
+def test_interactive_water_stop_waits_for_4507_echo_then_quits():
+    fake = FakeBleak()
+    fake.script_full[4507] = [_command_notification(4507)]
+    c = _client(fake)
+    event = run(c.stop_water_session())
+    assert event.command_code == 4507
+    assert _commands(fake) == [4507, 8013]
+
+
+def test_grinder_stop_ack_timeout_still_sends_quit_and_cleans_notification_mode():
+    fake = FakeBleak()
+    c = _client(fake)
+    c.ack_timeout = 0.01
+    with pytest.raises(XBloomError, match="timed out"):
+        run(c.stop_grinder_session())
+    assert 3505 in _commands(fake)
+    assert 8012 in _commands(fake)
+    assert c._consuming is False
 
 
 def test_idle_session_drops_notifications():

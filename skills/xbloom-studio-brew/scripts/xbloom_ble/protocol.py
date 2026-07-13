@@ -40,26 +40,27 @@ Sent frame-by-frame, waiting for each ACK on ``ffe2``:
 
 1. command 8100 (legacy ``a4 1f``) — session start.
 2. command 8102 (``a6 1f``) — optional bypass water + dose.
-3. command 8104 (``a8 1f``) — staging/cup float values.
+3. command 8104 (``a8 1f``) — cup-geometry compatibility values.
 4. command 8001 (``41 1f``), or 8004 for no-grind — pours + grind.
 
 After these four frames the machine reports STATE ``0x1f`` (armed/loaded). At
 that point you can either approve the brew **on the machine** or start it
 remotely (below), exactly like the official app.
 
-Starting a brew (commit / start / cancel)
------------------------------------------
-Loading only *arms* the machine. To start the brew remotely — the way the app
-does when you tap "Brew" — three further command frames are used:
+Starting a brew (commit / state-sensitive compatibility control / cancel)
+---------------------------------------------------------------------------
+Loading only *arms* the machine. To start the brew remotely, the captured
+workflow uses these control frames:
 
 * command 8002 (legacy ``42 1f``) — **commit**: the machine moves to ``0x1e``
   (awaiting-confirm) and shows its ~99 s add-beans countdown.
-* command 40518 (``46 9e``) — **start**: the "go" — the machine begins brewing.
+* command 40518 (``46 9e``) — APK 2.2.2 calls this **pause**. Target-firmware
+  captures also prove a start meaning while the machine has freshly reported
+  ``awaiting_confirm``. Never infer that meaning from a timeout alone.
 * command 40519 (``47 9e``) — **cancel**: abort a committed/running brew.
 
-All three carry the constant one-byte payload ``01`` and were captured
-byte-for-byte from the vendor app (:func:`build_commit`, :func:`build_start`,
-:func:`build_cancel`).
+All three carry the constant one-byte payload ``01``. The builders reproduce
+the captured bytes; callers own the state preconditions.
 
 ⚠️ SAFETY — loading and starting are separate, explicit steps
 -------------------------------------------------------------
@@ -79,6 +80,7 @@ from collections.abc import Iterable, Mapping
 
 __all__ = [
     "PATTERN_CODES",
+    "VIBRATION_CODES",
     "MACHINE_PATTERN_CODES",
     "ROOM_TEMPERATURE_C",
     "LOAD_SEQ",
@@ -89,6 +91,7 @@ __all__ = [
     "build_a4",
     "build_a6",
     "build_a8",
+    "build_coffee_cup_geometry_compat",
     "build_41",
     "build_load_frames",
     "build_session_start",
@@ -116,13 +119,30 @@ __all__ = [
     "CMD_GRINDER_START",
     "CMD_GRINDER_STOP",
     "CMD_GRINDER_QUIT",
+    "CMD_GRINDER_PAUSE",
+    "CMD_GRINDER_RESUME",
     "CMD_BREWER_ENTER",
     "CMD_BREWER_START",
     "CMD_BREWER_STOP",
     "CMD_BREWER_QUIT",
+    "CMD_BREWER_SET_PATTERN",
+    "CMD_BREWER_PAUSE",
+    "CMD_BREWER_RESUME",
+    "CMD_BREWER_SET_TEMPERATURE",
+    "CMD_COFFEE_PAUSE",
+    "CMD_COFFEE_RESUME",
     "CMD_TEA_RECIPE_CODE",
     "CMD_TEA_RECIPE_MAKE",
     "CMD_RECIPE_START_QUIT",
+    "CMD_SET_WEIGHT_UNIT",
+    "CMD_SET_TEMPERATURE_UNIT",
+    "CMD_SET_WATER_SOURCE",
+    "CMD_SET_DISPLAY",
+    "CMD_READ_POUR_RADIUS",
+    "CMD_WRITE_POUR_RADIUS",
+    "CMD_READ_VIBRATION_AMPLITUDE",
+    "CMD_WRITE_VIBRATION_AMPLITUDE",
+    "COFFEE_CUP_GEOMETRY_COMPAT",
     "build_scale_enter",
     "build_scale_exit",
     "build_scale_tare",
@@ -130,35 +150,71 @@ __all__ = [
     "build_grinder_start",
     "build_grinder_stop",
     "build_grinder_quit",
+    "build_grinder_pause",
+    "build_grinder_resume",
     "build_brewer_enter",
     "build_brewer_start",
     "build_brewer_stop",
     "build_brewer_quit",
+    "build_brewer_pause",
+    "build_brewer_resume",
+    "build_brewer_set_pattern",
+    "build_brewer_set_temperature",
+    "build_coffee_pause",
+    "build_coffee_resume",
     "build_tea_recipe_code",
     "build_tea_set_cup",
     "build_tea_code_upload",
     "build_tea_load_frames",
     "build_tea_start",
     "build_recipe_start_quit",
+    "build_set_weight_unit",
+    "build_set_temperature_unit",
+    "build_set_water_source",
+    "build_set_display",
+    "build_read_pour_radius",
+    "build_write_pour_radius",
+    "build_read_vibration_amplitude",
+    "build_write_vibration_amplitude",
 ]
 
 # Sequence byte used for the load sequence, and for the brew (commit/start) phase.
 LOAD_SEQ = 0x1F
 BREW_SEQ = 0x9E
 
-# Brew-control opcodes. These START (or cancel) a brew — they are NOT part of the
-# load sequence and are only emitted by an explicit start/cancel call.
+# Command 8104 is named APP_SET_CUP by APK 2.2.2. The coffee path below keeps
+# the 110/90 values from the upstream capture and successful target-firmware
+# runs; those values are an opaque compatibility profile, not temperatures a
+# recipe author should tune. Do not change without a controlled hardware A/B.
+COFFEE_CUP_GEOMETRY_COMPAT = (110.0, 90.0)
+
+# Brew-control opcodes. They are NOT part of the load sequence: commit and the
+# state-sensitive 40518 confirm/pause command belong only to an explicit control
+# workflow, while cancel belongs only to explicit recovery.
 COMMIT_OPCODE = 0x42  # commit: arm → awaiting-confirm (seq 0x1f)
-START_OPCODE = 0x46   # start: the "go" — begin brewing (seq 0x9e)
+START_OPCODE = 0x46   # legacy name: full command 40518 is state-sensitive
 CANCEL_OPCODE = 0x47  # cancel: abort a committed/running brew (seq 0x9e)
 
-# (pattern, agitation) -> (pat_byte, agit_byte). Verified combos from the
-# capture; others are best-effort extrapolation.
+# Legacy (pattern, agitation) -> (pattern byte, second byte) compatibility
+# table from captured recipes. New recipes bypass this table and encode the
+# second byte as an explicit four-state vibration timing.
 PATTERN_CODES: dict[tuple[str, bool], tuple[int, int]] = {
     ("spiral", True): (0x02, 0x02),   # bloom (spiral + agitation ON)
     ("spiral", False): (0x02, 0x00),  # default spiral
     ("ring", False): (0x01, 0x00),    # ring / middle
     ("center", False): (0x00, 0x01),  # center single dot
+}
+
+# The recipe byte following the pattern is not a generic agitation boolean.
+# The Android recipe encoder derives it from two independent UI toggles:
+# vibrate before the pour and vibrate after the pour. Keep PATTERN_CODES above
+# solely for old recipe compatibility; all new recipes should use these exact
+# four states independently of the pouring pattern.
+VIBRATION_CODES: dict[str, int] = {
+    "none": 0,
+    "before": 1,
+    "after": 2,
+    "both": 3,
 }
 
 # Pattern values used by the app's generic J15 commands. The app UI calls
@@ -188,16 +244,39 @@ CMD_GRINDER_ENTER = 8006
 CMD_GRINDER_START = 3500
 CMD_GRINDER_STOP = 3505
 CMD_GRINDER_QUIT = 8012
+CMD_GRINDER_PAUSE = 8018
+CMD_GRINDER_RESUME = 8020
 
 CMD_BREWER_ENTER = 8007
 CMD_BREWER_START = 4506
 CMD_BREWER_STOP = 4507
 CMD_BREWER_QUIT = 8013
+CMD_BREWER_SET_PATTERN = 8016
+CMD_BREWER_PAUSE = 8019
+CMD_BREWER_RESUME = 8021
+CMD_BREWER_SET_TEMPERATURE = 4510
+
+CMD_COFFEE_PAUSE = 40518
+CMD_COFFEE_RESUME = 40524
 
 CMD_TEA_RECIPE_MAKE = 4512
 CMD_TEA_RECIPE_CODE = 4513
 CMD_RECIPE_START_QUIT = 8017
 CMD_SET_CUP = 8104
+
+# Persistent Studio settings. Values are one little-endian u32, matching the
+# Android app's MachineJ15Fragment/BleCodeFactory calls.
+CMD_SET_WEIGHT_UNIT = 8005
+CMD_SET_TEMPERATURE_UNIT = 8010
+CMD_SET_WATER_SOURCE = 4508
+CMD_SET_DISPLAY = 8103
+
+# Mechanical tuning uses CodeModule2/buildCommandString2 and therefore frame
+# type 0x02. Read commands carry no data; writes carry one u32 value.
+CMD_READ_POUR_RADIUS = 11506
+CMD_WRITE_POUR_RADIUS = 11507
+CMD_READ_VIBRATION_AMPLITUDE = 11508
+CMD_WRITE_VIBRATION_AMPLITUDE = 11509
 
 
 def crc16_kermit(data: bytes) -> int:
@@ -298,6 +377,54 @@ def _machine_pattern(pattern: str) -> int:
         ) from exc
 
 
+def _recipe_pattern(pattern: str) -> tuple[str, int]:
+    """Normalize recipe pattern names and return ``(canonical, wire_value)``."""
+    name = str(pattern).strip().lower()
+    if name == "ring":
+        name = "circular"
+    try:
+        return name, MACHINE_PATTERN_CODES[name]
+    except KeyError as exc:
+        raise ValueError(
+            f"pattern must be one of {sorted(MACHINE_PATTERN_CODES)}; got {pattern!r}"
+        ) from exc
+
+
+def _pour_pattern_vibration(pour: Mapping) -> tuple[int, int]:
+    """Encode one recipe's independent pattern and vibration timing.
+
+    ``vibration`` is the exact modern field. ``agitation`` remains a deprecated
+    compatibility path because published versions of this Skill emitted it and
+    a captured slot recipe proves those legacy bytes. Supplying both is rejected
+    so a recipe can never contain two conflicting instructions.
+    """
+    _canonical, pattern = _recipe_pattern(str(pour.get("pattern", "spiral")))
+    has_vibration = pour.get("vibration") is not None
+    has_legacy = pour.get("agitation") is not None
+    if has_vibration and has_legacy:
+        raise ValueError("pour cannot set both vibration and legacy agitation")
+    if has_vibration:
+        timing = str(pour["vibration"]).strip().lower()
+        try:
+            return pattern, VIBRATION_CODES[timing]
+        except KeyError as exc:
+            raise ValueError(
+                f"vibration must be one of {sorted(VIBRATION_CODES)}; got {pour['vibration']!r}"
+            ) from exc
+    if has_legacy:
+        legacy_name = str(pour.get("pattern", "spiral")).strip().lower()
+        if legacy_name == "circular":
+            legacy_name = "ring"
+        try:
+            return PATTERN_CODES[(legacy_name, bool(pour["agitation"]))]
+        except KeyError as exc:
+            raise ValueError(
+                f"unsupported legacy pattern/agitation pair: "
+                f"({pour.get('pattern')!r}, {pour.get('agitation')!r})"
+            ) from exc
+    return pattern, VIBRATION_CODES["none"]
+
+
 # ---------------------------------------------------------------------------
 # FreeSolo scale / grinder / brewer commands
 # ---------------------------------------------------------------------------
@@ -328,6 +455,14 @@ def build_grinder_stop() -> bytes:
 
 def build_grinder_quit() -> bytes:
     return j15_frame(CMD_GRINDER_QUIT)
+
+
+def build_grinder_pause() -> bytes:
+    return j15_frame(CMD_GRINDER_PAUSE)
+
+
+def build_grinder_resume() -> bytes:
+    return j15_frame(CMD_GRINDER_RESUME)
 
 
 def build_brewer_enter(temp_c: int, pattern: str = "center") -> bytes:
@@ -376,6 +511,99 @@ def build_brewer_quit() -> bytes:
     return j15_frame(CMD_BREWER_QUIT)
 
 
+def build_brewer_pause() -> bytes:
+    return j15_frame(CMD_BREWER_PAUSE)
+
+
+def build_brewer_resume() -> bytes:
+    return j15_frame(CMD_BREWER_RESUME)
+
+
+def build_brewer_set_pattern(pattern: str) -> bytes:
+    """Change the active FreeSolo brewer pouring pattern.
+
+    This belongs to standalone FreeSolo water. It does not edit a running
+    automatic coffee recipe.
+    """
+    return j15_frame(CMD_BREWER_SET_PATTERN, [_machine_pattern(pattern)])
+
+
+def build_brewer_set_temperature(temp_c: int) -> bytes:
+    """Change the active FreeSolo brewer temperature target.
+
+    The app sends a plain integer in tenths of a degree here, unlike the
+    float-bit fields in the initial FreeSolo start command. ``20`` is RT and
+    ``98`` is the Studio/J15 boiling-point setting.
+    """
+    temp_c = int(temp_c)
+    if temp_c != ROOM_TEMPERATURE_C and not 40 <= temp_c <= 98:
+        raise ValueError("temperature must be RT (20) or 40-98 C")
+    return j15_frame(CMD_BREWER_SET_TEMPERATURE, [temp_c * 10])
+
+
+# ---------------------------------------------------------------------------
+# Persistent machine settings and mechanical tuning
+# ---------------------------------------------------------------------------
+def build_set_weight_unit(unit: str) -> bytes:
+    """Persist the display/scale unit (``ml``, ``g``, or ``oz``)."""
+    name = str(unit).strip().lower()
+    values = {"ml": 0, "g": 1, "oz": 2}
+    if name not in values:
+        raise ValueError("weight unit must be ml, g, or oz")
+    return j15_frame(CMD_SET_WEIGHT_UNIT, [values[name]])
+
+
+def build_set_temperature_unit(unit: str) -> bytes:
+    """Persist the machine display temperature unit (``C`` or ``F``)."""
+    name = str(unit).strip().upper()
+    values = {"F": 0, "C": 1}
+    if name not in values:
+        raise ValueError("temperature unit must be C or F")
+    return j15_frame(CMD_SET_TEMPERATURE_UNIT, [values[name]])
+
+
+def build_set_water_source(source: str) -> bytes:
+    """Persist ``tank`` or direct/automatic ``tap`` water feed."""
+    name = str(source).strip().lower()
+    values = {"tank": 0, "tap": 1}
+    if name not in values:
+        raise ValueError("water source must be tank or tap")
+    return j15_frame(CMD_SET_WATER_SOURCE, [values[name]])
+
+
+def build_set_display(level: str) -> bytes:
+    """Persist Studio display brightness (``low``, ``medium``, ``high``)."""
+    name = str(level).strip().lower()
+    values = {"low": 1, "medium": 8, "high": 15}
+    if name not in values:
+        raise ValueError("display must be low, medium, or high")
+    return j15_frame(CMD_SET_DISPLAY, [values[name]])
+
+
+def build_read_pour_radius() -> bytes:
+    return j15_frame(CMD_READ_POUR_RADIUS, frame_type=0x02)
+
+
+def build_write_pour_radius(value: int) -> bytes:
+    value = int(value)
+    # The app exposes five values around a per-machine baseline; known firmware
+    # baselines are 560-840 and the UI applies +/-160 in 80-unit steps.
+    if not 400 <= value <= 1000:
+        raise ValueError("pour radius must be 400-1000")
+    return j15_frame(CMD_WRITE_POUR_RADIUS, [value], frame_type=0x02)
+
+
+def build_read_vibration_amplitude() -> bytes:
+    return j15_frame(CMD_READ_VIBRATION_AMPLITUDE, frame_type=0x02)
+
+
+def build_write_vibration_amplitude(value: int) -> bytes:
+    value = int(value)
+    if value not in range(1000, 1501, 100):
+        raise ValueError("vibration amplitude must be 1000-1500 in 100-unit steps")
+    return j15_frame(CMD_WRITE_VIBRATION_AMPLITUDE, [value], frame_type=0x02)
+
+
 # ---------------------------------------------------------------------------
 # Omni Tea Brewer commands and recipe-code port
 # ---------------------------------------------------------------------------
@@ -412,7 +640,7 @@ def build_tea_recipe_code(
     for index, pour in enumerate(pours):
         ml = int(pour["ml"])
         temp = int(pour.get("temp", pour.get("temp_c")))
-        pattern = _machine_pattern(str(pour.get("pattern", "ring")))
+        pattern = _machine_pattern(str(pour.get("pattern", "circular")))
         vibration = int(pour.get("vibration", 0)) & 0xFF
         pause_lo, pause_hi = _tea_pause_bytes(
             int(pour.get("pause", pour.get("pause_s", 0)))
@@ -516,28 +744,42 @@ def build_a6(
     )
 
 
-def build_a8(temp1: float = 110.0, temp2: float = 90.0) -> bytes:
-    """0xa8 stage-temps payload: ``01`` + f32le(temp1) + f32le(temp2).
+def build_coffee_cup_geometry_compat(
+    first: float = COFFEE_CUP_GEOMETRY_COMPAT[0],
+    second: float = COFFEE_CUP_GEOMETRY_COMPAT[1],
+) -> bytes:
+    """Build command-8104's opaque coffee compatibility payload.
 
-    The captured standard case is ``01 0000dc42 0000b442`` = 110.0, 90.0.
+    APK 2.2.2 calls this command ``APP_SET_CUP`` and treats both floats as cup
+    geometry. The captured coffee path uses 110/90. They are deliberately not
+    exposed as recipe temperatures.
     """
-    f1 = struct.pack("<f", float(temp1))
-    f2 = struct.pack("<f", float(temp2))
+    f1 = struct.pack("<f", float(first))
+    f2 = struct.pack("<f", float(second))
     return bytes([0x01]) + f1 + f2
+
+
+def build_a8(temp1: float = 110.0, temp2: float = 90.0) -> bytes:
+    """Deprecated raw-capture alias for :func:`build_coffee_cup_geometry_compat`."""
+
+    return build_coffee_cup_geometry_compat(temp1, temp2)
 
 
 def _pour_segments(p: Mapping) -> list[bytes]:
     """Turn one logical pour dict into a list of segment byte-strings.
 
-    ``p`` keys: ``ml``, ``temp``, ``pattern`` ('spiral'|'center'|'ring'),
-    ``agitation`` (bool), ``pause`` (seconds, post-pour), ``rpm`` (int),
-    ``flow`` (ml/s float).
+    ``p`` keys: ``ml``, ``temp``, ``pattern``
+    (``spiral``/``center``/``circular``; legacy ``ring`` is accepted),
+    ``vibration`` (``none``/``before``/``after``/``both``), ``pause``
+    (seconds, post-pour), ``rpm`` (int), and ``flow`` (ml/s float). The old
+    ``agitation`` boolean remains supported only as a compatibility input.
 
-    8-byte pour segment: ``[ml, temp, pat, agit, negpause, 00, rpm, flow*10]``.
+    8-byte pour segment: ``[ml, temp, pattern, vibration, negpause, 00, rpm,
+    flow*10]``.
     A pour whose volume exceeds 127 ml is split into 127-ml 4-byte lead
     segments followed by an 8-byte remainder carrying flow/pause/rpm.
     """
-    pat, agit = PATTERN_CODES[(p.get("pattern", "spiral"), bool(p.get("agitation", False)))]
+    pat, vibration = _pour_pattern_vibration(p)
     ml = int(p["ml"])
     temp = int(p["temp"]) & 0xFF
     pause = int(p.get("pause", 0))
@@ -547,9 +789,11 @@ def _pour_segments(p: Mapping) -> list[bytes]:
     segs: list[bytes] = []
     remaining = ml
     while remaining > 127:
-        segs.append(bytes([127, temp, pat, agit]))
+        segs.append(bytes([127, temp, pat, vibration]))
         remaining -= 127
-    segs.append(bytes([remaining & 0xFF, temp, pat, agit, negpause, 0x00, rpm, flow10]))
+    segs.append(
+        bytes([remaining & 0xFF, temp, pat, vibration, negpause, 0x00, rpm, flow10])
+    )
     return segs
 
 
@@ -609,17 +853,27 @@ def build_load_frames(recipe: Mapping) -> list[bytes]:
     Returns exactly ``[a4, a6, a8, pours]`` — the four frames that *load* the
     recipe onto the machine. The pours opcode is ``0x41`` normally, or ``0x44``
     for a **no-grind** recipe (``grind == 0``, brew pre-ground). It **never**
-    includes ``0x42`` (commit) or ``0x46`` (start): loading only arms the machine,
-    so a load can never brew by accident. To start a brew, call the dedicated
-    :func:`build_commit`/:func:`build_start` builders explicitly.
+    includes ``0x42`` (commit) or ``0x46`` (state-sensitive confirm/pause): loading
+    only arms the machine, so a load can never brew by accident. The guarded client
+    owns the explicit commit/state-precondition sequence.
 
     ``recipe`` may be a plain dict (with keys ``dose``, ``grind``, optional
-    ``stage_temps``, optional ``tail``, optional ``seq``, and ``pours``) or any
-    mapping providing the same keys. :class:`xbloom_ble.recipe.Recipe` exposes
-    a ``to_protocol_dict()`` producing exactly this shape.
+    internal ``cup_geometry_compat``, optional ``tail``, optional ``seq``, and
+    ``pours``) or any mapping providing the same keys. The deprecated raw-capture
+    key ``stage_temps`` remains accepted only for upstream byte-test compatibility.
+    :class:`xbloom_ble.recipe.Recipe` exposes a ``to_protocol_dict()`` producing
+    the canonical internal shape.
     """
     seq = recipe.get("seq", LOAD_SEQ)
-    t1, t2 = recipe.get("stage_temps", (110.0, 90.0))
+    if "cup_geometry_compat" in recipe and "stage_temps" in recipe:
+        raise ValueError("recipe cannot set both cup_geometry_compat and stage_temps")
+    cup_geometry = recipe.get(
+        "cup_geometry_compat",
+        recipe.get("stage_temps", COFFEE_CUP_GEOMETRY_COMPAT),
+    )
+    if not isinstance(cup_geometry, (tuple, list)) or len(cup_geometry) != 2:
+        raise ValueError("cup_geometry_compat must contain exactly two values")
+    cup_first, cup_second = cup_geometry
     tail = _ratio_byte(recipe)                                   # ratio × 10, derived
     pours_cmd = POURS_CMD_NO_GRIND if int(recipe["grind"]) == 0 else POURS_CMD_GRIND
     frames = [
@@ -633,7 +887,11 @@ def build_load_frames(recipe: Mapping) -> list[bytes]:
                 recipe.get("bypass_temp_c", 0.0),
             ),
         ),
-        xbloom_frame(0xA8, seq, build_a8(t1, t2)),
+        xbloom_frame(
+            0xA8,
+            seq,
+            build_coffee_cup_geometry_compat(cup_first, cup_second),
+        ),
         xbloom_frame(pours_cmd, seq, build_41(recipe["pours"], recipe["grind"], tail)),
     ]
     # Belt-and-braces: loading is load-only. A commit/start opcode must never ride
@@ -660,16 +918,31 @@ def build_commit() -> bytes:
 
 
 def build_start() -> bytes:
-    """The ``0x46`` **start** frame — the "go" that begins brewing.
+    """Build state-sensitive command 40518 for an awaiting-confirm start.
 
-    Sent after :func:`build_commit` (machine at ``0x1e``); the machine begins
-    brewing (STATE ``0x3b``). Constant payload ``01``, seq ``0x9e`` (the brew
-    phase id). Byte-exact vs the app's capture (``580101469e0c0000000180a1``).
+    APK 2.2.2 names this command ``全流程冲泡暂停``. On the captured target
+    firmware, the same bytes start only while a fresh status report says
+    ``awaiting_confirm``; while running they pause/abort. Constant payload ``01``,
+    seq ``0x9e``; captured frame ``580101469e0c0000000180a1``.
 
-    ⚠️ This physically dispenses near-boiling water. Emit it only when the machine
-    is ready and someone intends to brew.
+    ⚠️ Emit only with a fresh awaiting-confirm precondition and an intentional,
+    physically ready brew. A timeout is not evidence of that state.
     """
     return xbloom_frame(START_OPCODE, BREW_SEQ, b"\x01")
+
+
+def build_coffee_pause() -> bytes:
+    """Pause a running automatic coffee recipe.
+
+    Command 40518 is state-sensitive: hardware proves an awaiting-confirm start
+    meaning, while APK 2.2.2 defines the running-state meaning as pause. The frame
+    is byte-identical; only a current machine state makes the intent unambiguous.
+    """
+    return build_start()
+
+
+def build_coffee_resume() -> bytes:
+    return j15_frame(CMD_COFFEE_RESUME)
 
 
 def build_cancel() -> bytes:

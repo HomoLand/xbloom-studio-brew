@@ -42,16 +42,27 @@ The port is pinned by tests for:
 - Brewer enter/start argument encoding, tank/tap source, `TemperatureConstant.RT = 20.0`, and
   completion cleanup.
 - Coffee bypass volume/temperature/dose encoding and recipe-stage RT/BP tokens.
+- Independent recipe pattern plus four-state vibration timing (`none`, `before`, `after`, `both`).
 - Fixed-width Studio machine-info decoding with serial redaction at the CLI boundary.
+- Persistent unit/display/source commands, combined settings report, and type-2 radius/amplitude
+  read/write frames with APK UI-level transforms.
+- Cumulative dispensed-water report `40523`, separate cup-scale readings, pour/tea/error reports,
+  and six-character xPod XID reports.
 - Tea cup setup, recipe upload, execute separation, official green-tea blob, and native minute-pause
   transformation.
 
 These are decoded, firmware-dependent behaviors, not an official xBloom API. Scale enter/read/exit
 has also been verified on `V12.0D.500`; a follow-up hardware observation confirmed that the entry
-command zeros a load already present. Unattended tests do not run the grinder or dispense water.
+command zeros a load already present. On 2026-07-13, a supervised RT-water run on the same firmware
+visually verified a running `center → spiral` command and confirmed explicit STOP echo `4507`, quit
+`8013`, and return to idle. The run was deliberately stopped around 100 ml of a 200 ml target, so it
+does not verify natural completion or physical live-temperature response. The temperature frame and
+completed write path are separately verified, but not with an outlet thermometer. Persistent
+settings/mechanical writes are also not physically tested by this project. Unattended tests do not
+run the grinder or dispense water.
 
 See `apk-capability-matrix.md` for the complete Studio command inventory, feature classification,
-known cup-geometry/vibration uncertainties, and the distinction between J15 BLE, J20 cloud code,
+known cup-geometry/settings evidence boundaries, and the distinction between J15 BLE, J20 cloud code,
 NFC lookup, and mobile-only features.
 
 ## Public official tea templates

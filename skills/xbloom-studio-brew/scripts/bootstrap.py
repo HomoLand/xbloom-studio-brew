@@ -1,4 +1,4 @@
-"""Create a skill-local runtime and install pinned BLE dependencies."""
+"""Create an external per-user runtime and install pinned BLE dependencies."""
 
 from __future__ import annotations
 
@@ -9,41 +9,54 @@ import subprocess
 import sys
 import venv
 
+from xbloom_paths import RUNTIME_DIR_ENV, runtime_python_path, skill_runtime_dir
+
 
 ROOT = Path(__file__).resolve().parents[1]
-VENV = ROOT / ".venv"
 
 
-def venv_python() -> Path:
-    if os.name == "nt":
-        return VENV / "Scripts" / "python.exe"
-    return VENV / "bin" / "python"
+def venv_python(runtime: Path | None = None) -> Path:
+    return runtime_python_path(skill_runtime_dir() if runtime is None else runtime)
 
 
-def run(args: list[str]) -> None:
-    subprocess.run(args, cwd=ROOT, check=True)
+def run(args: list[str], *, env: dict[str, str] | None = None) -> None:
+    subprocess.run(args, cwd=ROOT, env=env, check=True)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dev", action="store_true", help="also install pytest and run tests")
+    parser.add_argument(
+        "--runtime-dir",
+        type=Path,
+        help="override the external runtime directory for this bootstrap",
+    )
     args = parser.parse_args()
+    runtime = (args.runtime_dir or skill_runtime_dir()).expanduser().resolve()
 
-    if not venv_python().exists():
-        print(f"Creating local runtime at {VENV}")
-        venv.EnvBuilder(with_pip=True).create(VENV)
+    if not venv_python(runtime).exists():
+        print(f"Creating external runtime at {runtime}")
+        venv.EnvBuilder(with_pip=True).create(runtime)
 
     requirement = ROOT / ("requirements-dev.txt" if args.dev else "requirements.txt")
-    python = str(venv_python())
+    python = str(venv_python(runtime))
     run([python, "-m", "pip", "install", "--disable-pip-version-check", "-r", str(requirement)])
-    run([python, str(ROOT / "scripts" / "xbloom.py"), "doctor"])
+    runtime_env = dict(os.environ)
+    runtime_env[RUNTIME_DIR_ENV] = str(runtime)
+    run(
+        [python, str(ROOT / "scripts" / "xbloom.py"), "doctor"],
+        env=runtime_env,
+    )
     if args.dev:
-        env = dict(os.environ)
-        env["PYTHONPATH"] = str(ROOT / "scripts")
+        runtime_env["PYTHONPATH"] = str(ROOT / "scripts")
         subprocess.run(
-            [python, "-m", "pytest", "-q"], cwd=ROOT, env=env, check=True
+            [python, "-m", "pytest", "-q"], cwd=ROOT, env=runtime_env, check=True
         )
 
+    if args.runtime_dir is not None:
+        print(
+            f"Persist {RUNTIME_DIR_ENV}={runtime} for future CLI and bridge calls."
+        )
     print("Bootstrap complete. Run: python scripts/xbloom.py scan")
 
 
