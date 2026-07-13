@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import dataclass
 import importlib.util
 import json
 import os
@@ -41,6 +42,8 @@ UNTESTED_FIRMWARE_ENV = "XBLOOM_ALLOW_UNTESTED_FIRMWARE"
 UNTESTED_FIRMWARE_SENTINEL = "I_ACCEPT_UNTESTED_FIRMWARE"
 ACTIVE_STATES = frozenset({"armed", "awaiting_confirm", "starting", "brewing", "saving_slots"})
 ROOM_TEMPERATURE_C = 20
+DEFAULT_PROGRESS_INTERVAL = 1.0
+UNCONFIRMED_COMPLETION_EXIT = 3
 
 
 def local_python() -> Path:
@@ -108,14 +111,16 @@ def require_runtime() -> None:
         raise RuntimeError("BLE runtime missing; run: python scripts/bootstrap.py")
 
 
-def state_write(data: dict[str, Any], path: Path = STATE_FILE) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+def state_write(data: dict[str, Any], path: Path | None = None) -> None:
+    path = STATE_FILE if path is None else path
+    path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(".tmp")
     temp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     temp.replace(path)
 
 
-def state_read(path: Path = STATE_FILE) -> dict[str, Any]:
+def state_read(path: Path | None = None) -> dict[str, Any]:
+    path = STATE_FILE if path is None else path
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
@@ -125,7 +130,8 @@ def state_read(path: Path = STATE_FILE) -> dict[str, Any]:
     return data
 
 
-def state_clear(path: Path = STATE_FILE) -> None:
+def state_clear(path: Path | None = None) -> None:
+    path = STATE_FILE if path is None else path
     try:
         path.unlink()
     except FileNotFoundError:
@@ -180,6 +186,45 @@ async def resolve_address(explicit: str | None, timeout: float) -> tuple[str, st
         raise RuntimeError(f"expected exactly one nearby xBloom; found {len(devices)}")
     device = devices[0]
     return device.address, getattr(device, "name", None) or "xBloom"
+
+
+def loaded_workflow_records() -> list[tuple[Path, dict[str, Any]]]:
+    return [
+        (path, state_read(path))
+        for path in (STATE_FILE, TEA_STATE_FILE)
+        if path.exists()
+    ]
+
+
+async def resolve_control_address(explicit: str | None, timeout: float) -> tuple[str, str]:
+    """Resolve monitor/cancel against a loaded workflow before scanning.
+
+    A state record is the authoritative machine binding after load/start. Reusing it
+    avoids scanning during an armed or running operation and makes recovery reliable
+    when several xBloom machines are nearby.
+    """
+    records = loaded_workflow_records()
+    if not records:
+        return await resolve_address(explicit, timeout)
+
+    addresses = {str(record.get("address") or "") for _path, record in records}
+    if "" in addresses:
+        raise RuntimeError("loaded workflow state has no machine address; inspect before recovery")
+    if len(addresses) != 1:
+        raise RuntimeError("loaded workflow records refer to different machines; inspect before recovery")
+    recorded_address = next(iter(addresses))
+    configured_address = explicit or os.environ.get("XBLOOM_ADDRESS")
+    if configured_address and configured_address.casefold() != recorded_address.casefold():
+        raise RuntimeError("requested machine differs from the loaded workflow machine")
+    machine = next(
+        (
+            str(record.get("machine"))
+            for _path, record in records
+            if record.get("machine")
+        ),
+        "xBloom",
+    )
+    return recorded_address, machine
 
 
 def redact_machine_info(machine_info: dict[str, object]) -> dict[str, object]:
@@ -380,34 +425,155 @@ class _MonitorComplete(Exception):
     pass
 
 
-async def monitor_client(client: Any, duration: float) -> None:
+@dataclass(frozen=True)
+class MonitorResult:
+    terminal_confirmed: bool
+    terminal_state: str | None
+    last_state: str | None
+    saw_active: bool
+    water_g: float | None
+    coffee_g: float | None
+    scale_g: float | None
+    events_seen: int
+    elapsed_s: float
+
+    @property
+    def completion_confirmed(self) -> bool:
+        return self.terminal_confirmed and self.terminal_state in {"ready", "complete"}
+
+    def summary(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "terminal_confirmed": self.terminal_confirmed,
+            "completion_confirmed": self.completion_confirmed,
+            "saw_active": self.saw_active,
+            "events_seen": self.events_seen,
+            "elapsed_s": self.elapsed_s,
+        }
+        if self.terminal_state is not None:
+            data["terminal_state"] = self.terminal_state
+        if self.last_state is not None:
+            data["last_state"] = self.last_state
+        if self.water_g is not None:
+            data["water_g"] = self.water_g
+        if self.coffee_g is not None:
+            data["coffee_g"] = self.coffee_g
+        if self.scale_g is not None:
+            data["scale_g"] = self.scale_g
+        return data
+
+
+def mark_workflow_started(
+    state: dict[str, Any], path: Path, machine_state: str
+) -> dict[str, Any]:
+    updated = dict(state)
+    updated.update(
+        {
+            "status": "running",
+            "started_at": time.time(),
+            "last_state": machine_state,
+        }
+    )
+    state_write(updated, path)
+    return updated
+
+
+def finalize_workflow_state(
+    state: dict[str, Any], path: Path, result: MonitorResult
+) -> bool:
+    """Clear only a terminal-confirmed workflow; preserve uncertain recovery state."""
+    if result.terminal_confirmed:
+        state_clear(path)
+        return True
+    updated = dict(state)
+    updated.update(
+        {
+            "status": "completion_unconfirmed",
+            "last_state": result.last_state or state.get("last_state"),
+            "last_telemetry_at": time.time(),
+        }
+    )
+    state_write(updated, path)
+    return False
+
+
+async def monitor_client(
+    client: Any,
+    duration: float,
+    *,
+    progress_interval: float = DEFAULT_PROGRESS_INTERVAL,
+    active_already: bool = False,
+) -> MonitorResult:
+    if not 0.1 <= float(progress_interval) <= 60:
+        raise RuntimeError("progress interval must be 0.1-60 seconds")
     active_states = {0x1F, 0x1E, 0x22, 0x10, 0x23, 0x3B}
     terminal_states = {0x24, 0x41, 0x01}
-    saw_active = False
+    saw_active = active_already
+    started = time.monotonic()
+    last_progress_emit = started
+    last_emitted_state: str | None = None
+    last_state: str | None = None
+    terminal_state: str | None = None
+    water_g: float | None = None
+    coffee_g: float | None = None
+    scale_g: float | None = None
+    events_seen = 0
 
     def on_event(event: Any) -> None:
-        nonlocal saw_active
+        nonlocal saw_active, last_progress_emit, last_emitted_state, last_state
+        nonlocal terminal_state, water_g, coffee_g, scale_g, events_seen
+        events_seen += 1
+        now = time.monotonic()
+        if event.water_g is not None:
+            water_g = event.water_g
+        if event.coffee_g is not None:
+            coffee_g = event.coffee_g
+        if event.scale_g is not None:
+            scale_g = event.scale_g
         if event.state in active_states:
             saw_active = True
-        data: dict[str, Any] = {
-            "command": "telemetry",
-            "time": round(time.time(), 3),
-            "state": event.state_name,
-        }
-        if event.water_g is not None:
-            data["water_g"] = event.water_g
-        if event.coffee_g is not None:
-            data["coffee_g"] = event.coffee_g
-        if event.scale_g is not None:
-            data["scale_g"] = event.scale_g
-        emit(data)
-        if saw_active and event.state in terminal_states:
+        if event.state is not None:
+            last_state = event.state_name
+        terminal = saw_active and event.state in terminal_states
+        state_changed = event.state is not None and event.state_name != last_emitted_state
+        has_weight = any(
+            value is not None for value in (event.water_g, event.coffee_g, event.scale_g)
+        )
+        if terminal or state_changed or (has_weight and now - last_progress_emit >= progress_interval):
+            data: dict[str, Any] = {
+                "command": "telemetry",
+                "time": round(time.time(), 3),
+                "state": event.state_name if event.state is not None else (last_state or "scale"),
+            }
+            if water_g is not None:
+                data["water_g"] = water_g
+            if coffee_g is not None:
+                data["coffee_g"] = coffee_g
+            if scale_g is not None:
+                data["scale_g"] = scale_g
+            emit(data)
+            last_progress_emit = now
+            if event.state is not None:
+                last_emitted_state = event.state_name
+        if terminal:
+            terminal_state = event.state_name
             raise _MonitorComplete()
 
+    terminal_confirmed = False
     try:
         await client.stream_telemetry(on_event, duration=duration, stop_on_terminal=False)
     except _MonitorComplete:
-        return
+        terminal_confirmed = True
+    return MonitorResult(
+        terminal_confirmed=terminal_confirmed,
+        terminal_state=terminal_state,
+        last_state=last_state,
+        saw_active=saw_active,
+        water_g=water_g,
+        coffee_g=coffee_g,
+        scale_g=scale_g,
+        events_seen=events_seen,
+        elapsed_s=round(time.monotonic() - started, 2),
+    )
 
 
 async def async_monitor(args: argparse.Namespace) -> int:
@@ -415,10 +581,46 @@ async def async_monitor(args: argparse.Namespace) -> int:
 
     if not 0.1 <= float(args.duration) <= 3600:
         raise RuntimeError("monitor --duration must be 0.1-3600 seconds")
-    address, name = await resolve_address(args.address, args.scan_timeout)
-    emit({"command": "monitor", "status": "listening", "machine": name})
+    if not 0.1 <= float(args.progress_interval) <= 60:
+        raise RuntimeError("monitor --progress-interval must be 0.1-60 seconds")
+    workflow_records = loaded_workflow_records()
+    if len(workflow_records) > 1:
+        raise RuntimeError("multiple loaded workflow records exist; run cancel before monitoring")
+    active_already = any(
+        record.get("status") in {"running", "completion_unconfirmed"}
+        for _path, record in workflow_records
+    )
+    address, name = await resolve_control_address(args.address, args.scan_timeout)
+    emit(
+        {
+            "command": "monitor",
+            "status": "listening",
+            "machine": name,
+            "progress_interval_s": args.progress_interval,
+        }
+    )
     async with XBloomClient(address) as client:
-        await monitor_client(client, args.duration)
+        result = await monitor_client(
+            client,
+            args.duration,
+            progress_interval=args.progress_interval,
+            active_already=active_already,
+        )
+    state_records_cleared = 0
+    if result.terminal_confirmed:
+        for path, _record in workflow_records:
+            state_clear(path)
+            state_records_cleared += 1
+    emit(
+        {
+            "command": "monitor",
+            "status": (
+                result.terminal_state if result.terminal_confirmed else "duration_elapsed"
+            ),
+            "state_records_cleared": state_records_cleared,
+            **result.summary(),
+        }
+    )
     return 0
 
 
@@ -665,6 +867,8 @@ async def async_tea_start(args: argparse.Namespace) -> int:
         raise RuntimeError(f"--confirm-ready must equal {TEA_READY_SENTINEL}")
     if not 1 <= float(args.duration) <= 3600:
         raise RuntimeError("tea-start --duration must be 1-3600 seconds")
+    if not 0.1 <= float(args.progress_interval) <= 60:
+        raise RuntimeError("tea-start --progress-interval must be 0.1-60 seconds")
     path, _recipe, summary = load_tea_recipe(args.recipe)
     state = state_read(TEA_STATE_FILE)
     age = time.time() - float(state.get("loaded_at", 0))
@@ -677,11 +881,12 @@ async def async_tea_start(args: argparse.Namespace) -> int:
     address = str(state.get("address") or "")
     if not address:
         raise RuntimeError("loaded tea state has no machine address")
-    if args.address and args.address != address:
+    if args.address and args.address.casefold() != address.casefold():
         raise RuntimeError("requested machine differs from the loaded tea machine")
 
     async with XBloomClient(address) as client:
         ack = await client.start_tea()
+        state = mark_workflow_started(state, TEA_STATE_FILE, "start_accepted")
         emit(
             {
                 "command": "tea-start",
@@ -692,15 +897,30 @@ async def async_tea_start(args: argparse.Namespace) -> int:
                 "recipe_sha256": summary["recipe_sha256"],
             }
         )
-        await monitor_client(client, args.duration)
-    state_clear(TEA_STATE_FILE)
-    return 0
+        result = await monitor_client(
+            client,
+            args.duration,
+            progress_interval=args.progress_interval,
+        )
+    state_record_cleared = finalize_workflow_state(state, TEA_STATE_FILE, result)
+    output = {
+        "command": "tea-start",
+        "status": (
+            result.terminal_state if result.terminal_confirmed else "completion_unconfirmed"
+        ),
+        "state_record_cleared": state_record_cleared,
+        **result.summary(),
+    }
+    if not result.terminal_confirmed:
+        output["next_action"] = "run monitor or cancel; do not assume tea completed"
+    emit(output)
+    return 0 if result.terminal_confirmed else UNCONFIRMED_COMPLETION_EXIT
 
 
 async def async_cancel(args: argparse.Namespace) -> int:
     from xbloom_ble.client import XBloomClient
 
-    address, name = await resolve_address(args.address, args.scan_timeout)
+    address, name = await resolve_control_address(args.address, args.scan_timeout)
     async with XBloomClient(address) as client:
         await client.cancel_brew()
         if TEA_STATE_FILE.exists():
@@ -733,6 +953,8 @@ async def async_start(args: argparse.Namespace) -> int:
         raise RuntimeError(f"--confirm-ready must equal {READY_SENTINEL}")
     if not 1 <= float(args.duration) <= 3600:
         raise RuntimeError("start --duration must be 1-3600 seconds")
+    if not 0.1 <= float(args.progress_interval) <= 60:
+        raise RuntimeError("start --progress-interval must be 0.1-60 seconds")
     path, _recipe, summary = load_recipe(args.recipe)
     state = state_read()
     age = time.time() - float(state.get("loaded_at", 0))
@@ -745,11 +967,12 @@ async def async_start(args: argparse.Namespace) -> int:
     address = str(state.get("address") or "")
     if not address:
         raise RuntimeError("armed state has no machine address")
-    if args.address and args.address != address:
+    if args.address and args.address.casefold() != address.casefold():
         raise RuntimeError("requested machine differs from the armed machine")
 
     async with XBloomClient(address) as client:
         event = await client.start()
+        state = mark_workflow_started(state, STATE_FILE, event.state_name)
         emit(
             {
                 "command": "start",
@@ -758,9 +981,25 @@ async def async_start(args: argparse.Namespace) -> int:
                 "recipe_sha256": summary["recipe_sha256"],
             }
         )
-        await monitor_client(client, args.duration)
-    state_clear()
-    return 0
+        result = await monitor_client(
+            client,
+            args.duration,
+            progress_interval=args.progress_interval,
+            active_already=(bool(event.raw) and event.state_name in ACTIVE_STATES),
+        )
+    state_record_cleared = finalize_workflow_state(state, STATE_FILE, result)
+    output = {
+        "command": "start",
+        "status": (
+            result.terminal_state if result.terminal_confirmed else "completion_unconfirmed"
+        ),
+        "state_record_cleared": state_record_cleared,
+        **result.summary(),
+    }
+    if not result.terminal_confirmed:
+        output["next_action"] = "run monitor or cancel; do not assume brew completed"
+    emit(output)
+    return 0 if result.terminal_confirmed else UNCONFIRMED_COMPLETION_EXIT
 
 
 async def async_save_slots(args: argparse.Namespace) -> int:
@@ -802,6 +1041,12 @@ def build_parser() -> argparse.ArgumentParser:
     load.add_argument("recipe")
     monitor = sub.add_parser("monitor", help="stream status/weights without starting")
     monitor.add_argument("--duration", type=float, default=300.0)
+    monitor.add_argument(
+        "--progress-interval",
+        type=float,
+        default=DEFAULT_PROGRESS_INTERVAL,
+        help="minimum seconds between aggregated weight updates (0.1-60)",
+    )
     scale = sub.add_parser(
         "scale",
         help="standalone electronic scale; entry automatically zeros the current load",
@@ -844,11 +1089,23 @@ def build_parser() -> argparse.ArgumentParser:
     tea_start.add_argument("recipe")
     tea_start.add_argument("--confirm-ready", default="")
     tea_start.add_argument("--duration", type=float, default=600.0)
+    tea_start.add_argument(
+        "--progress-interval",
+        type=float,
+        default=DEFAULT_PROGRESS_INTERVAL,
+        help="minimum seconds between aggregated weight updates (0.1-60)",
+    )
     sub.add_parser("cancel", help="cancel/exit an armed or running brew")
     start = sub.add_parser("start", help="explicitly gated remote start")
     start.add_argument("recipe")
     start.add_argument("--confirm-ready", default="")
     start.add_argument("--duration", type=float, default=300.0)
+    start.add_argument(
+        "--progress-interval",
+        type=float,
+        default=DEFAULT_PROGRESS_INTERVAL,
+        help="minimum seconds between aggregated weight updates (0.1-60)",
+    )
     slots = sub.add_parser("save-slots", help="write guarded recipes to A/B/C; never brews")
     slots.add_argument("recipes", nargs=3, metavar="RECIPE")
     return parser

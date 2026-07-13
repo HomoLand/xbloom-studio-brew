@@ -45,6 +45,8 @@ skill also completed its initial hardware validation on that firmware.
 11. Treat `save-slots` as a persistent configuration change. State that A/B/C will all be replaced
    and obtain explicit user intent before calling it.
 12. Do not expose a BLE address, serial number, or telemetry log in a public recipe or issue.
+13. Clear a coffee/tea workflow record only after telemetry confirms a terminal machine state. A
+   monitoring timeout is an unknown outcome, not completion; preserve the record for recovery.
 
 ## Physical readiness checklist
 
@@ -130,10 +132,12 @@ physical controls remain the final fallback if the process or BLE adapter fails 
 Use the least invasive recovery path:
 
 1. Stop monitoring with Ctrl+C if only the terminal is stuck.
-2. Run `python scripts/xbloom.py cancel` for an armed, waiting, or active workflow.
-3. Use the machine's physical cancel control if BLE is unavailable.
-4. Move the cup only after the machine has stopped dispensing.
-5. If the local armed-state file is stale, run `cancel` once to clear it safely.
+2. If `start`/`tea-start` reports `completion_unconfirmed` (exit 3), run `monitor` to reattach or
+   `cancel` to stop. Both commands reuse the machine address stored by load and do not scan first.
+3. Run `python scripts/xbloom.py cancel` for an armed, waiting, or active workflow.
+4. Use the machine's physical cancel control if BLE is unavailable.
+5. Move the cup only after the machine has stopped dispensing.
+6. If the local armed-state file is stale, run `cancel` once to clear it safely.
 
 Coffee, tea, and grinder-rest records live under `~/.xbloom-studio-brew/` by default. Override the
 directory with `XBLOOM_SKILL_STATE_DIR` for tests or managed deployments.

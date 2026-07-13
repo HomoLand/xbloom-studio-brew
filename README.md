@@ -127,6 +127,9 @@ and [tea brewing](skills/xbloom-studio-brew/references/tea-brewing.md).
 - Firmware/state preflight runs before recipe or preset writes.
 - Remote start requires an owner opt-in, current physical-readiness confirmation, the same recipe
   hash and machine, and an armed state less than five minutes old.
+- Brew telemetry is aggregated to one progress update per second. Workflow state is cleared only
+  after a terminal machine notification; a monitor timeout preserves recovery state for reattach
+  or cancel, using the already-recorded machine instead of scanning.
 - The tested firmware allowlist currently contains `V12.0D.500`; other firmware requires an explicit
   owner-level compatibility override.
 - Every external or generated recipe must pass the same validator.
@@ -150,7 +153,7 @@ cd skills/xbloom-studio-brew
 python scripts/bootstrap.py --dev
 ```
 
-The current suite contains 168 passing tests and 4 hardware/platform skips. Release tests never
+The current suite contains 176 passing tests and 4 hardware/platform skips. Release tests never
 activate the grinder or dispense hot water; the scale enter/read/exit path is hardware-verified on
 firmware `V12.0D.500`.
 

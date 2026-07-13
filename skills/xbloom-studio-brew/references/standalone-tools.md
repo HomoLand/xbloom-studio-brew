@@ -36,6 +36,29 @@ Hardware status: enter, live readings, and clean exit were verified on firmware 
 2026-07-12. A follow-up test with a cup already present confirmed the entry baseline: it read 0,
 removing the cup produced the corresponding negative value, and replacing it returned to 0.
 
+### Interactive absolute-weight workflow
+
+1. Ask the user to clear the platform. Do not enter scale mode with the object already present.
+2. Run `scale` without `--tare` and wait for `"status": "ready"` with
+   `"baseline_zeroed": true`. Use `--duration 60` to `90` when a chat round trip is expected.
+3. Surface `ready` immediately and ask the user to place the object centered, without touching the
+   chassis. Do not wait for the scale session to exit before giving this instruction.
+4. Report a result only after several samples agree on a plausible positive weight. For a cup,
+   an all-zero stream is not a 0 g cup; it means the object was zeroed at entry or was never placed.
+5. If no stable positive reading arrives, exit normally, explain that no absolute weight was
+   measured, and retry only after the user reconfirms an empty platform.
+
+Supported standalone current-weight reports preserve negative values when a tared load is removed.
+Use those readings to explain the zero baseline; do not turn a negative reading into an absolute
+object weight.
+
+### BLE contention
+
+Treat Studio BLE as single-controller in practice. An open/connected phone xBloom App can make
+Agent scans find no machine or cause a FreeSolo session to time out. Before BLE work, have the user
+fully close or disconnect the App. After an uncertain physical action, keep the vessel in place,
+use `cancel` or the machine's physical control, and confirm the machine is idle before retrying.
+
 ## Standalone grinder
 
 Official limits are setting 1-80, 60-120 RPM, no more than 30 seconds per run, followed by at least
@@ -106,6 +129,12 @@ false completion claim.
 Hardware status: frames and completion/timeout cleanup are tested against a scripted BLE device and
 the command semantics are decoded from the official app. A real hot-water dispense is never run as
 an unattended self-test.
+
+For RT water, successful JSON must report `"status": "complete"`, `"temp_setting": "RT"`, and a
+metered volume near the request. A timeout or interruption is not success: keep the vessel centered,
+confirm the phone App is disconnected, use `cancel` if the machine may still be active, then retry
+at most once with a finite `--timeout` and the source reported by machine preflight. Do not silently
+substitute 40 C for RT; that changes the requested drink and requires the user's acceptance.
 
 ## Evidence boundary
 

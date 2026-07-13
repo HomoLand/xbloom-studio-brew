@@ -127,11 +127,19 @@ python <skill-dir>/scripts/xbloom.py start <same-recipe.yaml> --confirm-ready cu
 ```
 
 The recipe must be unchanged, armed on the same machine, and loaded less than five minutes ago.
-The command streams telemetry until completion or timeout. For listen-only telemetry, use:
+The command aggregates weight progress to at most one update per second and emits a final summary.
+Claim successful completion only when that summary reports `"completion_confirmed": true`.
+`"terminal_confirmed": true` means the workflow ended and allows the wrapper to clear its record;
+an `idle` terminal without `ready`/`complete` does not prove a successful cup. For listen-only
+telemetry, use:
 
 ```text
 python <skill-dir>/scripts/xbloom.py monitor --duration 300
 ```
+
+If monitoring reaches its duration without a terminal machine state, `start` exits with code 3,
+reports `completion_unconfirmed`, and preserves the machine binding for `monitor` or `cancel`.
+Never interpret that timeout as a failed brew or a completed brew.
 
 If anything is uncertain, cancel. Never schedule an unattended start.
 
@@ -177,6 +185,11 @@ Add `--tare` only when the user explicitly requests an *additional* re-tare afte
 describe the default as "without tare" or imply that omitting `--tare` preserves the pre-entry
 absolute load.
 
+For an interactive absolute-weight request, keep the platform empty through entry, surface
+`"status": "ready"` immediately, then tell the user to place the object. Use a 60-90 second session
+when chat latency requires it and report only a stable, plausible positive reading. An all-zero
+session did not measure the object's absolute weight; explain the baseline and retry from empty.
+
 The grinder is a motor action. Never set its owner opt-in yourself. After current confirmation of
 beans, receiving cup, clear chute, and clear hands, an enabled deployment may run at most 30 s:
 
@@ -218,11 +231,14 @@ as a substitute for loading one temporary recipe.
 
 - Runtime missing: run `scripts/bootstrap.py`; do not install packages globally.
 - No machine found: confirm Bluetooth is on, the Agent is executing locally, the phone app is not
-  holding the connection, and the machine is nearby.
+  holding the connection, and the machine is nearby. Treat Studio BLE as single-controller in
+  practice: have the user fully close/disconnect the phone app before Agent BLE work.
 - Multiple machines: select one with `--address` or `XBLOOM_ADDRESS`.
 - Unknown firmware: stop. Only the deployment owner may use the explicit override documented in
   `references/device-safety.md` after controlled validation.
 - Armed-state record exists: monitor or cancel; do not probe or load over it.
+- Completion is unconfirmed: leave the state record intact and run `monitor` or `cancel`; monitor
+  and cancel automatically reuse the recorded machine instead of scanning.
 - Tea-loaded-state record exists: execute the unchanged recipe while currently ready, or cancel.
 - Grinder cooldown active: wait for the reported remainder; never bypass the rest record.
 - `WAIT` or slow drawdown: follow the physical checks in `references/recipe-design.md`, then change
