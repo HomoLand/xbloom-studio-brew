@@ -1,0 +1,35 @@
+name: Example Balanced Hot
+kind: hot
+dripper: Omni Dripper 2
+dose_g: 15
+grind: 58
+ratio: 16
+water_ml: 240
+hot_water_ml: 240
+time: "2:30-3:05"
+note: Replace this starting point with bean-specific values before brewing.
+pours:
+  - label: Bloom
+    ml: 45
+    temp_c: 92
+    pattern: spiral
+    vibration: after
+    pause_s: 35
+    rpm: 90
+    flow_ml_s: 3.0
+  - label: Main
+    ml: 105
+    temp_c: 92
+    pattern: spiral
+    vibration: none
+    pause_s: 10
+    rpm: 90
+    flow_ml_s: 3.2
+  - label: Finish
+    ml: 90
+    temp_c: 91
+    pattern: circular
+    vibration: none
+    pause_s: 0
+    rpm: 90
+    flow_ml_s: 3.2

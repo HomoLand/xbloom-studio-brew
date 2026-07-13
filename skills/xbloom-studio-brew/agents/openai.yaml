@@ -1,0 +1,4 @@
+interface:
+  display_name: "xBloom Studio Brew"
+  short_description: "Recipes, account catalog sync, tools, and guarded BLE"
+  default_prompt: "Use $xbloom-studio-brew to sync, import, or design a coffee or tea recipe, validate it, and safely use my xBloom Studio."

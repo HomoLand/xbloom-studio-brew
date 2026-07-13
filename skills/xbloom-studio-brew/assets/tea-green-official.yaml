@@ -1,0 +1,9 @@
+# xBloom public Green Tea template (retrieved 2026-07-12):
+# https://share-h5-test-cn.xbloomcoffee.cn/?id=850qMtt0WPvyTOSvvizGlw%3D%3D
+name: xBloom Official Green Tea
+kind: tea
+leaf_g: 4
+output_ml_per_steep: 120
+pours:
+  - {label: Steep 1, ml: 90, temp_c: 85, pattern: circular, pause_s: 20, flow_ml_s: 3.5}
+  - {label: Steep 2, ml: 90, temp_c: 85, pattern: center, pause_s: 15, flow_ml_s: 3.5}

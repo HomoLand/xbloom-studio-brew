@@ -1,0 +1,9 @@
+# xBloom public Oolong Tea template (retrieved 2026-07-12):
+# https://share-h5-test-cn.xbloomcoffee.cn/?id=ZjhJp8TorA3kS9dFjZWgWA%3D%3D
+name: xBloom Official Oolong Tea
+kind: tea
+leaf_g: 4
+output_ml_per_steep: 120
+pours:
+  - {label: Steep 1, ml: 90, temp_c: 99, pattern: circular, pause_s: 15, flow_ml_s: 3.5}
+  - {label: Steep 2, ml: 90, temp_c: 99, pattern: circular, pause_s: 10, flow_ml_s: 3.5}

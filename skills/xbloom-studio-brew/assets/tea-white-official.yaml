@@ -1,0 +1,9 @@
+# xBloom public White Tea template (retrieved 2026-07-12):
+# https://share-h5-test-cn.xbloomcoffee.cn/?id=FELD1GKNl68YmE7BV50nuA%3D%3D
+name: xBloom Official White Tea
+kind: tea
+leaf_g: 4
+output_ml_per_steep: 120
+pours:
+  - {label: Steep 1, ml: 90, temp_c: 99, pattern: circular, pause_s: 30, flow_ml_s: 3.5}
+  - {label: Steep 2, ml: 90, temp_c: 99, pattern: circular, pause_s: 30, flow_ml_s: 3.5}
