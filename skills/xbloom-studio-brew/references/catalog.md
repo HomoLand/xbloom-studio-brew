@@ -204,11 +204,14 @@ live account; the first real add remains an explicitly approved owner action.
 
 Cloud form conversion is stricter than local BLE execution. The Android created-recipe schema has
 one global grinder RPM, so a local coffee file with multiple non-zero RPM values is rejected rather
-than flattened. For flash brew, the cloud record stores only the hot extraction program: ice mass,
-final water, time, and note remain local/manual preparation, so keep the ice requirement visible in
-the cloud recipe name. Tea uploads contain leaf mass and the programmed 80/90 ml stages; app-display
-metadata such as `output_ml_per_steep` is not a machine or cloud stage field. Disabled tea bypass
-placeholders are compatibility residue and are never interpreted as an extra pour.
+than flattened. The APK reads persisted pours ordered by their stage name, so upload replaces local
+display labels with the App's sortable `Bloom`, `Pour 2`, `Pour 3`, ... names; JSON array position
+alone is not sufficient to preserve execution order. Tea uses its corresponding canonical labels.
+For flash brew, the cloud record stores only the hot extraction program: ice mass, final water,
+time, and note remain local/manual preparation, so keep the ice requirement visible in the cloud
+recipe name. Tea uploads contain leaf mass and the programmed 80/90 ml stages; app-display metadata
+such as `output_ml_per_steep` is not a machine or cloud stage field. Disabled tea bypass placeholders
+are compatibility residue and are never interpreted as an extra pour.
 
 ## A/B/C compatibility
 

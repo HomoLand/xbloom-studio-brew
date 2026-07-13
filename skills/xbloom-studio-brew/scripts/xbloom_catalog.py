@@ -1347,7 +1347,10 @@ def _build_cloud_coffee_form(recipe: Recipe) -> dict[str, Any]:
             pause_s=pour.pause_s,
             flow_ml_s=pour.flow_ml_s,
             vibration=str(pour.vibration or "none"),
-            label=pour.label,
+            # The APK persists pours ordered by ``theName`` rather than JSON
+            # position. Match RecipeEditActivity's canonical sortable labels;
+            # arbitrary local labels such as Main/Finish would reverse stages.
+            label="Bloom" if index == 1 else f"Pour {index}",
         )
         for index, pour in enumerate(recipe.pours, start=1)
     ]
@@ -1394,7 +1397,6 @@ def build_cloud_recipe_form(
                 pattern=pour.pattern,
                 pause_s=pour.pause_s,
                 flow_ml_s=pour.flow_ml_s,
-                label=pour.label,
             )
             for index, pour in enumerate(recipe.pours, start=1)
         ]
@@ -1478,6 +1480,8 @@ def cloud_recipe_preview(recipe: Recipe | TeaRecipe) -> dict[str, Any]:
     warnings = [
         "preview only; no login or remote write was performed",
         "apply is add-only and refuses a same-name recipe with different parameters",
+        "local pour labels are replaced with app-sortable stage names because the APK reads "
+        "cloud pours ordered by stage name",
     ]
     if isinstance(recipe, TeaRecipe):
         warnings.append(

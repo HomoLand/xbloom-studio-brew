@@ -796,6 +796,7 @@ def test_tea_cloud_form_keeps_finished_output_out_of_programmed_pours():
     assert form["isEnableBypassWater"] == 2
     assert form["bypassVolume"] == 5.0
     assert "output_ml_per_steep" not in form
+    assert [pour["theName"] for pour in pours] == ["Bloom", "Pour1"]
     preview = cloud_recipe_preview(recipe)
     assert preview["write_performed"] is False
     assert preview["confirmation_required"] == CLOUD_WRITE_CONFIRM_SENTINEL
@@ -815,13 +816,21 @@ def test_flash_cloud_preview_discloses_manual_ice_boundary():
     recipe = _flash_recipe()
 
     preview = cloud_recipe_preview(recipe)
+    pours = json.loads(preview["app_recipe_form"]["pourDataJSONStr"])
 
     assert preview["manual_preparation"] == {
         "ice_g": 90.0,
         "hot_water_ml": 150.0,
         "final_water_ml": 240.0,
     }
+    assert [pour["theName"] for pour in pours] == ["Bloom", "Pour 2", "Pour 3"]
+    assert [pour["volume"] for pour in sorted(pours, key=lambda item: item["theName"])] == [
+        40.0,
+        60.0,
+        50.0,
+    ]
     assert any("stores only the hot extraction" in item for item in preview["warnings"])
+    assert any("ordered by stage name" in item for item in preview["warnings"])
 
 
 def test_coffee_cloud_form_refuses_lossy_multiple_rpm_mapping():
@@ -917,7 +926,10 @@ def test_cloud_push_compares_hot_only_flash_representation_idempotently(monkeypa
         **form,
         "tableId": 777,
         "appPlace": [4],
-        "pourList": json.loads(form["pourDataJSONStr"]),
+        # The APK/created endpoint reads stages in ascending ``theName`` order.
+        "pourList": sorted(
+            json.loads(form["pourDataJSONStr"]), key=lambda item: item["theName"]
+        ),
     }
     remote.pop("pourDataJSONStr")
     calls = []
