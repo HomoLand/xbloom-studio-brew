@@ -6,21 +6,36 @@ validate every edited recipe before any BLE write.
 This page defines coffee and flash-brew files. Omni Tea Brewer files use a deliberately separate
 schema and protocol; read `tea-brewing.md` and validate them with `tea-validate`.
 
+## Machine program versus serving metadata
+
+xBloom Studio exposes one coffee pour-over program, not separate hot and iced/flash programs. Both
+local `kind` values produce the same class of coffee load frames. The machine receives dose, grind,
+ordered pours, and optional machine bypass; it never receives `kind`, `ice_g`, final `water_ml`,
+`time`, or `note` and cannot dispense ice. `flash-brew` therefore means: preload measured ice in the
+receiving vessel before `start`, then run the normal coffee program with a concentrated hot-water
+profile. It is a local serving/safety classification, not a device mode.
+
+The Android account form also stores only that coffee program. A cloud entry such as a 1:10 recipe
+whose name mentions ice may be a valid manual-over-ice extraction, not a wrongly stored machine
+program. Because the App record lacks trustworthy ice mass/final-water metadata, keep it guarded
+until the user confirms those values and a local `flash-brew` wrapper can be created without changing
+the machine stages.
+
 ## Top-level fields
 
 | Field | Required | Guarded meaning |
 | --- | --- | --- |
 | `name` | Recommended | Human-readable recipe name. |
-| `kind` | Yes | Canonical value `hot` or `flash-brew`. |
+| `kind` | Yes | Local serving classification `hot` or `flash-brew`; never a machine mode. |
 | `dripper` | Recommended | Must contain `Omni` when supplied. |
 | `dose_g` | Yes | 5-18 g. |
 | `grind` | Yes | 35-75; larger is coarser. Use `0` for pre-ground/grinder-off. |
 | `ratio` | Yes | Sum of extraction pours divided by dose; bypass is excluded. For flash brew this is the extraction ratio. |
-| `water_ml` | Yes | Pours plus bypass for `hot`; pours plus bypass plus ice for `flash-brew`. |
+| `water_ml` | Yes | Final serving accounting: pours plus bypass for `hot`; add manual vessel ice for `flash-brew`. Never sent. |
 | `hot_water_ml` | Recommended/Yes | Sum of extraction pours; required for `flash-brew`. |
 | `bypass_ml` | Optional | Machine-executed post-brew bypass, whole 5-100 ml. Omit/zero to disable. |
 | `bypass_temp_c` | With bypass | `RT`, guarded numeric 40-95 C, or `BP`; forbidden without `bypass_ml`. |
-| `ice_g` | Flash only | 40-180 g; forbidden on hot recipes except zero/omitted. |
+| `ice_g` | Flash only | 40-180 g placed manually in the receiving vessel; never machine-dispensed or sent over BLE. |
 | `time` | Optional | Display-only expected range; quote it as a string. |
 | `note` | Optional | Display-only preparation or flavor note. |
 | `pours` | Yes | Two to five ordered pour mappings. |
@@ -37,7 +52,8 @@ remain 1:12 through 1:20. Total machine water must be 60-360 ml.
 
 For a flash brew, sum of pours must equal `hot_water_ml`; `water_ml` must equal
 `hot_water_ml + bypass_ml + ice_g`. Extraction ratio must be 1:8 through 1:14 and final ratio must
-be 1:12 through 1:20.
+be 1:12 through 1:20. These extra constraints validate the intended serving; they do not select a
+different Studio program.
 
 ## Pour fields
 

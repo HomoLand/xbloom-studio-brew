@@ -11,7 +11,6 @@ import asyncio
 from dataclasses import dataclass
 import importlib.util
 import json
-import os
 from pathlib import Path
 import platform
 import re
@@ -21,6 +20,8 @@ import time
 from typing import Any
 
 from xbloom_paths import (
+    environment_copy,
+    environment_value,
     legacy_runtime_python,
     preferred_runtime_python,
     runtime_python_path,
@@ -79,9 +80,9 @@ def reexec_in_local_runtime() -> None:
         already_local = Path(sys.executable).resolve() == target.resolve()
     except OSError:
         already_local = False
-    if already_local or os.environ.get("XBLOOM_SKILL_REEXEC") == "1":
+    if already_local or environment_value("XBLOOM_SKILL_REEXEC") == "1":
         return
-    env = dict(os.environ)
+    env = environment_copy()
     env["XBLOOM_SKILL_REEXEC"] = "1"
     # Preserve the invoking terminal's working directory. Recipe/config paths
     # are user inputs and must not change meaning merely because dependencies
@@ -204,7 +205,7 @@ def reserve_grinder_rest(seconds: float) -> None:
 async def resolve_address(explicit: str | None, timeout: float) -> tuple[str, str]:
     from xbloom_ble.client import scan
 
-    address = explicit or os.environ.get("XBLOOM_ADDRESS")
+    address = explicit or environment_value("XBLOOM_ADDRESS")
     if address:
         return address, "configured"
     devices = await scan(timeout=timeout)
@@ -239,7 +240,7 @@ async def resolve_control_address(explicit: str | None, timeout: float) -> tuple
     if len(addresses) != 1:
         raise RuntimeError("loaded workflow records refer to different machines; inspect before recovery")
     recorded_address = next(iter(addresses))
-    configured_address = explicit or os.environ.get("XBLOOM_ADDRESS")
+    configured_address = explicit or environment_value("XBLOOM_ADDRESS")
     if configured_address and configured_address.casefold() != recorded_address.casefold():
         raise RuntimeError("requested machine differs from the loaded workflow machine")
     machine = next(
@@ -323,7 +324,7 @@ def require_write_preflight(report: dict[str, Any]) -> str:
     firmware = set(report.get("firmware", []))
     if firmware and firmware <= SUPPORTED_FIRMWARE:
         return sorted(firmware)[0]
-    if os.environ.get(UNTESTED_FIRMWARE_ENV) == UNTESTED_FIRMWARE_SENTINEL:
+    if environment_value(UNTESTED_FIRMWARE_ENV) == UNTESTED_FIRMWARE_SENTINEL:
         return ",".join(sorted(firmware)) if firmware else "unidentified"
     found = ", ".join(sorted(firmware)) if firmware else "unidentified"
     raise RuntimeError(
@@ -351,13 +352,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     selected_runtime = local_python()
     external_runtime = runtime_python_path(skill_runtime_dir())
     legacy_runtime = legacy_runtime_python(ROOT)
-    catalog_path = Path(os.environ.get(CATALOG_PATH_ENV, str(CATALOG_FILE))).expanduser()
-    cloud_config_value = os.environ.get(CLOUD_CONFIG_ENV)
+    catalog_path = Path(environment_value(CATALOG_PATH_ENV, str(CATALOG_FILE))).expanduser()
+    cloud_config_value = environment_value(CLOUD_CONFIG_ENV)
     cloud_config_exists = bool(
         cloud_config_value and Path(cloud_config_value).expanduser().is_file()
     )
-    account_email_configured = bool(os.environ.get(ACCOUNT_EMAIL_ENV))
-    account_password_configured = bool(os.environ.get(ACCOUNT_PASSWORD_ENV))
+    account_email_configured = bool(environment_value(ACCOUNT_EMAIL_ENV))
+    account_password_configured = bool(environment_value(ACCOUNT_PASSWORD_ENV))
     try:
         runtime_location = (
             "external"
@@ -457,13 +458,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         },
         "bridge_running": bridge_running,
         "physical_actions_enabled": {
-            "hot_water": os.environ.get(REMOTE_START_ENV) == REMOTE_START_SENTINEL,
-            "grinder": os.environ.get(REMOTE_GRINDER_ENV) == REMOTE_GRINDER_SENTINEL,
+            "hot_water": environment_value(REMOTE_START_ENV) == REMOTE_START_SENTINEL,
+            "grinder": environment_value(REMOTE_GRINDER_ENV) == REMOTE_GRINDER_SENTINEL,
             "live_adjust_unverified": (
-                os.environ.get(LIVE_ADJUST_ENV) == LIVE_ADJUST_SENTINEL
+                environment_value(LIVE_ADJUST_ENV) == LIVE_ADJUST_SENTINEL
             ),
             "persistent_settings": (
-                os.environ.get(SETTINGS_WRITE_ENV) == SETTINGS_WRITE_SENTINEL
+                environment_value(SETTINGS_WRITE_ENV) == SETTINGS_WRITE_SENTINEL
             ),
         },
     }
@@ -504,7 +505,7 @@ async def async_probe(args: argparse.Namespace) -> int:
 
 
 def require_settings_write_gate(confirmation: str, expected: str) -> None:
-    if os.environ.get(SETTINGS_WRITE_ENV) != SETTINGS_WRITE_SENTINEL:
+    if environment_value(SETTINGS_WRITE_ENV) != SETTINGS_WRITE_SENTINEL:
         raise RuntimeError(
             f"persistent machine writes disabled; administrator must set "
             f"{SETTINGS_WRITE_ENV}={SETTINGS_WRITE_SENTINEL}"
@@ -729,7 +730,7 @@ def cmd_catalog(args: argparse.Namespace) -> int:
         )
         return 0
     if action == "sync":
-        config_value = args.config or os.environ.get(CLOUD_CONFIG_ENV)
+        config_value = args.config or environment_value(CLOUD_CONFIG_ENV)
         if not config_value:
             raise RuntimeError(
                 f"catalog sync requires --config or {CLOUD_CONFIG_ENV}; "
@@ -754,12 +755,12 @@ def cmd_catalog(args: argparse.Namespace) -> int:
         )
         return 0
     if action == "login-sync":
-        email = args.email or os.environ.get(ACCOUNT_EMAIL_ENV)
+        email = args.email or environment_value(ACCOUNT_EMAIL_ENV)
         if not email:
             raise RuntimeError(
                 f"catalog login-sync requires --email or {ACCOUNT_EMAIL_ENV}"
             )
-        password = os.environ.get(ACCOUNT_PASSWORD_ENV)
+        password = environment_value(ACCOUNT_PASSWORD_ENV)
         if not password:
             if not sys.stdin.isatty():
                 raise RuntimeError(
@@ -808,12 +809,12 @@ def cmd_catalog(args: argparse.Namespace) -> int:
                 "catalog push --apply requires --confirm-write "
                 f"{CLOUD_WRITE_CONFIRM_SENTINEL}"
             )
-        email = args.email or os.environ.get(ACCOUNT_EMAIL_ENV)
+        email = args.email or environment_value(ACCOUNT_EMAIL_ENV)
         if not email:
             raise RuntimeError(
                 f"catalog push --apply requires --email or {ACCOUNT_EMAIL_ENV}"
             )
-        password = os.environ.get(ACCOUNT_PASSWORD_ENV)
+        password = environment_value(ACCOUNT_PASSWORD_ENV)
         if not password:
             if not sys.stdin.isatty():
                 raise RuntimeError(
@@ -867,6 +868,9 @@ async def async_load(args: argparse.Namespace) -> int:
             "status": "armed",
             "firmware": firmware,
             "target_dispensed_water_ml": summary["target_dispensed_water_ml"],
+            "serving_kind": summary["kind"],
+            "machine_program": summary["machine_program"],
+            "manual_preload_ice_g": summary["manual_preload_ice_g"],
         }
     )
     emit(
@@ -1255,7 +1259,7 @@ async def async_scale(args: argparse.Namespace) -> int:
 async def async_grind(args: argparse.Namespace) -> int:
     from xbloom_ble.client import XBloomClient
 
-    if os.environ.get(REMOTE_GRINDER_ENV) != REMOTE_GRINDER_SENTINEL:
+    if environment_value(REMOTE_GRINDER_ENV) != REMOTE_GRINDER_SENTINEL:
         raise RuntimeError(
             f"remote grinder disabled; administrator must set "
             f"{REMOTE_GRINDER_ENV}={REMOTE_GRINDER_SENTINEL}"
@@ -1299,7 +1303,7 @@ async def async_grind(args: argparse.Namespace) -> int:
 async def async_water(args: argparse.Namespace) -> int:
     from xbloom_ble.client import XBloomClient
 
-    if os.environ.get(REMOTE_START_ENV) != REMOTE_START_SENTINEL:
+    if environment_value(REMOTE_START_ENV) != REMOTE_START_SENTINEL:
         raise RuntimeError(
             f"hot-water actions disabled; administrator must set "
             f"{REMOTE_START_ENV}={REMOTE_START_SENTINEL}"
@@ -1429,7 +1433,7 @@ async def async_tea_start(args: argparse.Namespace) -> int:
     from xbloom_ble.client import XBloomClient
     from xbloom_safety import recipe_sha256
 
-    if os.environ.get(REMOTE_START_ENV) != REMOTE_START_SENTINEL:
+    if environment_value(REMOTE_START_ENV) != REMOTE_START_SENTINEL:
         raise RuntimeError(
             f"hot-water actions disabled; administrator must set "
             f"{REMOTE_START_ENV}={REMOTE_START_SENTINEL}"
@@ -1494,7 +1498,7 @@ async def async_tea_brew(args: argparse.Namespace) -> int:
     """Load then explicitly execute tea in one connected, recoverable workflow."""
     from xbloom_ble.client import XBloomClient
 
-    if os.environ.get(REMOTE_START_ENV) != REMOTE_START_SENTINEL:
+    if environment_value(REMOTE_START_ENV) != REMOTE_START_SENTINEL:
         raise RuntimeError(
             f"hot-water actions disabled; administrator must set "
             f"{REMOTE_START_ENV}={REMOTE_START_SENTINEL}"
@@ -1603,7 +1607,7 @@ async def async_start(args: argparse.Namespace) -> int:
     from xbloom_ble.client import XBloomClient
     from xbloom_safety import recipe_sha256
 
-    if os.environ.get(REMOTE_START_ENV) != REMOTE_START_SENTINEL:
+    if environment_value(REMOTE_START_ENV) != REMOTE_START_SENTINEL:
         raise RuntimeError(
             f"remote start disabled; administrator must set {REMOTE_START_ENV}={REMOTE_START_SENTINEL}"
         )
@@ -1637,6 +1641,13 @@ async def async_start(args: argparse.Namespace) -> int:
                 "status": event.state_name,
                 "verified_by_notification": bool(event.raw),
                 "recipe_sha256": summary["recipe_sha256"],
+                "machine_program": summary.get("machine_program", "coffee-pour-over"),
+                "machine_dispenses_ice": bool(
+                    summary.get("machine_dispenses_ice", False)
+                ),
+                "manual_preload_ice_g": int(
+                    summary.get("manual_preload_ice_g", 0) or 0
+                ),
             }
         )
         result = await monitor_client(

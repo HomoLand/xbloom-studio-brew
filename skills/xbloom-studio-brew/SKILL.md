@@ -1,6 +1,6 @@
 ---
 name: xbloom-studio-brew
-description: Design bean-specific hot pour-over and Americano-style flash-brew recipes for xBloom Studio, research cited roaster/cafe/xPod references, import/query/sync a private app-visible coffee/tea catalog, preview or explicitly add local account recipes, run guarded Omni Tea Brewer recipes, dial in by taste, and operate bundled local BLE for diagnostics, settings, scale, grinder, temperature/volume water, recipe load, A/B/C presets, monitoring, cancel, persistent pause/resume, and explicitly gated physical starts. Use for xBloom Studio, Omni Dripper, xPod/NFC Recipe Cards, Omni Tea Brewer, official or saved coffee/tea recipes, iced coffee, C40 conversion, WAIT troubleshooting, electronic-scale readings, standalone grinding/water, or direct xBloom Bluetooth control.
+description: Design bean-specific hot pour-over and manual-over-ice Americano-style flash-brew recipes for xBloom Studio, research cited roaster/cafe/xPod references, import/query/sync a private app-visible coffee/tea catalog, preview or explicitly add local account recipes, run guarded Omni Tea Brewer recipes, dial in by taste, and operate bundled local BLE for diagnostics, settings, scale, grinder, temperature/volume water, recipe load, A/B/C presets, monitoring, cancel, persistent pause/resume, and explicitly gated physical starts. Use for xBloom Studio, Omni Dripper, xPod/NFC Recipe Cards, Omni Tea Brewer, official or saved coffee/tea recipes, iced coffee, C40 conversion, WAIT troubleshooting, electronic-scale readings, standalone grinding/water, or direct xBloom Bluetooth control.
 ---
 
 # xBloom Studio Brew
@@ -38,6 +38,17 @@ Classify the request before acting:
 Do not produce espresso recipes. xBloom Studio brews pour-over, not espresso. When the user asks
 for iced Americano, offer an **Americano-style flash brew** and state the distinction briefly.
 
+### Non-negotiable flash-brew invariant
+
+xBloom Studio has no separate iced or flash coffee program. Hot and manual-over-ice servings load
+the same coffee pour-over frames, and the machine dispenses only programmed water. Local
+`kind: flash-brew`, `ice_g`, and final `water_ml` are serving/safety metadata that never reach the
+machine. Require the measured ice in the receiving vessel before `start`; never claim the machine
+recognizes or dispenses ice. If a cloud/catalog recipe has a concentrated hot program and mentions
+ice only in its name, do not call it stored incorrectly: the App schema cannot preserve ice mass.
+Explain that local serving metadata is incomplete, confirm ice/final water, then wrap the unchanged
+hot stages as local `flash-brew` metadata. Never replace the vessel ice with machine bypass.
+
 ## Design a recipe
 
 Read `references/recipe-design.md` when creating or adjusting a recipe. Read
@@ -52,7 +63,8 @@ Read `references/recipe-design.md` when creating or adjusting a recipe. Read
 3. If details are missing after research, use reasonable assumptions and state them. Default to 15 g coffee,
    240 g final water, Omni Dripper 2, and filtered water; never assume unknown water is RO.
 4. Choose the smallest useful pour count and a conservative first-cup profile.
-5. For flash brew, separate hot machine water from ice and label the hot and final ratios.
+5. For manual-over-ice flash brew, keep the unchanged coffee pour-over program separate from vessel
+   ice; label both ratios and require the ice before physical start.
    For an intentional bypass recipe, keep extraction pours and final bypass explicit; bypass is
    machine water, not display-only metadata. Use `RT`/`BP` only when that mode is intentional.
 6. Copy `assets/hot-template.yaml` or `assets/flash-brew-template.yaml` to a user/workspace path.
@@ -176,7 +188,8 @@ Remote start is an available core capability, not an add-on, but it has owner an
 Never set the owner opt-in yourself. Never infer physical readiness from BLE.
 
 Only after the user explicitly confirms water, beans, filter, dripper, cup, and clear surroundings
-in the current interaction, and only when the deployment owner has enabled remote start, run:
+in the current interaction—and measured vessel ice for `flash-brew`—and only when the deployment
+owner has enabled remote start, run:
 
 ```text
 python <skill-dir>/scripts/xbloom.py start <same-recipe.yaml> --confirm-ready cup-filter-water-beans

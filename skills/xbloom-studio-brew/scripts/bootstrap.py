@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
 import subprocess
 import sys
 import venv
 
-from xbloom_paths import RUNTIME_DIR_ENV, runtime_python_path, skill_runtime_dir
+from xbloom_paths import (
+    RUNTIME_DIR_ENV,
+    environment_copy,
+    runtime_python_path,
+    skill_runtime_dir,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,7 +45,7 @@ def main() -> None:
     requirement = ROOT / ("requirements-dev.txt" if args.dev else "requirements.txt")
     python = str(venv_python(runtime))
     run([python, "-m", "pip", "install", "--disable-pip-version-check", "-r", str(requirement)])
-    runtime_env = dict(os.environ)
+    runtime_env = environment_copy()
     runtime_env[RUNTIME_DIR_ENV] = str(runtime)
     run(
         [python, str(ROOT / "scripts" / "xbloom.py"), "doctor"],

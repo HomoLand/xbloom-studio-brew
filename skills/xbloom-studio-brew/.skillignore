@@ -1,0 +1,8 @@
+# Development-only fixtures are not part of the runtime security surface.
+/tests/
+
+# Local developer artifacts are never published, but ignore them in checkout scans.
+/.pytest_cache/
+/.venv/
+__pycache__/
+*.pyc

@@ -18,6 +18,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import secrets
 from typing import Any, Callable, Iterable, Mapping
 from urllib.error import HTTPError, URLError
@@ -28,6 +29,7 @@ import yaml
 
 from xbloom_ble.recipe import Recipe
 from xbloom_ble.tea import TeaRecipe
+from xbloom_paths import environment_value
 from xbloom_safety import strict_validate, validate_slot_compatible
 
 
@@ -104,6 +106,13 @@ KNOWN_CONTAINERS = {
     "value",
 }
 
+MANUAL_ICE_NAME_RE = re.compile(r"(?:\b(?:ice|iced|flash)\b|冰|闪冲)", re.IGNORECASE)
+MANUAL_ICE_INCOMPLETE = (
+    "manual-over-ice serving metadata is incomplete: xBloom stores the same coffee "
+    "pour-over program for hot and flash service; confirm ice_g and final water before "
+    "creating a local kind=flash-brew wrapper, without changing the machine stages"
+)
+
 
 class CatalogError(RuntimeError):
     """Raised for malformed imports, unsafe exports, or cloud-sync failures."""
@@ -114,7 +123,7 @@ def utc_now() -> str:
 
 
 def default_catalog_path(state_dir: Path) -> Path:
-    configured = os.environ.get(CATALOG_PATH_ENV)
+    configured = environment_value(CATALOG_PATH_ENV)
     if configured:
         return Path(configured).expanduser()
     return Path(state_dir) / "catalog" / "catalog.json"
@@ -439,6 +448,23 @@ def _normalise_coffee(
     return recipe
 
 
+def _looks_like_manual_ice_serving(recipe: Mapping[str, Any]) -> bool:
+    """Recognize an ice-named concentrated cloud program without inventing ice mass."""
+
+    if str(recipe.get("kind", "")).strip().lower() == "flash-brew":
+        return False
+    if not MANUAL_ICE_NAME_RE.search(str(recipe.get("name", ""))):
+        return False
+    try:
+        if float(recipe.get("ice_g", 0) or 0) > 0:
+            return False
+        dose = float(recipe["dose_g"])
+        pour_total = sum(float(item["ml"]) for item in recipe["pours"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return dose > 0 and 8 <= pour_total / dose <= 14
+
+
 def _normalise_tea(raw: Mapping[str, Any], *, warnings: list[str]) -> dict[str, Any]:
     if str(raw.get("kind", "")).strip().lower() == "tea" and "leaf_g" in raw:
         recipe = TeaRecipe.from_dict(dict(raw))
@@ -578,6 +604,7 @@ def normalise_entry(
         else _normalise_coffee(raw, cup_type=cup_type, warnings=warnings)
     )
     kind = "tea" if is_tea else "coffee"
+    manual_ice_incomplete = kind == "coffee" and _looks_like_manual_ice_serving(recipe)
     table_id = _optional_int(_first(raw, "tableId", "table_id", "recipeId"))
     stable_material = json.dumps(recipe, ensure_ascii=False, sort_keys=True).encode("utf-8")
     identifier = f"xbloom:{table_id}" if table_id is not None else (
@@ -602,6 +629,13 @@ def normalise_entry(
     except Exception as exc:
         executable = False
         validation_errors.append(str(exc))
+    if manual_ice_incomplete:
+        executable = False
+        validation_errors.insert(0, MANUAL_ICE_INCOMPLETE)
+        warnings.append(
+            "name and extraction ratio suggest manual-over-ice service; the App did not "
+            "store ice mass or final water, and the machine program itself is not malformed"
+        )
     if kind == "tea":
         has_tea_bypass_flag = "isEnableBypassWater" in raw
         tea_bypass_volume = _optional_float(
@@ -668,6 +702,9 @@ def normalise_entry(
         "table_id": table_id,
         "name": str(recipe["name"]),
         "kind": kind,
+        "machine_program": (
+            "coffee-pour-over" if kind == "coffee" else "omni-tea-brewer"
+        ),
         "origin": origin,
         "app_places": app_places,
         "app_place_labels": [APP_PLACE_LABELS.get(item, str(item)) for item in app_places],
@@ -693,6 +730,14 @@ def normalise_entry(
         "first_seen_at": imported_at,
         "last_seen_at": imported_at,
     }
+    if manual_ice_incomplete:
+        entry["manual_preparation"] = {
+            "status": "ice-metadata-required",
+            "ice_g": None,
+            "final_water_ml": None,
+            "machine_dispenses_ice": False,
+            "machine_stages_change_required": False,
+        }
     slot = context.get("slot")
     if isinstance(slot, Mapping):
         entry["slots"] = [
@@ -719,6 +764,42 @@ def empty_catalog() -> dict[str, Any]:
     return {"schema_version": SCHEMA_VERSION, "created_at": now, "updated_at": now, "entries": []}
 
 
+def _annotate_loaded_entry(entry: dict[str, Any]) -> None:
+    """Apply current non-destructive semantics to older schema-compatible entries."""
+
+    kind = str(entry.get("kind", ""))
+    entry.setdefault(
+        "machine_program",
+        "coffee-pour-over" if kind == "coffee" else "omni-tea-brewer",
+    )
+    recipe = entry.get("recipe")
+    if kind != "coffee" or not isinstance(recipe, Mapping):
+        return
+    if not _looks_like_manual_ice_serving(recipe):
+        return
+
+    entry["executable"] = False
+    entry["slot_compatible"] = False
+    entry["slot_incompatibility"] = MANUAL_ICE_INCOMPLETE
+    validation_errors = [str(item) for item in entry.get("validation_errors") or []]
+    entry["validation_errors"] = list(
+        dict.fromkeys([MANUAL_ICE_INCOMPLETE, *validation_errors])
+    )
+    warnings = [str(item) for item in entry.get("warnings") or []]
+    warnings.append(
+        "name and extraction ratio suggest manual-over-ice service; the App did not "
+        "store ice mass or final water, and the machine program itself is not malformed"
+    )
+    entry["warnings"] = sorted(set(warnings))
+    entry["manual_preparation"] = {
+        "status": "ice-metadata-required",
+        "ice_g": None,
+        "final_water_ml": None,
+        "machine_dispenses_ice": False,
+        "machine_stages_change_required": False,
+    }
+
+
 def load_catalog(path: str | Path) -> dict[str, Any]:
     resolved = Path(path).expanduser()
     if not resolved.exists():
@@ -732,6 +813,8 @@ def load_catalog(path: str | Path) -> dict[str, Any]:
     entries = data.get("entries")
     if not isinstance(entries, list) or not all(isinstance(item, dict) for item in entries):
         raise CatalogError(f"catalog entries at {resolved} are invalid")
+    for entry in entries:
+        _annotate_loaded_entry(entry)
     return data
 
 
@@ -895,6 +978,7 @@ def list_entries(
                     "table_id",
                     "name",
                     "kind",
+                    "machine_program",
                     "origin",
                     "author",
                     "cup_type",
@@ -902,6 +986,8 @@ def list_entries(
                     "slot_compatible",
                     "slots",
                     "warnings",
+                    "validation_errors",
+                    "manual_preparation",
                 )
                 if entry.get(key) not in (None, [], "")
             }

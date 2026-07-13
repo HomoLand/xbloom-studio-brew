@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from os import environ as _process_environment
 from pathlib import Path
 
 STATE_DIR_ENV = "XBLOOM_SKILL_STATE_DIR"
@@ -11,7 +12,23 @@ RUNTIME_DIR_ENV = "XBLOOM_SKILL_RUNTIME_DIR"
 
 
 def _environment(environ: Mapping[str, str] | None) -> Mapping[str, str]:
-    return os.environ if environ is None else environ
+    return _process_environment if environ is None else environ
+
+
+def environment_value(
+    name: str,
+    default: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> str | None:
+    """Read one explicitly named configuration value from the process environment."""
+
+    return _environment(environ).get(name, default)
+
+
+def environment_copy(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Copy the environment so a child-process overlay cannot mutate its source."""
+
+    return dict(_environment(environ))
 
 
 def skill_state_dir(environ: Mapping[str, str] | None = None) -> Path:

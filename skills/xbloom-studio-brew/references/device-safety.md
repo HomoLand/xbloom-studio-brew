@@ -143,6 +143,10 @@ python scripts/xbloom.py start recipe.yaml --confirm-ready cup-filter-water-bean
 These gates prevent accidental or stale starts. They do not prove physical safety, so current-turn
 user confirmation remains mandatory.
 
+For a local `flash-brew` serving, that current-turn confirmation must also cover the measured ice
+already placed in the receiving vessel. The machine still runs the normal coffee program and the
+readiness token does not mean Studio can detect or dispense ice.
+
 The exact readiness arguments differ by action:
 
 ```text

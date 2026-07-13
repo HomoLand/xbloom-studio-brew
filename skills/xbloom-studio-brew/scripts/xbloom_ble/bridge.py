@@ -22,7 +22,11 @@ import sys
 import time
 from typing import Any
 
-from xbloom_paths import skill_state_dir as _shared_skill_state_dir
+from xbloom_paths import (
+    environment_copy,
+    environment_value,
+    skill_state_dir as _shared_skill_state_dir,
+)
 
 from .client import XBloomClient, scan
 from .protocol import ROOM_TEMPERATURE_C
@@ -133,11 +137,11 @@ class BridgeCore:
         environ: Mapping[str, str] | None = None,
         machine_info_timeout: float = 4.0,
     ) -> None:
-        self.default_address = default_address or os.environ.get("XBLOOM_ADDRESS")
+        self.default_address = default_address or environment_value("XBLOOM_ADDRESS")
         self.state_dir = Path(state_dir) if state_dir is not None else skill_state_dir()
         self.client_factory = client_factory
         self.scan_fn = scan_fn
-        self.environ = dict(os.environ if environ is None else environ)
+        self.environ = environment_copy(environ)
         self.machine_info_timeout = float(machine_info_timeout)
 
         self.client: Any | None = None
@@ -797,9 +801,10 @@ class BridgeCore:
         if not raw_path:
             raise BridgeError("coffee.load requires a local recipe path")
         path = Path(str(raw_path)).expanduser().resolve(strict=True)
-        from xbloom_safety import load_strict_recipe
+        from xbloom_safety import load_strict_recipe, recipe_summary
 
         recipe = load_strict_recipe(path)
+        summary = recipe_summary(recipe, path)
         await self._ensure_connected(params)
         firmware = self._require_idle_write_preflight()
         event = await self.client.load_recipe(recipe)
@@ -814,6 +819,9 @@ class BridgeCore:
             "status": "armed",
             "firmware": firmware,
             "owner": "bridge",
+            "serving_kind": summary["kind"],
+            "machine_program": summary["machine_program"],
+            "manual_preload_ice_g": summary["manual_preload_ice_g"],
         }
         _atomic_json(self.coffee_state_file, state, private=True)
         self.activity = "coffee"
@@ -822,9 +830,17 @@ class BridgeCore:
         self.targets = {
             "recipe": path.name,
             "target_dispensed_water_ml": recipe.total_machine_water_ml,
+            "machine_program": summary["machine_program"],
+            "machine_dispenses_ice": summary["machine_dispenses_ice"],
+            "manual_preload_ice_g": summary["manual_preload_ice_g"],
         }
         self._saw_active = False
-        return {"status": "armed", "recipe": path.name, "firmware": firmware}
+        return {
+            "status": "armed",
+            "recipe": path.name,
+            "firmware": firmware,
+            **summary,
+        }
 
     async def _coffee_start(self, params: Mapping[str, Any]) -> dict[str, Any]:
         self._require_hot_water(params.get("confirmation"), READY_SENTINEL)
@@ -845,7 +861,13 @@ class BridgeCore:
         self._saw_active = event.state in ACTIVE_STATE_BYTES or self._saw_active
         state.update(status="running", started_at=time.time(), last_state=event.state_name)
         _atomic_json(self.coffee_state_file, state, private=True)
-        return {"status": "running", "state": event.state_name}
+        return {
+            "status": "running",
+            "state": event.state_name,
+            "machine_program": state.get("machine_program", "coffee-pour-over"),
+            "machine_dispenses_ice": False,
+            "manual_preload_ice_g": int(state.get("manual_preload_ice_g", 0) or 0),
+        }
 
     async def _tea_load(self, params: Mapping[str, Any]) -> dict[str, Any]:
         self._ensure_no_loaded_record()

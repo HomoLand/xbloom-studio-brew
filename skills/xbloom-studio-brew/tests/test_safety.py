@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from xbloom_ble.recipe import RecipeError
+from xbloom_ble.recipe import Recipe, RecipeError
 from xbloom_safety import (
     SafetyError,
     load_strict_recipe,
@@ -15,13 +15,30 @@ from xbloom_safety import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize("asset", ["hot-template.yaml", "flash-brew-template.yaml"])
-def test_bundled_templates_pass_strict_validation(asset):
+@pytest.mark.parametrize(
+    ("asset", "manual_ice_g"),
+    [("hot-template.yaml", 0), ("flash-brew-template.yaml", 90)],
+)
+def test_bundled_templates_pass_strict_validation(asset, manual_ice_g):
     path = ROOT / "assets" / asset
     recipe = load_strict_recipe(path)
     summary = recipe_summary(recipe, path)
+    assert summary["machine_program"] == "coffee-pour-over"
+    assert summary["machine_dispenses_ice"] is False
+    assert summary["manual_preload_ice_g"] == manual_ice_g
     assert summary["load_opcodes"]
     assert not ({"0x42", "0x46", "0x47"} & set(summary["load_opcodes"]))
+
+
+def test_flash_serving_metadata_never_reaches_machine_protocol():
+    data = yaml.safe_load(
+        (ROOT / "assets" / "flash-brew-template.yaml").read_text(encoding="utf-8")
+    )
+    protocol = Recipe.from_dict(data).to_protocol_dict()
+
+    assert "kind" not in protocol
+    assert "ice_g" not in protocol
+    assert "water_ml" not in protocol
 
 
 def _hot_mapping():
