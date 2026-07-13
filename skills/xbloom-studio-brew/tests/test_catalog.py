@@ -113,6 +113,51 @@ def _tea():
     }
 
 
+def _flash_recipe():
+    return Recipe.from_dict(
+        {
+            "name": "Iced 90 g",
+            "kind": "flash-brew",
+            "dripper": "Omni Dripper 2",
+            "dose_g": 15,
+            "grind": 50,
+            "ratio": 10,
+            "water_ml": 240,
+            "hot_water_ml": 150,
+            "ice_g": 90,
+            "pours": [
+                {
+                    "ml": 40,
+                    "temp_c": 94,
+                    "pattern": "spiral",
+                    "vibration": "after",
+                    "pause_s": 35,
+                    "rpm": 100,
+                    "flow_ml_s": 3.0,
+                },
+                {
+                    "ml": 60,
+                    "temp_c": 93,
+                    "pattern": "spiral",
+                    "vibration": "none",
+                    "pause_s": 5,
+                    "rpm": 100,
+                    "flow_ml_s": 3.4,
+                },
+                {
+                    "ml": 50,
+                    "temp_c": 92,
+                    "pattern": "circular",
+                    "vibration": "none",
+                    "pause_s": 0,
+                    "rpm": 100,
+                    "flow_ml_s": 3.5,
+                },
+            ],
+        }
+    )
+
+
 def test_import_app_envelopes_normalises_coffee_and_tea_without_raw_secrets():
     catalog = empty_catalog()
     payload = {
@@ -767,48 +812,7 @@ def test_coffee_cloud_form_accepts_public_omni_dripper_name():
 
 
 def test_flash_cloud_preview_discloses_manual_ice_boundary():
-    recipe = Recipe.from_dict(
-        {
-            "name": "Iced 90 g",
-            "kind": "flash-brew",
-            "dripper": "Omni Dripper 2",
-            "dose_g": 15,
-            "grind": 50,
-            "ratio": 10,
-            "water_ml": 240,
-            "hot_water_ml": 150,
-            "ice_g": 90,
-            "pours": [
-                {
-                    "ml": 40,
-                    "temp_c": 94,
-                    "pattern": "spiral",
-                    "vibration": "after",
-                    "pause_s": 35,
-                    "rpm": 100,
-                    "flow_ml_s": 3.0,
-                },
-                {
-                    "ml": 60,
-                    "temp_c": 93,
-                    "pattern": "spiral",
-                    "vibration": "none",
-                    "pause_s": 5,
-                    "rpm": 100,
-                    "flow_ml_s": 3.4,
-                },
-                {
-                    "ml": 50,
-                    "temp_c": 92,
-                    "pattern": "circular",
-                    "vibration": "none",
-                    "pause_s": 0,
-                    "rpm": 100,
-                    "flow_ml_s": 3.5,
-                },
-            ],
-        }
-    )
+    recipe = _flash_recipe()
 
     preview = cloud_recipe_preview(recipe)
 
@@ -904,6 +908,48 @@ def test_cloud_push_is_idempotent_and_never_returns_session_secrets(monkeypatch)
     serialised = json.dumps(result)
     for secret in (email, password, token, "fixed-client-id"):
         assert secret not in serialised
+
+
+def test_cloud_push_compares_hot_only_flash_representation_idempotently(monkeypatch):
+    recipe = _flash_recipe()
+    form = build_cloud_recipe_form(recipe)
+    remote = {
+        **form,
+        "tableId": 777,
+        "appPlace": [4],
+        "pourList": json.loads(form["pourDataJSONStr"]),
+    }
+    remote.pop("pourDataJSONStr")
+    calls = []
+
+    def request(**kwargs):
+        calls.append(kwargs)
+        if kwargs["endpoint"] == xbloom_catalog.LOGIN_ENDPOINT:
+            return {
+                "result": "success",
+                "token": "private-session-token",
+                "member": {"tableId": 42},
+            }
+        if kwargs["endpoint"] == xbloom_catalog.ENDPOINTS["created"]:
+            return {"result": "success", "list": [remote]}
+        raise AssertionError("an existing flash recipe must not be added again")
+
+    monkeypatch.setattr(xbloom_catalog, "_cloud_request", request)
+    result = push_cloud_recipe_with_login(
+        recipe,
+        email="account@example.test",
+        password="private-password",
+        region="china",
+        confirm_write=CLOUD_WRITE_CONFIRM_SENTINEL,
+    )
+
+    assert result["status"] == "already-present"
+    assert result["remote_table_id"] == 777
+    assert result["write_performed"] is False
+    assert [call["endpoint"] for call in calls] == [
+        xbloom_catalog.LOGIN_ENDPOINT,
+        xbloom_catalog.ENDPOINTS["created"],
+    ]
 
 
 def test_cloud_push_tea_uses_recipe_add_form_but_test_never_writes_live(monkeypatch):

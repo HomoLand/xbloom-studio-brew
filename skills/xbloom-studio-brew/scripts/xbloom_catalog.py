@@ -1313,6 +1313,67 @@ def _app_pour_record(
     }
 
 
+def _build_cloud_coffee_form(recipe: Recipe) -> dict[str, Any]:
+    """Map parsed coffee data without applying local brew-safety policy.
+
+    Local upload candidates must pass :func:`strict_validate` before calling
+    this mapper.  Normalised records already returned by xBloom cloud use it
+    directly so a flash-brew's hot-only account representation (for example a
+    1:10 extraction over manual ice) can still be compared idempotently.
+    """
+
+    name = str(recipe.name).strip()
+    if not name:
+        raise CatalogError("cloud recipe name must not be empty")
+    dripper = str(recipe.dripper or "Omni").strip().casefold()
+    if "omni" not in dripper and "xdripper" not in dripper:
+        raise CatalogError(
+            "only an Omni/xDripper loose-bean recipe can be added to the account; "
+            "adapt xPod or other-dripper recipes first"
+        )
+    rpm_values = {int(pour.rpm) for pour in recipe.pours if int(pour.rpm) > 0}
+    if len(rpm_values) > 1:
+        raise CatalogError(
+            "the Android account recipe schema has one global RPM; local pours use "
+            f"multiple values {sorted(rpm_values)}"
+        )
+    rpm = next(iter(rpm_values), 120)
+    pours = [
+        _app_pour_record(
+            index=index,
+            ml=pour.ml,
+            temp_c=pour.temp_c,
+            pattern=pour.pattern,
+            pause_s=pour.pause_s,
+            flow_ml_s=pour.flow_ml_s,
+            vibration=str(pour.vibration or "none"),
+            label=pour.label,
+        )
+        for index, pour in enumerate(recipe.pours, start=1)
+    ]
+    enabled_bypass = bool(recipe.bypass_ml)
+    form = {
+        "adaptedModel": 1,
+        "cupType": 2,
+        "dose": float(recipe.dose_g),
+        "grandWater": float(recipe.effective_ratio),
+        "isEnableBypassWater": 1 if enabled_bypass else 2,
+        "isSetGrinderSize": 2 if recipe.no_grind else 1,
+        "pourDataJSONStr": json.dumps(
+            pours, ensure_ascii=False, separators=(",", ":")
+        ),
+        "rpm": rpm,
+        "theColor": DEFAULT_RECIPE_COLOR,
+        "theName": name,
+    }
+    if not recipe.no_grind:
+        form["grinderSize"] = float(recipe.grind)
+    if enabled_bypass:
+        form["bypassVolume"] = float(recipe.bypass_ml)
+        form["bypassTemp"] = float(recipe.bypass_temp_c)
+    return form
+
+
 def build_cloud_recipe_form(
     recipe: Recipe | TeaRecipe,
     *,
@@ -1360,53 +1421,8 @@ def build_cloud_recipe_form(
             form["creatorId"] = _required_int(member_id, "member id")
         return form
 
-    dripper = str(recipe.dripper or "Omni").strip().casefold()
-    if "omni" not in dripper and "xdripper" not in dripper:
-        raise CatalogError(
-            "only an Omni/xDripper loose-bean recipe can be added to the account; "
-            "adapt xPod or other-dripper recipes first"
-        )
-    rpm_values = {int(pour.rpm) for pour in recipe.pours if int(pour.rpm) > 0}
-    if len(rpm_values) > 1:
-        raise CatalogError(
-            "the Android account recipe schema has one global RPM; local pours use "
-            f"multiple values {sorted(rpm_values)}"
-        )
+    form = _build_cloud_coffee_form(recipe)
     strict_validate(recipe)
-    rpm = next(iter(rpm_values), 120)
-    pours = [
-        _app_pour_record(
-            index=index,
-            ml=pour.ml,
-            temp_c=pour.temp_c,
-            pattern=pour.pattern,
-            pause_s=pour.pause_s,
-            flow_ml_s=pour.flow_ml_s,
-            vibration=str(pour.vibration or "none"),
-            label=pour.label,
-        )
-        for index, pour in enumerate(recipe.pours, start=1)
-    ]
-    enabled_bypass = bool(recipe.bypass_ml)
-    form = {
-        "adaptedModel": 1,
-        "cupType": 2,
-        "dose": float(recipe.dose_g),
-        "grandWater": float(recipe.effective_ratio),
-        "isEnableBypassWater": 1 if enabled_bypass else 2,
-        "isSetGrinderSize": 2 if recipe.no_grind else 1,
-        "pourDataJSONStr": json.dumps(
-            pours, ensure_ascii=False, separators=(",", ":")
-        ),
-        "rpm": rpm,
-        "theColor": DEFAULT_RECIPE_COLOR,
-        "theName": name,
-    }
-    if not recipe.no_grind:
-        form["grinderSize"] = float(recipe.grind)
-    if enabled_bypass:
-        form["bypassVolume"] = float(recipe.bypass_ml)
-        form["bypassTemp"] = float(recipe.bypass_temp_c)
     return form
 
 
@@ -1559,11 +1575,11 @@ def push_cloud_recipe_with_login(
             existing_recipe: Recipe | TeaRecipe
             if entry["kind"] == "tea":
                 existing_recipe = TeaRecipe.from_dict(entry["recipe"])
+                existing_form = build_cloud_recipe_form(existing_recipe)
             else:
                 existing_recipe = Recipe.from_dict(entry["recipe"])
-            existing_semantics = _cloud_form_semantics(
-                build_cloud_recipe_form(existing_recipe)
-            )
+                existing_form = _build_cloud_coffee_form(existing_recipe)
+            existing_semantics = _cloud_form_semantics(existing_form)
         except Exception as exc:
             raise CatalogError(
                 "the account already has a same-name recipe that could not be "
