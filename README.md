@@ -5,8 +5,9 @@
 A portable Agent Skill for designing bean-specific xBloom Studio coffee/tea recipes and using the
 machine's guarded local Bluetooth LE capabilities, including its scale, grinder, and brewer.
 
-It combines an offline coffee-recipe model, optional cited web research, deterministic recipe
-validation, and bundled BLE control. It works with Hermes and other Agent Skills-compatible clients.
+It combines an offline coffee-recipe model, optional cited web research, a private app-visible
+recipe catalog, deterministic validation, and bundled BLE control. It works with Hermes and other
+Agent Skills-compatible clients.
 
 > [!WARNING]
 > This is an unofficial community project. The BLE protocol is reverse-engineered and can control
@@ -21,6 +22,8 @@ validation, and bundled BLE control. It works with Hermes and other Agent Skills
 - Treats exact xPod/Recipe Card recipes as first-party references while adapting their pod geometry
   explicitly for loose-bean Omni brews.
 - Includes five xBloom-published Omni Tea Brewer templates and a dedicated guarded tea protocol.
+- Imports authorized xBloom App/API or decoded-MMKV JSON into a private normalized coffee/tea
+  catalog; optional read-only sync covers the user's own account/region-visible host lists.
 - Shows a conservative Skill baseline plus cited adaptations for the user to compare.
 - Validates dose, extraction/final ratios, bypass, water totals, grind, temperature modes, pattern,
   four-state vibration timing, flow, RPM, and BLE opcodes before writes.
@@ -33,7 +36,8 @@ validation, and bundled BLE control. It works with Hermes and other Agent Skills
   mislabel any of them as water-supply inventory.
 - Reads redacted Studio machine info plus persistent settings/mechanical tuning, with separately
   gated readback/rollback writes for units, display, source, pour radius, and vibration amplitude.
-- Runs locally without xBloom cloud credentials or an app account.
+- Runs all recipe, catalog-import, and BLE workflows locally without an app account; optional
+  private cloud sync alone uses an explicit external account form and never stores it in the catalog.
 
 ## How recipes are produced
 
@@ -63,6 +67,29 @@ hermes config set web.search_backend ddgs
 ```
 
 The full verification query is in the [deployment guide](skills/xbloom-studio-brew/references/deployment.md).
+
+## Private recipe catalog
+
+The APK does not bundle a global recipe database: it fetches regional, account/device-visible
+records and caches them. This project can therefore collect every recipe present in an authorized
+JSON/cache export, or every host coffee/tea record returned to the user's own account and region;
+it cannot truthfully promise every private or worldwide xBloom recipe.
+
+```text
+python scripts/xbloom.py catalog status
+python scripts/xbloom.py catalog import-json app-response.json
+python scripts/xbloom.py catalog import-mmkv decoded-mmkv.json
+python scripts/xbloom.py catalog list --kind coffee --executable
+python scripts/xbloom.py catalog list --kind tea
+python scripts/xbloom.py catalog export <id> recipe.yaml
+```
+
+The default catalog lives outside the installed Skill under
+`~/.xbloom-studio-brew/catalog/catalog.json`. Raw responses and credentials are not retained.
+xPod and J20 records stay reference-only; validated Studio coffee and tea records export through
+their respective guarded YAML schemas. Optional cloud sync reproduces the APK request envelope but
+has not been live-service verified by this project, so it is explicitly configured and never a
+hidden dependency. See the [catalog and A/B/C guide](skills/xbloom-studio-brew/references/catalog.md).
 
 ## Install
 
@@ -99,6 +126,7 @@ Example prompts:
 ```text
 Use xbloom-studio-brew to design a clear, fruit-forward hot recipe for this coffee bag.
 Find credible public recipes for this coffee and let me choose before creating the xBloom recipe.
+Import my authorized xBloom recipe JSON, list the Studio coffee and tea recipes, and export one.
 Create an Americano-style flash brew, validate it, and load it onto my xBloom Studio without starting.
 Use the official green-tea template, but load it without starting.
 Help me weigh this empty cup: enter the scale with an empty platform, tell me when it is ready,
@@ -114,6 +142,7 @@ Basic local commands:
 python scripts/xbloom.py scale --duration 30
 python scripts/xbloom.py settings
 python scripts/xbloom.py advanced
+python scripts/xbloom.py catalog status
 python scripts/xbloom.py tea-validate assets/tea-green-official.yaml
 python scripts/xbloom.py tea-load assets/tea-green-official.yaml
 python scripts/xbloom.py bridge start
@@ -142,6 +171,13 @@ pattern targets are also protocol-implemented behind a separate owner gate. A ru
 `center → spiral` pattern change is hardware-verified on firmware `V12.0D.500`; live temperature
 command encoding and its completed BLE write are verified, while physical outlet response remains
 unmeasured. They do not change mid-run volume/flow or edit coffee recipe steps.
+
+A/B/C programming is an atomic three-recipe operation. Run `validate <recipe.yaml> --slot` on
+each input first. AUTO slots store pours, grind, ratio, and scale behavior; the machine measures
+dose when a preset runs. They cannot represent post-brew bypass or tea, so every slot-writing layer
+rejects bypass recipes instead of silently dropping water. Slot programming temporarily selects
+PRO mode, writes A/B/C, confirms the saved state, and returns to AUTO without starting a brew.
+Optional `--scale on off on` configures the three on-brew scale flags in A/B/C order.
 
 ## Safety model
 

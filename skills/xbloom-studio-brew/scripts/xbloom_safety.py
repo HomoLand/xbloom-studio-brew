@@ -100,8 +100,12 @@ def strict_validate(recipe: Recipe) -> None:
     if kind not in {"hot", "flash-brew"}:
         errors.append("kind must be 'hot' or 'flash-brew'")
 
+    if isinstance(recipe.dose_g, bool) or not float(recipe.dose_g).is_integer():
+        errors.append("dose_g must use whole grams")
     if not 5 <= int(recipe.dose_g) <= 18:
         errors.append("dose_g must be 5-18 g")
+    if isinstance(recipe.grind, bool) or not float(recipe.grind).is_integer():
+        errors.append("grind must use a whole-number Studio setting")
     if int(recipe.grind) != 0 and not 35 <= int(recipe.grind) <= 75:
         errors.append("grind must be 35-75, or 0 for pre-ground/grinder-off")
     if not 2 <= len(recipe.pours) <= 5:
@@ -189,6 +193,24 @@ def strict_validate(recipe: Recipe) -> None:
 
     if errors:
         raise SafetyError("; ".join(errors))
+
+
+def validate_slot_compatible(recipe: Recipe) -> None:
+    """Require semantics that Easy/Auto A/B/C can store without loss.
+
+    Command 11510 stores the coffee pours, grinder setting, and the derived
+    water-to-coffee ratio. Unlike the normal LOAD path, it has no command-8102
+    dose/bypass block. The machine measures the dose when an Auto preset runs
+    and scales the stored program from its ratio, but it cannot reproduce a
+    post-brew bypass. Reject that mismatch instead of silently dropping water.
+    """
+
+    strict_validate(recipe)
+    if float(recipe.bypass_ml or 0.0):
+        raise SafetyError(
+            "A/B/C Easy Mode cannot represent bypass_ml/bypass_temp_c; "
+            "use a non-bypass preset or load this recipe in Pro mode"
+        )
 
 
 def recipe_summary(recipe: Recipe, path: str | Path) -> dict[str, Any]:

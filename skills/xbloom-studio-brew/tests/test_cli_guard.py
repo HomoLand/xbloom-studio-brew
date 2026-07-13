@@ -32,6 +32,38 @@ def test_emit_falls_back_to_ascii_for_legacy_windows_console(monkeypatch):
 def test_save_slots_parser_accepts_exactly_three_recipes():
     args = xbloom.build_parser().parse_args(["save-slots", "a.yaml", "b.yaml", "c.yaml"])
     assert args.recipes == ["a.yaml", "b.yaml", "c.yaml"]
+    assert args.scale == ("on", "on", "on")
+    configured = xbloom.build_parser().parse_args(
+        [
+            "save-slots",
+            "a.yaml",
+            "b.yaml",
+            "c.yaml",
+            "--scale",
+            "on",
+            "off",
+            "on",
+        ]
+    )
+    assert configured.scale == ["on", "off", "on"]
+
+
+def test_catalog_and_slot_validation_parsers_are_offline_capable():
+    parser = xbloom.build_parser()
+    validate = parser.parse_args(["validate", "recipe.yaml", "--slot"])
+    assert validate.slot is True
+    status = parser.parse_args(
+        ["catalog", "--catalog-file", "catalog.json", "status"]
+    )
+    assert (status.catalog_action, status.catalog_file) == ("status", "catalog.json")
+    listing = parser.parse_args(
+        ["catalog", "list", "--kind", "tea", "--slot-compatible"]
+    )
+    assert listing.kind == "tea" and listing.slot_compatible is True
+    sync = parser.parse_args(
+        ["catalog", "sync", "--config", "cloud.json", "--include", "coffee"]
+    )
+    assert sync.include == ["coffee"]
 
 
 def test_freesolo_and_tea_parsers_expose_guarded_parameters():
@@ -116,9 +148,20 @@ def test_bridge_parser_exposes_interactive_controls():
     tea = parser.parse_args(["bridge", "tea-load", "tea.yaml"])
     assert (tea.bridge_action, tea.recipe) == ("tea-load", "tea.yaml")
     slots = parser.parse_args(
-        ["bridge", "save-slots", "a.yaml", "b.yaml", "c.yaml"]
+        [
+            "bridge",
+            "save-slots",
+            "a.yaml",
+            "b.yaml",
+            "c.yaml",
+            "--scale",
+            "off",
+            "on",
+            "off",
+        ]
     )
     assert slots.recipes == ["a.yaml", "b.yaml", "c.yaml"]
+    assert slots.scale == ["off", "on", "off"]
     settings = parser.parse_args(
         ["bridge", "set-settings", "--display", "high"]
     )
@@ -229,6 +272,22 @@ def test_doctor_reports_unverified_live_adjust_gate(monkeypatch, capsys):
         report["capabilities"]["freesolo_live_temperature_hardware_verified"]
         is False
     )
+
+
+def test_doctor_reports_catalog_configuration_without_reading_secrets(
+    monkeypatch, tmp_path, capsys
+):
+    config = tmp_path / "cloud.json"
+    config.write_text('{"token":"do-not-print"}', encoding="utf-8")
+    catalog = tmp_path / "catalog.json"
+    monkeypatch.setenv(xbloom.CLOUD_CONFIG_ENV, str(config))
+    monkeypatch.setenv(xbloom.CATALOG_PATH_ENV, str(catalog))
+    monkeypatch.setattr(bridge_module, "bridge_is_running", lambda: False)
+    assert xbloom.cmd_doctor(SimpleNamespace(scan=False, scan_timeout=0.1)) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["capabilities"]["catalog_path"] == str(catalog)
+    assert report["capabilities"]["catalog_cloud_configured"] is True
+    assert "do-not-print" not in json.dumps(report)
 
 
 def test_supported_firmware_passes_preflight(monkeypatch):

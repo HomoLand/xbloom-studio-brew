@@ -26,8 +26,9 @@ decompiled source are not redistributed.
 
 The portable Skill covers the important Studio beverage path: coffee recipes, four-state
 vibration and bypass, guarded start/cancel, FreeSolo scale/grinder/water, tea recipes, A/B/C
-presets, persistent user settings, guarded mechanical tuning, and structured machine telemetry.
-It does **not** claim literal app parity.
+presets, persistent user settings, guarded mechanical tuning, structured machine telemetry, and
+a private normalized import/sync path for account-visible coffee and tea records. It does **not**
+claim literal app parity.
 
 Literal parity is neither possible nor desirable in one Agent Skill:
 
@@ -35,8 +36,9 @@ Literal parity is neither possible nor desirable in one Agent Skill:
   bundled loopback bridge now owns and serializes that connection for coffee, tea, scale, grinder,
   FreeSolo water, presets, settings, and advanced tuning; direct one-shot BLE commands refuse
   while it runs.
-- Accounts, recipe library/search/share, history, store/cart, device sharing, cloud logs, and J20
-  remote control are mobile/cloud services rather than Studio BLE appliance commands.
+- Login/account mutation, recipe edit/share/pin, history, store/cart, device sharing, cloud logs,
+  and J20 remote control are mobile/cloud services rather than Studio BLE appliance commands. The
+  Skill exposes only a separate read-only recipe-catalog interoperability subset.
 - NFC is an Android tag reader that extracts an xPod identifier and asks xBloom's cloud for the
   recipe. The tag does not contain a complete portable brew program.
 - Firmware flashing and calibration can leave the machine unusable. Knowing their commands is not
@@ -69,14 +71,15 @@ evidence.
 | FreeSolo grinder | Size, RPM, start, pause, resume, stop, exit | **Available** one-shot and through the bridge with cooldown | **D/T** in this project ledger; motor actions remain excluded from unattended tests |
 | FreeSolo brewer | Volume, RT/heated temperature, flow, circular/spiral/center pattern, tank/direct-feed source, pause/resume, live pattern/temp changes, stop, exit | **Available** for bounded dispense and bridge controls | Base dispense and running pattern switch are **D/T/H** on `V12.0D.500`; live temperature is **D/T**, not **P**; paused-state behavior is unmeasured; live volume/flow change is not exposed |
 | Omni Tea Brewer | Upload dedicated tea program, execute on the same or a later connection, and receive soak/pause/restart reports | **Available** one-shot and through the bridge | Dedicated frames/templates are **D/T**; phase reports do not imply intervention commands |
-| Auto/Easy mode | Write the atomic A/B/C slot set, switch PRO/AUTO, and report order/count/mode | **Available** as one atomic A/B/C operation | **D/T/H** for the atomic batch and mode transition; arbitrary order/count editing is not public |
+| Auto/Easy mode | Write the atomic A/B/C slot set, switch PRO/AUTO, and report order/count/mode | **Available** as one atomic A/B/C operation | **D/T/H** for the atomic batch and mode transition; command `11510` cannot represent bypass or tea, and arbitrary order/count editing is not public |
+| Private recipe catalog | Fetch host coffee, tea, current Easy, and default Easy records; cache account/device-visible recipes | **Available** for authorized JSON/decoded-MMKV import and optional read-only own-account sync | Import, normalization, app-compatible RSA envelope, and secret non-persistence are **D/T**; current live-service auth/response is not **H**; no global-catalog claim |
 | Units, display, water source | Set weight unit, temperature unit, display brightness, persistent water source | **Available** with readback/rollback one-shot and through the bridge | **D/T**; physical setting changes have not been supervised by this project |
 | Pour radius and vibration amplitude | Read/write advanced mechanical tuning | **Available** with baseline-derived levels and rollback | **D/T**; APK UI ranges are enforced, physical writes remain unobserved |
 | Grinder calibration | Drive the grinder to its zero/calibration position | **Excluded by default** | Service-grade motor action; vendor app/physical procedure should own it |
 | Scale calibration / descaling | Guided physical maintenance screens | **Vendor-guided** | The Studio APK screens are mainly procedural, not a missing normal brew command |
 | Firmware update | Download firmware, enter upgrade mode, transfer with YMODEM | **Excluded by default** | High bricking risk, signed-image/update-policy questions, and no recovery path in the Skill |
-| NFC/xPod card | Read NfcV blocks, extract a six-character XID, fetch cloud recipe | **Reference input only** | Portable hosts may lack NFC and account/cloud access; accept user/public recipe data instead |
-| Account and cloud | Login/profile, browse/edit/share/pin recipes, history, device sharing, logs | **Out of portable BLE scope** | Would require a separately authenticated, policy-reviewed cloud connector |
+| NFC/xPod card | Read NfcV blocks, extract a six-character XID, fetch cloud recipe | **Reference input only** | Portable hosts may lack NFC; an authorized imported/fetched xPod record remains reference-only until explicit Omni adaptation |
+| Account and cloud | Login/profile, browse/edit/share/pin recipes, history, device sharing, logs | **Catalog read subset only** | Explicit external own-account form can read selected recipe endpoints; login, mutation, history, sharing, logs, and credential extraction remain excluded |
 | Store and content UI | Product catalog, cart, articles, notifications, app updates | **Not a machine-control feature** | Use the official app/site |
 | xBloom Original (`J20`) | Wi-Fi/cloud machine control and J20-specific maintenance | **Out of scope** | It is a different product family in the same APK |
 
@@ -177,7 +180,9 @@ outlet lag. Paused-state pattern/temperature behavior and the other pattern tran
 separate evidence gaps; do not generalize the verified running `center → spiral` result beyond
 firmware `V12.0D.500`. A later supervised pass can validate persistent settings and mechanical
 levels one field at a time against the UI; until then their public status stays command-derived.
-Tea intervention and deeper payload semantics remain separate follow-ups.
+Tea intervention and deeper payload semantics remain separate follow-ups. The catalog request path
+needs a controlled live-service compatibility check with the owner's own account before its
+evidence can move beyond D/T; imports remain the preferred stable path.
 Calibration and OTA should remain a separate maintainer/service package even if their wire format
-is completely decoded. Cloud/account and NFC should likewise be optional platform integrations,
-not hidden dependencies of the portable brewing Skill.
+is completely decoded. Cloud/account and NFC remain optional integrations, never hidden
+dependencies of the portable brewing Skill.

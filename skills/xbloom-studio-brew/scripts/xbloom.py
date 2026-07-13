@@ -34,6 +34,9 @@ STATE_DIR = skill_state_dir()
 STATE_FILE = STATE_DIR / "armed-state.json"
 TEA_STATE_FILE = STATE_DIR / "tea-loaded-state.json"
 GRINDER_STATE_FILE = STATE_DIR / "grinder-rest-state.json"
+CATALOG_FILE = STATE_DIR / "catalog" / "catalog.json"
+CATALOG_PATH_ENV = "XBLOOM_CATALOG_PATH"
+CLOUD_CONFIG_ENV = "XBLOOM_CLOUD_CONFIG"
 REMOTE_START_ENV = "XBLOOM_ENABLE_REMOTE_START"
 REMOTE_START_SENTINEL = "I_UNDERSTAND_REMOTE_HOT_WATER"
 REMOTE_GRINDER_ENV = "XBLOOM_ENABLE_REMOTE_GRINDER"
@@ -343,6 +346,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     selected_runtime = local_python()
     external_runtime = runtime_python_path(skill_runtime_dir())
     legacy_runtime = legacy_runtime_python(ROOT)
+    catalog_path = Path(os.environ.get(CATALOG_PATH_ENV, str(CATALOG_FILE))).expanduser()
+    cloud_config_value = os.environ.get(CLOUD_CONFIG_ENV)
+    cloud_config_exists = bool(
+        cloud_config_value and Path(cloud_config_value).expanduser().is_file()
+    )
     try:
         runtime_location = (
             "external"
@@ -395,6 +403,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 "advanced_tuning",
             ],
             "easy_mode_scope": "atomic_abc_only",
+            "private_recipe_catalog": (
+                ROOT / "scripts" / "xbloom_catalog.py"
+            ).exists(),
+            "catalog_scope": "own-account-region-visible",
+            "catalog_cloud_sync": "explicit_authorized_app_form",
+            "catalog_path": str(catalog_path),
+            "catalog_cloud_configured": cloud_config_exists,
             "freesolo_live_adjust_protocol": True,
             "freesolo_live_adjust_hardware_verified": False,
             "freesolo_live_pattern_hardware_verified": True,
@@ -568,9 +583,144 @@ async def async_set_advanced(args: argparse.Namespace) -> int:
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
-    path, _recipe, summary = load_recipe(args.recipe)
-    emit({"command": "validate", "ok": True, "path": str(path), **summary})
+    from xbloom_safety import validate_slot_compatible
+
+    path, recipe, summary = load_recipe(args.recipe)
+    if bool(getattr(args, "slot", False)):
+        validate_slot_compatible(recipe)
+    output = {"command": "validate", "ok": True, "path": str(path), **summary}
+    if bool(getattr(args, "slot", False)):
+        output["slot_compatible"] = True
+    emit(output)
     return 0
+
+
+def cmd_catalog(args: argparse.Namespace) -> int:
+    """Operate the private, user-local recipe catalog without touching BLE."""
+
+    from xbloom_catalog import (
+        CLOUD_CONFIG_ENV,
+        catalog_summary,
+        default_catalog_path,
+        export_entry,
+        get_entry,
+        import_json_file,
+        list_entries,
+        load_catalog,
+        load_cloud_config,
+        save_catalog,
+        sync_cloud,
+    )
+
+    configured_path = getattr(args, "catalog_file", None)
+    catalog_path = (
+        Path(configured_path).expanduser()
+        if configured_path
+        else default_catalog_path(STATE_DIR)
+    ).resolve()
+    catalog = load_catalog(catalog_path)
+    action = args.catalog_action
+    if action == "status":
+        summary = catalog_summary(catalog)
+        if not catalog_path.exists():
+            summary["updated_at"] = None
+        emit(
+            {
+                "command": "catalog",
+                "action": action,
+                "path": str(catalog_path),
+                "exists": catalog_path.exists(),
+                **summary,
+            }
+        )
+        return 0
+    if action in {"import-json", "import-mmkv"}:
+        stats = import_json_file(
+            catalog,
+            args.input,
+            source_type=("mmkv-json" if action == "import-mmkv" else args.source),
+            region=args.region,
+            kind_hint=args.kind,
+        )
+        save_catalog(catalog, catalog_path)
+        emit(
+            {
+                "command": "catalog",
+                "action": action,
+                "status": "imported",
+                "path": str(catalog_path),
+                **stats,
+            }
+        )
+        return 0
+    if action == "list":
+        entries = list_entries(
+            catalog,
+            kind=args.kind,
+            origin=args.origin,
+            query=args.query,
+            executable_only=bool(args.executable),
+            slot_compatible_only=bool(args.slot_compatible),
+        )
+        emit(
+            {
+                "command": "catalog",
+                "action": action,
+                "count": len(entries),
+                "entries": entries,
+            }
+        )
+        return 0
+    if action == "show":
+        emit(
+            {
+                "command": "catalog",
+                "action": action,
+                "entry": get_entry(catalog, args.identifier),
+            }
+        )
+        return 0
+    if action == "export":
+        entry = get_entry(catalog, args.identifier)
+        output = export_entry(entry, args.output, overwrite=bool(args.overwrite))
+        emit(
+            {
+                "command": "catalog",
+                "action": action,
+                "status": "exported",
+                "id": entry["id"],
+                "kind": entry["kind"],
+                "path": str(output),
+                "slot_compatible": bool(entry.get("slot_compatible")),
+            }
+        )
+        return 0
+    if action == "sync":
+        config_value = args.config or os.environ.get(CLOUD_CONFIG_ENV)
+        if not config_value:
+            raise RuntimeError(
+                f"catalog sync requires --config or {CLOUD_CONFIG_ENV}; "
+                "keep the account form outside the Skill/repository"
+            )
+        config = load_cloud_config(config_value)
+        result = sync_cloud(
+            catalog,
+            config,
+            include=args.include or ("coffee", "tea"),
+            timeout=args.timeout,
+        )
+        save_catalog(catalog, catalog_path)
+        emit(
+            {
+                "command": "catalog",
+                "action": action,
+                "status": "synced",
+                "path": str(catalog_path),
+                **result,
+            }
+        )
+        return 0
+    raise RuntimeError(f"unknown catalog action {action}")
 
 
 async def async_load(args: argparse.Namespace) -> int:
@@ -1391,14 +1541,18 @@ async def async_start(args: argparse.Namespace) -> int:
 
 async def async_save_slots(args: argparse.Namespace) -> int:
     from xbloom_ble.client import XBloomClient
+    from xbloom_safety import validate_slot_compatible
 
     loaded = [load_recipe(path) for path in args.recipes]
+    for _path, recipe, _summary in loaded:
+        validate_slot_compatible(recipe)
     ensure_no_loaded_workflow()
     address, name = await resolve_address(args.address, args.scan_timeout)
     preflight = await inspect_machine(address)
     firmware = require_write_preflight(preflight)
+    scale = [value == "on" for value in args.scale]
     async with XBloomClient(address) as client:
-        await client.save_slots([item[1] for item in loaded])
+        await client.save_slots([item[1] for item in loaded], scale=scale)
     emit(
         {
             "command": "save-slots",
@@ -1406,6 +1560,7 @@ async def async_save_slots(args: argparse.Namespace) -> int:
             "machine": name,
             "firmware": firmware,
             "slots": [item[2]["name"] for item in loaded],
+            "scale": dict(zip(("A", "B", "C"), scale)),
             "brew_started": False,
         }
     )
@@ -1560,6 +1715,7 @@ def cmd_bridge(args: argparse.Namespace) -> int:
             "presets.save",
             {
                 "recipes": recipes,
+                "scale": [value == "on" for value in args.scale],
                 "address": args.address,
                 "scan_timeout": args.scan_timeout,
             },
@@ -1636,6 +1792,66 @@ def build_parser() -> argparse.ArgumentParser:
     set_advanced.add_argument("--confirm-write", default="")
     validate = sub.add_parser("validate", help="strictly validate a local recipe")
     validate.add_argument("recipe")
+    validate.add_argument(
+        "--slot",
+        action="store_true",
+        help="also require lossless compatibility with Auto/Easy A/B/C storage",
+    )
+    catalog = sub.add_parser(
+        "catalog",
+        help="import, sync, query, and export a private coffee/tea recipe catalog",
+    )
+    catalog.add_argument(
+        "--catalog-file",
+        help="private catalog JSON path; defaults below the writable Skill state directory",
+    )
+    catalog_sub = catalog.add_subparsers(dest="catalog_action", required=True)
+    catalog_sub.add_parser("status", help="show catalog location and counts; never uses network")
+    catalog_import = catalog_sub.add_parser(
+        "import-json", help="import an authorised xBloom App/API JSON export"
+    )
+    catalog_import.add_argument("input")
+    catalog_import.add_argument(
+        "--source",
+        choices=("app-json", "api-json", "public-share-json"),
+        default="app-json",
+    )
+    catalog_import.add_argument("--region", choices=("international", "china"))
+    catalog_import.add_argument("--kind", choices=("auto", "coffee", "tea"), default="auto")
+    catalog_mmkv = catalog_sub.add_parser(
+        "import-mmkv",
+        help="import a decoded MMKV JSON dump (raw MMKV binary is not accepted)",
+    )
+    catalog_mmkv.add_argument("input")
+    catalog_mmkv.add_argument("--region", choices=("international", "china"))
+    catalog_mmkv.add_argument("--kind", choices=("auto", "coffee", "tea"), default="auto")
+    catalog_list = catalog_sub.add_parser("list", help="list private catalog entries")
+    catalog_list.add_argument("--kind", choices=("all", "coffee", "tea"), default="all")
+    catalog_list.add_argument("--origin")
+    catalog_list.add_argument("--query")
+    catalog_list.add_argument("--executable", action="store_true")
+    catalog_list.add_argument("--slot-compatible", action="store_true")
+    catalog_show = catalog_sub.add_parser("show", help="show one normalised catalog entry")
+    catalog_show.add_argument("identifier")
+    catalog_export = catalog_sub.add_parser(
+        "export", help="export one executable entry as guarded YAML"
+    )
+    catalog_export.add_argument("identifier")
+    catalog_export.add_argument("output")
+    catalog_export.add_argument("--overwrite", action="store_true")
+    catalog_sync = catalog_sub.add_parser(
+        "sync",
+        help="read the user's own account-visible xBloom catalog using an explicit app form",
+    )
+    catalog_sync.add_argument("--config")
+    catalog_sync.add_argument(
+        "--include",
+        action="append",
+        choices=("coffee", "tea", "easy", "easy-default"),
+        default=None,
+        help="repeat to select targets; defaults to coffee and tea",
+    )
+    catalog_sync.add_argument("--timeout", type=float, default=20.0)
     load = sub.add_parser("load", help="load and arm a recipe; never starts brewing")
     load.add_argument("recipe")
     monitor = sub.add_parser("monitor", help="stream status/weights without starting")
@@ -1718,6 +1934,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     slots = sub.add_parser("save-slots", help="write guarded recipes to A/B/C; never brews")
     slots.add_argument("recipes", nargs=3, metavar="RECIPE")
+    slots.add_argument(
+        "--scale",
+        nargs=3,
+        choices=("on", "off"),
+        default=("on", "on", "on"),
+        metavar=("A", "B", "C"),
+        help="per-slot on-brew scale behavior in A/B/C order (default: on on on)",
+    )
     bridge = sub.add_parser(
         "bridge",
         help="manage the local long-lived BLE owner and interactive controls",
@@ -1788,6 +2012,14 @@ def build_parser() -> argparse.ArgumentParser:
         "save-slots", help="write all three guarded A/B/C recipes; never brews"
     )
     bridge_slots.add_argument("recipes", nargs=3, metavar="RECIPE")
+    bridge_slots.add_argument(
+        "--scale",
+        nargs=3,
+        choices=("on", "off"),
+        default=("on", "on", "on"),
+        metavar=("A", "B", "C"),
+        help="per-slot on-brew scale behavior in A/B/C order (default: on on on)",
+    )
     bridge_grinder = bridge_sub.add_parser(
         "grinder-start", help="start a timed interactive FreeSolo grinder session"
     )
@@ -1836,6 +2068,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "doctor":
             return cmd_doctor(args)
+        if args.command == "catalog":
+            return cmd_catalog(args)
         require_runtime()
         if args.command == "bridge":
             return cmd_bridge(args)

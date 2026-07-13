@@ -3,7 +3,13 @@ from pathlib import Path
 import pytest
 import yaml
 
-from xbloom_safety import SafetyError, load_strict_recipe, recipe_summary
+from xbloom_ble.recipe import RecipeError
+from xbloom_safety import (
+    SafetyError,
+    load_strict_recipe,
+    recipe_summary,
+    validate_slot_compatible,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +59,24 @@ def test_inconsistent_recipe_rpm_is_rejected(tmp_path):
         load_strict_recipe(_write(tmp_path, data))
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("dose_g", 15.5, "whole grams"),
+        ("grind", 58.5, "whole-number Studio setting"),
+    ],
+)
+def test_fractional_machine_settings_are_rejected_not_truncated(
+    tmp_path, field, value, message
+):
+    data = _hot_mapping()
+    data[field] = value
+    if field == "dose_g":
+        data.pop("ratio")
+    with pytest.raises(RecipeError, match=message):
+        load_strict_recipe(_write(tmp_path, data))
+
+
 def test_center_first_pour_is_rejected(tmp_path):
     data = _hot_mapping()
     data["pours"][0]["pattern"] = "center"
@@ -96,3 +120,13 @@ def test_guard_rejects_low_numeric_bypass_temperature(tmp_path):
     data["water_ml"] = int(data["hot_water_ml"]) + 30
     with pytest.raises(SafetyError, match="bypass temperature"):
         load_strict_recipe(_write(tmp_path, data))
+
+
+def test_slot_guard_rejects_recipe_bypass_instead_of_dropping_it(tmp_path):
+    data = _hot_mapping()
+    data["bypass_ml"] = 30
+    data["bypass_temp_c"] = "RT"
+    data["water_ml"] = int(data["hot_water_ml"]) + 30
+    recipe = load_strict_recipe(_write(tmp_path, data))
+    with pytest.raises(SafetyError, match="cannot represent bypass"):
+        validate_slot_compatible(recipe)

@@ -1,6 +1,6 @@
 ---
 name: xbloom-studio-brew
-description: Design bean-specific hot pour-over and Americano-style flash-brew recipes for xBloom Studio, research cited roaster/cafe/xPod references, run guarded Omni Tea Brewer recipes, dial in by taste, and operate bundled local BLE for diagnostics, settings, scale, grinder, temperature/volume water, recipe load, presets, monitoring, cancel, persistent pause/resume, and explicitly gated physical starts. Use for xBloom Studio, Omni Dripper, xPod/NFC Recipe Cards, Omni Tea Brewer, coffee or tea recipes, iced coffee, C40 conversion, WAIT troubleshooting, electronic-scale readings, standalone grinding/water, or direct xBloom Bluetooth control.
+description: Design bean-specific hot pour-over and Americano-style flash-brew recipes for xBloom Studio, research cited roaster/cafe/xPod references, import or query a private app-visible coffee/tea catalog, run guarded Omni Tea Brewer recipes, dial in by taste, and operate bundled local BLE for diagnostics, settings, scale, grinder, temperature/volume water, recipe load, A/B/C presets, monitoring, cancel, persistent pause/resume, and explicitly gated physical starts. Use for xBloom Studio, Omni Dripper, xPod/NFC Recipe Cards, Omni Tea Brewer, official or saved coffee/tea recipes, iced coffee, C40 conversion, WAIT troubleshooting, electronic-scale readings, standalone grinding/water, or direct xBloom Bluetooth control.
 ---
 
 # xBloom Studio Brew
@@ -18,6 +18,8 @@ Classify the request before acting:
 - **Recipe only:** design, save, validate, and explain the recipe. Do not scan or connect.
 - **Research and compare:** find credible public bean/recipe sources, distinguish native xBloom
   recipes from adapted manual brews, and let the user choose before creating an executable recipe.
+- **Private catalog:** import an authorized App/API or decoded-MMKV JSON export; optionally sync
+  only the user's own account/region-visible coffee, tea, or Easy snapshots with external config.
 - **xPod reference:** preserve roaster intent but classify it `xPod-native`; adapt explicitly before
   using loose beans with Omni, and never assume an NFC card contains the full recipe payload.
 - **Dial-in:** inspect the previous recipe and tasted result, then change one variable.
@@ -67,6 +69,31 @@ python <skill-dir>/scripts/xbloom.py validate <recipe.yaml>
 
 Do not claim a generated recipe has been taste-validated. After the user tastes it, use the result
 and drawdown behavior to adjust one variable at a time.
+
+## Use the private recipe catalog
+
+Read `references/catalog.md` before importing or syncing app-visible recipes. Catalog operations
+are offline from BLE and require no machine connection:
+
+```text
+python <skill-dir>/scripts/xbloom.py catalog status
+python <skill-dir>/scripts/xbloom.py catalog import-json <authorized-export.json>
+python <skill-dir>/scripts/xbloom.py catalog import-mmkv <decoded-mmkv.json>
+python <skill-dir>/scripts/xbloom.py catalog list --kind coffee --executable
+python <skill-dir>/scripts/xbloom.py catalog list --kind tea
+python <skill-dir>/scripts/xbloom.py catalog show <id-or-name>
+python <skill-dir>/scripts/xbloom.py catalog export <id> <workspace-recipe.yaml>
+```
+
+Treat “all” as all records in the supplied export or visible to the user's own account and region,
+not a global xBloom database. Keep the normalized catalog private: redistribution rights default
+to unknown. xPod and J20 entries are reference-only; tea exports use the dedicated tea path.
+
+Cloud sync is optional and currently has decoded/deterministic, not live-service, evidence. It
+requires `--config` or `XBLOOM_CLOUD_CONFIG`; keep that file outside the Skill/repository and never
+print, persist into the catalog, or request credentials in chat. Do not extract credentials from
+an app installation without explicit owner authorization. Use an authorized JSON export when the
+form is unavailable.
 
 ## Prepare local BLE
 
@@ -360,17 +387,27 @@ to per-recipe vibration timing and live FreeSolo pattern changes.
 ## Save A/B/C presets
 
 Explain that this replaces all three on-machine presets, then require explicit user approval.
-Validate each file and write all three in A/B/C order:
+Validate each file for both recipe safety and lossless slot representation, then write all three
+in A/B/C order:
 
 ```text
+python <skill-dir>/scripts/xbloom.py validate <A.yaml> --slot
+python <skill-dir>/scripts/xbloom.py validate <B.yaml> --slot
+python <skill-dir>/scripts/xbloom.py validate <C.yaml> --slot
 python <skill-dir>/scripts/xbloom.py save-slots <A.yaml> <B.yaml> <C.yaml>
 ```
+
+Add `--scale on off on` only when the user explicitly wants different on-brew scale behavior for
+A, B, and C; the default is `on on on`.
 
 With a running bridge, use `bridge save-slots <A.yaml> <B.yaml> <C.yaml>` so the daemon remains the
 sole connection owner.
 
 Confirm JSON reports `"status": "saved"` and `"brew_started": false`. Do not use preset writes
-as a substitute for loading one temporary recipe.
+as a substitute for loading one temporary recipe. A/B/C stores pours, grind, ratio, and scale
+behavior; the machine measures dose at use time. It cannot store coffee bypass, tea, xPod-native
+geometry, J20 recipes, recipe names, notes, or citations. Every preset path rejects `bypass_ml`
+instead of silently omitting it. Read `references/catalog.md` for the full representation boundary.
 
 ## Handle failures
 
@@ -425,6 +462,8 @@ state support it. Distinguish `loaded/armed` from `started/brewing`.
 - Read `references/device-safety.md` before BLE writes or remote start.
 - Read `references/standalone-tools.md` for FreeSolo scale, grinder, and brewer commands.
 - Read `references/tea-brewing.md` for tea requirements, official templates, schema, and workflow.
+- Read `references/catalog.md` for authorized App/MMKV import, optional private sync, export, and
+  A/B/C representation limits.
 - Read `references/deployment.md` for Codex/Hermes installation, publication, and environment setup.
 - Read `references/apk-capability-matrix.md` before claiming app parity or adding decoded commands.
 - Read `references/sources.md` when checking provenance or making hardware/protocol claims.

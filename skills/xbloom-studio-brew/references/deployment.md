@@ -24,8 +24,9 @@ adapter and is near the xBloom Studio.
   terminal backend. The bundled persistent bridge is loopback-only and must run on that BLE host;
   it is not a remote-network gateway.
 
-No xBloom account, cloud token, Android app credential, or internet connection is required after
-the Python dependencies are installed.
+No xBloom account, cloud token, Android app credential, or internet connection is required for
+recipe design, authorized JSON/cache import, validation, or BLE. Optional read-only catalog sync
+alone uses the user's explicit external account form as described in `catalog.md`.
 
 Web recipe enrichment is optional and uses the host Agent's own web-search tool. Configure a web
 backend in Hermes or the target Agent when this feature is wanted; keep using the bundled offline
@@ -93,8 +94,13 @@ hermes skills tap add OWNER/REPOSITORY
 GitHub identifiers include the path to the Skill directory after `OWNER/REPOSITORY`. Test loading with:
 
 ```text
-hermes chat --toolsets skills -q "Use xbloom-studio-brew to validate a hot recipe"
+hermes chat --toolsets skills,terminal -s xbloom-studio-brew \
+  -q "Run the bundled offline catalog status command; do not use BLE or cloud"
 ```
+
+`skills` lets Hermes load the instructions; `terminal` is separately required for the Agent to
+execute the bundled local CLI. Omitting `terminal` can let the model describe a command without
+actually running it.
 
 Verify the daemon lifecycle without connecting to hardware:
 
@@ -117,6 +123,8 @@ All variables are optional; do not declare owner-gate overrides as automatically
 | `XBLOOM_ADDRESS` | Select one machine without scanning; useful when more than one is nearby. |
 | `XBLOOM_SKILL_STATE_DIR` | Relocate runtime records, bridge endpoint/log, and the default external runtime root. |
 | `XBLOOM_SKILL_RUNTIME_DIR` | Override only the external Python virtual-environment directory. |
+| `XBLOOM_CATALOG_PATH` | Override the private normalized catalog path; default is below the Skill state directory. |
+| `XBLOOM_CLOUD_CONFIG` | Point to an external own-account form for optional read-only recipe sync; never commit it. |
 | `XBLOOM_ENABLE_REMOTE_START` | Owner opt-in for remote hot-water start; exact sentinel in `device-safety.md`. |
 | `XBLOOM_ENABLE_REMOTE_GRINDER` | Separate owner opt-in for the standalone grinder; exact sentinel in `device-safety.md`. |
 | `XBLOOM_ENABLE_LIVE_ADJUST` | Separate owner opt-in for FreeSolo live target changes; pattern is hardware-observed only on listed firmware, while temperature write correctness is verified but outlet response is unmeasured. |
@@ -149,24 +157,27 @@ cloud tokens, or recipes containing private purchase/account data.
 1. Run `python scripts/bootstrap.py --dev` on a clean checkout.
 2. Run the Agent Skills structural validator.
 3. Inspect `git diff` for addresses, serials, tokens, and packet captures.
-4. Confirm coffee and tea load frames exclude their execute/start commands.
-5. Test `doctor`, `scan`, and `probe` on each supported OS when available.
-6. Test `scale` with the platform empty; confirm `entering → ready → exited`, then place a known
+4. Import scripted coffee, tea, Easy, xPod, and J20 JSON fixtures; confirm secrets/raw responses
+   are absent from the saved catalog and exported YAML passes the guarded validator.
+5. Confirm coffee and tea load frames exclude their execute/start commands.
+6. Test `doctor`, `scan`, and `probe` on each supported OS when available.
+7. Test `scale` with the platform empty; confirm `entering → ready → exited`, then place a known
    object only after `ready` and verify its reading. Treat `--tare` as an additional re-tare.
-7. For a supported firmware, load a conservative recipe and then cancel without starting.
-8. Pin RT's offline frame encoding to the app's 20 C sentinel, but keep grinder, water, coffee
+8. For a supported firmware, load a conservative recipe and then cancel without starting.
+9. Pin RT's offline frame encoding to the app's 20 C sentinel, but keep grinder, water, coffee
    start, and tea start out of unattended release tests.
-9. Run `bridge start`, `bridge status`, and idle `bridge stop` with no hardware connection. Confirm
+10. Run `bridge start`, `bridge status`, and idle `bridge stop` with no hardware connection. Confirm
    every one-shot BLE command refuses while the bridge owns the local control endpoint.
-10. Test bridge state transitions for coffee, tea, scale, grinder, water, presets, settings, and
+11. Test bridge state transitions for coffee, tea, scale, grinder, water, presets, settings, and
     advanced tuning against scripted BLE only. Keep grinder/water/coffee/tea actuation and FreeSolo
     live-target commands out of unattended tests; record supervised hardware evidence separately.
-11. Pin persistent settings and advanced-tuning command frames/readbacks in fake-BLE tests. Do not
+12. Pin persistent settings and advanced-tuning command frames/readbacks in fake-BLE tests. Do not
     run those writes as an unattended release check; record supervised results separately.
-12. Verify telemetry labels recipe target, cumulative machine output, and cup-scale delta
+13. Verify telemetry labels recipe target, cumulative machine output, and cup-scale delta
     independently, without claiming water-supply inventory.
-13. Never add firmware to the allowlist based only on a successful scan.
-14. Tag the release and record the vendored upstream commit in `THIRD_PARTY_NOTICES.md`.
+14. Verify `validate --slot` and every slot-writing layer reject bypass before BLE resolution.
+15. Never add firmware to the allowlist based only on a successful scan.
+16. Tag the release and record the vendored upstream commit in `THIRD_PARTY_NOTICES.md`.
 
 ## Architecture boundary
 
@@ -177,6 +188,8 @@ and retains bounded event history. Coffee, tea, scale, grinder, FreeSolo water, 
 and advanced tuning all use this path when the bridge is running.
 
 This bridge is deliberately not a LAN service, cloud relay, account connector, or general raw BLE
-socket. Concurrent remote Agents, cross-host authentication, high-rate binary streaming, and
+socket. The separate catalog module may make bounded read-only requests with an explicit external
+own-account form, but never passes credentials into the bridge or makes cloud access a dependency
+of BLE. Concurrent remote Agents, cross-host authentication, high-rate binary streaming, and
 multi-user authorization would justify a separately secured native Tool/MCP service. Keep the
 recipe and physical-safety workflow in this Skill even if such a transport is added later.

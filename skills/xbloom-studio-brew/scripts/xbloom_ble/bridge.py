@@ -1004,10 +1004,12 @@ class BridgeCore:
         if not isinstance(raw_recipes, list) or len(raw_recipes) != 3:
             raise BridgeError("presets.save requires exactly three recipe paths (A/B/C)")
         self._ensure_no_loaded_record()
-        from xbloom_safety import load_strict_recipe
+        from xbloom_safety import load_strict_recipe, validate_slot_compatible
 
         paths = [Path(str(item)).expanduser().resolve(strict=True) for item in raw_recipes]
         recipes = [load_strict_recipe(path) for path in paths]
+        for recipe in recipes:
+            validate_slot_compatible(recipe)
         scale = params.get("scale", True)
         if not isinstance(scale, (bool, list)):
             raise BridgeError("presets scale must be a boolean or three booleans")

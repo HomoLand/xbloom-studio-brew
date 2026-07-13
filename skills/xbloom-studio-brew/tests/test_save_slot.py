@@ -54,6 +54,11 @@ def test_save_slot_rejects_bad_index():
             build_save_slot(REC, bad)
 
 
+def test_save_slot_rejects_bypass_instead_of_silently_losing_water():
+    with pytest.raises(ValueError, match="has no bypass field"):
+        build_save_slot({**REC, "bypass_ml": 30}, 0)
+
+
 # --- mode switch (byte-exact vs the app's mode-toggle capture) --------------
 def test_set_mode_pro_byte_exact():
     assert build_set_mode(pro=True).hex() == "580102f72c1000000001000000002a90"

@@ -50,6 +50,9 @@ The port is pinned by tests for:
   and six-character xPod XID reports.
 - Tea cup setup, recipe upload, execute separation, official green-tea blob, and native minute-pause
   transformation.
+- Host-coffee, tea, current-Easy, and default-Easy endpoint/form models; recursive JSON/MMKV
+  normalization; and the app's chunked RSA/PKCS#1-v1.5 request envelope. These catalog paths have
+  decoded/deterministic tests but no live-service verification in this project.
 
 These are decoded, firmware-dependent behaviors, not an official xBloom API. Scale enter/read/exit
 has also been verified on `V12.0D.500`; a follow-up hardware observation confirmed that the entry

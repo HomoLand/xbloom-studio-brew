@@ -42,6 +42,18 @@ def test_ratio_mismatch_raises():
         Recipe.from_dict(_with(ratio=16))  # 16*16=256 != 150
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("dose_g", 15.5, "whole grams"),
+        ("grind", 62.5, "whole-number Studio setting"),
+    ],
+)
+def test_fractional_machine_fields_are_never_truncated(field, value, message):
+    with pytest.raises(RecipeError, match=message):
+        Recipe.from_dict(_with(**{field: value}))
+
+
 def test_bad_pattern_raises():
     bad = _with(pours=[
         {"ml": 35, "temp_c": 90, "pattern": "zigzag", "pause_s": 40, "rpm": 100, "flow_ml_s": 3.0},

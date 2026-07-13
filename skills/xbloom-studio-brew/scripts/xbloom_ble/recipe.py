@@ -344,11 +344,15 @@ class Recipe:
 
         # dose / grind
         # dose: the xBloom app caps the dose at 18 g (firm app maximum).
+        if isinstance(self.dose_g, bool) or not float(self.dose_g).is_integer():
+            errors.append("dose_g must use whole grams")
         if not (1 <= int(self.dose_g) <= 18):
             errors.append(f"dose_g {self.dose_g} out of range (1–18 g; 18 g is the app maximum)")
         # grind: 1–80 — the grinder has 80 micro-steps (~18.75 µm each); a lower
         # number is finer. (xBloom Studio published spec.) A grind of 0 is the
         # special "no-grind" value: brew pre-ground, grinder off (see NO_GRIND).
+        if isinstance(self.grind, bool) or not float(self.grind).is_integer():
+            errors.append("grind must use a whole-number Studio setting")
         if int(self.grind) != 0 and not (1 <= int(self.grind) <= 80):
             errors.append(
                 f"grind {self.grind} out of range (1–80; the grinder has 80 micro-steps — "

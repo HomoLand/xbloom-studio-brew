@@ -1013,6 +1013,10 @@ def build_save_slot(recipe: Mapping, slot: int, scale: bool = True) -> bytes:
     """
     if slot not in (0, 1, 2):
         raise ValueError(f"slot must be 0 (A), 1 (B) or 2 (C); got {slot!r}")
+    if float(recipe.get("bypass_ml", 0.0) or 0.0):
+        raise ValueError(
+            "Easy-Mode slot command 11510 has no bypass field; refusing to drop bypass_ml"
+        )
     tail = _ratio_byte(recipe)                               # ratio × 10, derived (matches the app)
     blob = build_41(recipe["pours"], recipe["grind"], tail)  # 01 | len | pours | grind | tail
     flags = SLOT_FLAG_SCALE_ON if scale else SLOT_FLAG_SCALE_OFF
