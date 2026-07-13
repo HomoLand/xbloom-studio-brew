@@ -239,7 +239,9 @@ python scripts/bootstrap.py --dev
 
 Release tests use scripted BLE and never activate the grinder or dispense water. The scale
 enter/read/exit path and a running FreeSolo pattern change have separate supervised hardware
-evidence on firmware `V12.0D.500`; see the capability matrix for exact evidence levels.
+evidence on firmware `V12.0D.500`; see the capability matrix for exact evidence levels and the
+[hardware validation backlog](skills/xbloom-studio-brew/references/hardware-validation.md) for the
+remaining supervised checklist.
 
 ## Acknowledgements
 

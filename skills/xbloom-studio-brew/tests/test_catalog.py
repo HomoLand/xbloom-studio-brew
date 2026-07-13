@@ -766,6 +766,60 @@ def test_coffee_cloud_form_accepts_public_omni_dripper_name():
     assert form["cupType"] == 2
 
 
+def test_flash_cloud_preview_discloses_manual_ice_boundary():
+    recipe = Recipe.from_dict(
+        {
+            "name": "Iced 90 g",
+            "kind": "flash-brew",
+            "dripper": "Omni Dripper 2",
+            "dose_g": 15,
+            "grind": 50,
+            "ratio": 10,
+            "water_ml": 240,
+            "hot_water_ml": 150,
+            "ice_g": 90,
+            "pours": [
+                {
+                    "ml": 40,
+                    "temp_c": 94,
+                    "pattern": "spiral",
+                    "vibration": "after",
+                    "pause_s": 35,
+                    "rpm": 100,
+                    "flow_ml_s": 3.0,
+                },
+                {
+                    "ml": 60,
+                    "temp_c": 93,
+                    "pattern": "spiral",
+                    "vibration": "none",
+                    "pause_s": 5,
+                    "rpm": 100,
+                    "flow_ml_s": 3.4,
+                },
+                {
+                    "ml": 50,
+                    "temp_c": 92,
+                    "pattern": "circular",
+                    "vibration": "none",
+                    "pause_s": 0,
+                    "rpm": 100,
+                    "flow_ml_s": 3.5,
+                },
+            ],
+        }
+    )
+
+    preview = cloud_recipe_preview(recipe)
+
+    assert preview["manual_preparation"] == {
+        "ice_g": 90.0,
+        "hot_water_ml": 150.0,
+        "final_water_ml": 240.0,
+    }
+    assert any("stores only the hot extraction" in item for item in preview["warnings"])
+
+
 def test_coffee_cloud_form_refuses_lossy_multiple_rpm_mapping():
     recipe = Recipe.from_dict(
         {

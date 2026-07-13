@@ -211,7 +211,8 @@ python scripts/bootstrap.py --dev
 ```
 
 发布测试仅使用脚本化 BLE，不会启动研磨器或出水。电子秤进入/读数/退出以及 FreeSolo
-运行中水型切换在固件 `V12.0D.500` 上有独立的受控真机证据；各能力的具体证据等级见矩阵。
+运行中水型切换在固件 `V12.0D.500` 上有独立的受控真机证据；各能力的具体证据等级见矩阵，
+后续受控测试见[实机验证清单](skills/xbloom-studio-brew/references/hardware-validation.md)。
 
 ## 致谢
 

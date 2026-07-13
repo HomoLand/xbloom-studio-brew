@@ -173,6 +173,9 @@ Two findings retain explicit evidence boundaries:
 
 ## Route to closer parity
 
+Track supervised work and its pass/evidence criteria in `hardware-validation.md`; do not replace
+that ledger with informal chat recollection.
+
 The local long-lived BLE bridge is available: it owns one Studio connection, maintains a state
 machine, serializes writes, and covers coffee, tea, scale, grinder, FreeSolo water, A/B/C presets,
 persistent settings, advanced tuning, and bounded telemetry through a token-authenticated loopback

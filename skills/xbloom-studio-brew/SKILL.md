@@ -477,4 +477,5 @@ state support it. Distinguish `loaded/armed` from `started/brewing`.
   A/B/C representation limits.
 - Read `references/deployment.md` for Codex/Hermes installation, publication, and environment setup.
 - Read `references/apk-capability-matrix.md` before claiming app parity or adding decoded commands.
+- Read `references/hardware-validation.md` before planning or recording supervised machine tests.
 - Read `references/sources.md` when checking provenance or making hardware/protocol claims.

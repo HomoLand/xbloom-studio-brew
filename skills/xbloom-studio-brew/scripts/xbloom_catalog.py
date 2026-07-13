@@ -1468,7 +1468,7 @@ def cloud_recipe_preview(recipe: Recipe | TeaRecipe) -> dict[str, Any]:
             "tea output_ml_per_steep is display metadata; only each programmed 80/90 ml "
             "steep is uploaded and firmware owns the siphon finish phase"
         )
-    return {
+    preview: dict[str, Any] = {
         "operation": "idempotent-add",
         "endpoint": RECIPE_ADD_ENDPOINT,
         "kind": "tea" if isinstance(recipe, TeaRecipe) else "coffee",
@@ -1485,6 +1485,19 @@ def cloud_recipe_preview(recipe: Recipe | TeaRecipe) -> dict[str, Any]:
         "write_performed": False,
         "warnings": warnings,
     }
+    if not isinstance(recipe, TeaRecipe) and (
+        str(recipe.kind or "").strip().lower() == "flash-brew" or recipe.ice_g
+    ):
+        preview["manual_preparation"] = {
+            "ice_g": float(recipe.ice_g or 0.0),
+            "hot_water_ml": float(recipe.hot_water_ml or recipe.total_water_ml),
+            "final_water_ml": float(recipe.water_ml or recipe.total_machine_water_ml),
+        }
+        warnings.append(
+            "the Android account form stores only the hot extraction program; flash-brew "
+            "kind, ice mass, time, and note remain local/manual preparation"
+        )
+    return preview
 
 
 def push_cloud_recipe_with_login(
