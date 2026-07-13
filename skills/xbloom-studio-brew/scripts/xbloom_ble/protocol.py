@@ -633,8 +633,10 @@ def build_tea_recipe_code(
 
     This ports the official app's Java ``GetRecipeCodeManager`` plus its native
     ``TeaRecipeCreate`` pause transform. The seemingly coffee-oriented suffix
-    values are retained because the five official tea recipes all carry them;
-    tea mode does not run the grinder.
+    is retained because official tea records carry grinderSize plus
+    ``grandWater = sum(programmed stage ml) / leaf grams``; tea mode still does
+    not run the grinder. The finished ~120 ml-per-steep display and firmware
+    siphon finish are not encoded as an extra pour here.
     """
     stages: list[bytes] = []
     for index, pour in enumerate(pours):

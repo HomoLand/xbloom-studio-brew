@@ -15,6 +15,9 @@ skill also completed its initial hardware validation on that firmware.
 | `set-settings` | Persistently changes units, display brightness, or water source, then reads back. | Owner + per-write gates; no brew command |
 | `set-advanced` | Persistently changes radius/amplitude levels, then reads back. | Owner + per-write gates; no brew command |
 | `validate` | Parses and validates a local recipe. | None |
+| `catalog login-sync` | Reads the owner's account-visible recipe categories and saves normalized private records. | No BLE; ephemeral account session, no cloud mutation |
+| `catalog push` | Offline preview of the Android created-recipe form. | No BLE or network write unless `--apply` is supplied |
+| `catalog push --apply` | Adds one recipe to the owner's cloud-created list. | External persistent write; exact owner confirmation required; add-only/conflict-refusing |
 | `load` | Writes guarded recipe frames and leaves the machine armed. Does not brew. | None |
 | `tea-validate` | Parses a local Omni Tea Brewer recipe. | None |
 | `tea-load` | Uploads tea cup geometry and recipe data; does not execute it. | None |
@@ -80,6 +83,10 @@ skill also completed its initial hardware validation on that firmware.
    readback, and disclose if best-effort rollback cannot be confirmed.
 18. Keep recipe target water, cumulative machine output (`40523`), and cup-scale net increase
    separate. None is a quantitative water-supply-level report.
+19. Treat `catalog push --apply` as a persistent external-account change even though it does not
+   touch BLE. Preview first, require the exact confirmation sentinel, use credentials only through
+   environment/hidden prompt, refuse same-name conflicts, and never create a disposable recipe as
+   a test. Login sync remains read-only and must persist neither credentials nor the raw session.
 
 ## Physical readiness checklist
 

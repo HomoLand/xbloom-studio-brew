@@ -54,10 +54,12 @@ class TeaPour:
 class TeaRecipe:
     """A guarded xBloom Omni Tea Brewer recipe.
 
-    ``leaf_g`` and ``output_ml_per_steep`` guide physical setup and reporting;
-    the machine's tea blob itself contains only the ordered pour stages. The
-    protocol suffix values below are intentionally fixed to the values present
-    in all five official xBloom templates recovered from their public shares.
+    ``TeaPour.ml`` is the programmed chamber-fill water for one steep, commonly
+    80 or 90 ml. ``output_ml_per_steep`` is the app's approximate finished-cup
+    display value (normally 120 ml per steep): it includes a firmware-managed
+    post-soak siphon/finish phase and is not sent as a 120 ml pour. The tea blob
+    contains only the ordered programmed stages; its otherwise coffee-shaped
+    ratio suffix is derived from total programmed water divided by ``leaf_g``.
     """
 
     name: str
@@ -169,7 +171,7 @@ class TeaRecipe:
             "cup_min_mm": 40.0,
             "cup_max_mm": 80.0,
             "grinder_size": 50,
-            "grand_water": 45.0,
+            "grand_water": sum(pour.ml for pour in self.pours) / float(self.leaf_g),
             "rpm": 120,
         }
 
@@ -181,6 +183,8 @@ class TeaRecipe:
             "steeps": len(self.pours),
             "programmed_water_ml": sum(pour.ml for pour in self.pours),
             "output_ml_per_steep": self.output_ml_per_steep,
+            "approx_finished_output_ml": self.output_ml_per_steep * len(self.pours),
+            "finish_phase": "firmware-managed-siphon",
             "temperatures_c": [pour.temp_c for pour in self.pours],
             "pauses_s": [pour.pause_s for pour in self.pours],
         }

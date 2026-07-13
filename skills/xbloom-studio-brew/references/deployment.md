@@ -25,8 +25,9 @@ adapter and is near the xBloom Studio.
   it is not a remote-network gateway.
 
 No xBloom account, cloud token, Android app credential, or internet connection is required for
-recipe design, authorized JSON/cache import, validation, or BLE. Optional read-only catalog sync
-alone uses the user's explicit external account form as described in `catalog.md`.
+recipe design, authorized JSON/cache import, validation, or BLE. Optional own-account catalog sync
+and add-only local-recipe upload use ephemeral credentials as described in `catalog.md`; neither is
+a dependency of machine control.
 
 Web recipe enrichment is optional and uses the host Agent's own web-search tool. Configure a web
 backend in Hermes or the target Agent when this feature is wanted; keep using the bundled offline
@@ -124,7 +125,9 @@ All variables are optional; do not declare owner-gate overrides as automatically
 | `XBLOOM_SKILL_STATE_DIR` | Relocate runtime records, bridge endpoint/log, and the default external runtime root. |
 | `XBLOOM_SKILL_RUNTIME_DIR` | Override only the external Python virtual-environment directory. |
 | `XBLOOM_CATALOG_PATH` | Override the private normalized catalog path; default is below the Skill state directory. |
-| `XBLOOM_CLOUD_CONFIG` | Point to an external own-account form for optional read-only recipe sync; never commit it. |
+| `XBLOOM_ACCOUNT_EMAIL` | Own-account email for ephemeral `catalog login-sync` or an approved `catalog push --apply`; never commit it. |
+| `XBLOOM_ACCOUNT_PASSWORD` | Own-account password for non-interactive login; never pass it as a CLI argument, print it, or commit it. Interactive use has a hidden prompt. |
+| `XBLOOM_CLOUD_CONFIG` | Point to an external own-account request form for advanced read-only recipe sync; never commit it. |
 | `XBLOOM_ENABLE_REMOTE_START` | Owner opt-in for remote hot-water start; exact sentinel in `device-safety.md`. |
 | `XBLOOM_ENABLE_REMOTE_GRINDER` | Separate owner opt-in for the standalone grinder; exact sentinel in `device-safety.md`. |
 | `XBLOOM_ENABLE_LIVE_ADJUST` | Separate owner opt-in for FreeSolo live target changes; pattern is hardware-observed only on listed firmware, while temperature write correctness is verified but outlet response is unmeasured. |
@@ -133,6 +136,17 @@ All variables are optional; do not declare owner-gate overrides as automatically
 
 For Hermes sandboxed execution, explicitly pass through only the variables the deployment needs.
 Do not place a BLE address or machine serial in public source control.
+
+Verify account-variable presence without exposing values:
+
+```text
+python scripts/xbloom.py doctor
+```
+
+`catalog login-sync` defaults to official coffee, official tea, combined user-created, Product/xPod,
+and Shared records. `catalog push` is offline preview by default. Remote add requires both `--apply`
+and the exact `--confirm-write own-account-cloud-recipe` sentinel; never use the apply path as a
+deployment smoke test.
 
 The bridge reads its environment once at launch. Restart an **idle** daemon after changing an
 owner gate or address. Runtime endpoint, random token, and log live under
@@ -157,8 +171,10 @@ cloud tokens, or recipes containing private purchase/account data.
 1. Run `python scripts/bootstrap.py --dev` on a clean checkout.
 2. Run the Agent Skills structural validator.
 3. Inspect `git diff` for addresses, serials, tokens, and packet captures.
-4. Import scripted coffee, tea, Easy, xPod, and J20 JSON fixtures; confirm secrets/raw responses
-   are absent from the saved catalog and exported YAML passes the guarded validator.
+4. Import scripted coffee, tea, Easy, xPod, and J20 JSON fixtures; mock all five own-account recipe
+   categories and the add endpoint; confirm secrets/raw responses are absent from the saved catalog,
+   push is preview-only by default, and exported YAML passes the guarded validator. Never mutate a
+   live account as part of release tests.
 5. Confirm coffee and tea load frames exclude their execute/start commands.
 6. Test `doctor`, `scan`, and `probe` on each supported OS when available.
 7. Test `scale` with the platform empty; confirm `entering → ready → exited`, then place a known
@@ -188,8 +204,9 @@ and retains bounded event history. Coffee, tea, scale, grinder, FreeSolo water, 
 and advanced tuning all use this path when the bridge is running.
 
 This bridge is deliberately not a LAN service, cloud relay, account connector, or general raw BLE
-socket. The separate catalog module may make bounded read-only requests with an explicit external
-own-account form, but never passes credentials into the bridge or makes cloud access a dependency
-of BLE. Concurrent remote Agents, cross-host authentication, high-rate binary streaming, and
+socket. The separate catalog module may make bounded own-account reads and an explicitly gated,
+idempotent add-only recipe write, but never passes credentials into the bridge, persists the login
+session, or makes cloud access a dependency of BLE. Concurrent remote Agents, cross-host
+authentication, high-rate binary streaming, and
 multi-user authorization would justify a separately secured native Tool/MCP service. Keep the
 recipe and physical-safety workflow in this Skill even if such a transport is added later.

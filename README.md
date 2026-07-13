@@ -21,9 +21,12 @@ Agent Skills-compatible clients.
 - Optionally researches public recipes from roasters, cafes, and named coffee professionals.
 - Treats exact xPod/Recipe Card recipes as first-party references while adapting their pod geometry
   explicitly for loose-bean Omni brews.
-- Includes five xBloom-published Omni Tea Brewer templates and a dedicated guarded tea protocol.
+- Includes five bundled xBloom-published Omni Tea Brewer templates and a dedicated guarded tea
+  protocol; account sync can also import the region's current tea list.
 - Imports authorized xBloom App/API or decoded-MMKV JSON into a private normalized coffee/tea
-  catalog; optional read-only sync covers the user's own account/region-visible host lists.
+  catalog; ephemeral account sync covers official, user-created, Product/xPod, and shared lists.
+- Previews local coffee/tea recipes as exact App forms and can explicitly perform an idempotent,
+  add-only account upload without storing credentials or session tokens.
 - Shows a conservative Skill baseline plus cited adaptations for the user to compare.
 - Validates dose, extraction/final ratios, bypass, water totals, grind, temperature modes, pattern,
   four-state vibration timing, flow, RPM, and BLE opcodes before writes.
@@ -36,8 +39,8 @@ Agent Skills-compatible clients.
   mislabel any of them as water-supply inventory.
 - Reads redacted Studio machine info plus persistent settings/mechanical tuning, with separately
   gated readback/rollback writes for units, display, source, pour radius, and vibration amplitude.
-- Runs all recipe, catalog-import, and BLE workflows locally without an app account; optional
-  private cloud sync alone uses an explicit external account form and never stores it in the catalog.
+- Runs recipe design, catalog import/query, and BLE workflows locally without an app account;
+  optional account sync/add uses ephemeral credentials and never stores credentials or raw sessions.
 
 ## How recipes are produced
 
@@ -72,8 +75,9 @@ The full verification query is in the [deployment guide](skills/xbloom-studio-br
 
 The APK does not bundle a global recipe database: it fetches regional, account/device-visible
 records and caches them. This project can therefore collect every recipe present in an authorized
-JSON/cache export, or every host coffee/tea record returned to the user's own account and region;
-it cannot truthfully promise every private or worldwide xBloom recipe.
+JSON/cache export, or every official, created, Product/xPod, and Shared record returned to the
+user's own account and region; it cannot truthfully promise every private or worldwide xBloom
+recipe.
 
 ```text
 python scripts/xbloom.py catalog status
@@ -82,14 +86,19 @@ python scripts/xbloom.py catalog import-mmkv decoded-mmkv.json
 python scripts/xbloom.py catalog list --kind coffee --executable
 python scripts/xbloom.py catalog list --kind tea
 python scripts/xbloom.py catalog export <id> recipe.yaml
+python scripts/xbloom.py catalog login-sync --region china --language zh-cn
+python scripts/xbloom.py catalog push recipe.yaml --region china
 ```
 
 The default catalog lives outside the installed Skill under
 `~/.xbloom-studio-brew/catalog/catalog.json`. Raw responses and credentials are not retained.
 xPod and J20 records stay reference-only; validated Studio coffee and tea records export through
-their respective guarded YAML schemas. Optional cloud sync reproduces the APK request envelope but
-has not been live-service verified by this project, so it is explicitly configured and never a
-hidden dependency. See the [catalog and A/B/C guide](skills/xbloom-studio-brew/references/catalog.md).
+their respective guarded YAML schemas. Ephemeral login and read-only sync were live-service
+verified against the China tenant on 2026-07-14: the session and credentials remain memory-only.
+Set `XBLOOM_ACCOUNT_EMAIL` and `XBLOOM_ACCOUNT_PASSWORD` in the host environment; passwords are
+never accepted as command arguments. `catalog push` is preview-only unless the user explicitly
+adds both `--apply` and `--confirm-write own-account-cloud-recipe`; the live write endpoint is not
+used by release tests. See the [catalog and A/B/C guide](skills/xbloom-studio-brew/references/catalog.md).
 
 ## Install
 
@@ -129,6 +138,7 @@ Find credible public recipes for this coffee and let me choose before creating t
 Import my authorized xBloom recipe JSON, list the Studio coffee and tea recipes, and export one.
 Create an Americano-style flash brew, validate it, and load it onto my xBloom Studio without starting.
 Use the official green-tea template, but load it without starting.
+Preview this local recipe for my xBloom account; do not upload it yet.
 Help me weigh this empty cup: enter the scale with an empty platform, tell me when it is ready,
 then I will place the cup.
 ```
@@ -151,6 +161,11 @@ python scripts/xbloom.py bridge scale-start --duration 90
 python scripts/xbloom.py bridge tea-load assets/tea-green-official.yaml
 python scripts/xbloom.py bridge stop
 ```
+
+Tea volume has two layers: each 80/90 ml stage is programmed chamber-fill water, while the App's
+`~120 / ~240 / ~360 ml` selector is approximate finished siphon output. After soaking, Studio
+enters a firmware-owned phase reported as `bypass`; this is not the configurable coffee bypass and
+is not encoded as an extra user-controlled 30 ml pour.
 
 Scale entry automatically zeros the load already present. Start with an empty platform for an
 object's absolute weight, or pre-position an empty vessel when measuring net contents; `--tare`

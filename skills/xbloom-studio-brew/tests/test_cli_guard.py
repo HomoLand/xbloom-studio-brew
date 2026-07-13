@@ -1,11 +1,43 @@
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import xbloom
 import xbloom_ble.bridge as bridge_module
+
+
+def test_runtime_reexec_preserves_callers_working_directory(monkeypatch, tmp_path):
+    runtime = tmp_path / "runtime-python.exe"
+    runtime.touch()
+    caller = tmp_path / "workspace"
+    caller.mkdir()
+    captured = {}
+
+    monkeypatch.chdir(caller)
+    monkeypatch.delenv("XBLOOM_SKILL_REEXEC", raising=False)
+    monkeypatch.setattr(xbloom, "local_python", lambda: runtime)
+    monkeypatch.setattr(
+        xbloom.sys, "argv", ["xbloom.py", "validate", "recipe.yaml"]
+    )
+
+    def fake_call(command, *, env):
+        captured["command"] = command
+        captured["env"] = env
+        captured["cwd"] = Path.cwd()
+        return 0
+
+    monkeypatch.setattr(xbloom.subprocess, "call", fake_call)
+
+    with pytest.raises(SystemExit) as exc:
+        xbloom.reexec_in_local_runtime()
+
+    assert exc.value.code == 0
+    assert captured["cwd"] == caller
+    assert captured["command"][-1] == "recipe.yaml"
+    assert captured["env"]["XBLOOM_SKILL_REEXEC"] == "1"
 
 
 def test_emit_falls_back_to_ascii_for_legacy_windows_console(monkeypatch):
@@ -64,6 +96,36 @@ def test_catalog_and_slot_validation_parsers_are_offline_capable():
         ["catalog", "sync", "--config", "cloud.json", "--include", "coffee"]
     )
     assert sync.include == ["coffee"]
+    login_sync = parser.parse_args(
+        [
+            "catalog",
+            "login-sync",
+            "--region",
+            "international",
+            "--language",
+            "zh-cn",
+            "--include",
+            "tea",
+        ]
+    )
+    assert login_sync.email is None
+    assert login_sync.language == "zh-cn"
+    assert login_sync.include == ["tea"]
+    push = parser.parse_args(
+        [
+            "catalog",
+            "push",
+            "tea.yaml",
+            "--region",
+            "china",
+            "--apply",
+            "--confirm-write",
+            "own-account-cloud-recipe",
+        ]
+    )
+    assert push.recipe == "tea.yaml"
+    assert push.apply is True
+    assert push.confirm_write == "own-account-cloud-recipe"
 
 
 def test_freesolo_and_tea_parsers_expose_guarded_parameters():
@@ -282,12 +344,18 @@ def test_doctor_reports_catalog_configuration_without_reading_secrets(
     catalog = tmp_path / "catalog.json"
     monkeypatch.setenv(xbloom.CLOUD_CONFIG_ENV, str(config))
     monkeypatch.setenv(xbloom.CATALOG_PATH_ENV, str(catalog))
+    monkeypatch.setenv(xbloom.ACCOUNT_EMAIL_ENV, "private@example.test")
+    monkeypatch.setenv(xbloom.ACCOUNT_PASSWORD_ENV, "do-not-print-password")
     monkeypatch.setattr(bridge_module, "bridge_is_running", lambda: False)
     assert xbloom.cmd_doctor(SimpleNamespace(scan=False, scan_timeout=0.1)) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["capabilities"]["catalog_path"] == str(catalog)
     assert report["capabilities"]["catalog_cloud_configured"] is True
+    assert report["capabilities"]["catalog_login_configured"] is True
+    assert report["capabilities"]["catalog_login_email_configured"] is True
+    assert report["capabilities"]["catalog_login_password_configured"] is True
     assert "do-not-print" not in json.dumps(report)
+    assert "private@example.test" not in json.dumps(report)
 
 
 def test_supported_firmware_passes_preflight(monkeypatch):

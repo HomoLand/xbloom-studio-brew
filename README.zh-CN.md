@@ -18,9 +18,12 @@ BLE 控制组合在一起，可用于 Hermes 及其他兼容 Agent Skills 的客
 - 可检索烘焙商、咖啡馆和具名咖啡从业者公开发布的方案。
 - 将精确匹配的 xPod/NFC Recipe Card 作为高价值的一方参考，但会明确适配 xPod 与 Omni
   不同的冲煮结构，不会原样套用。
-- 内置 xBloom 公布的五套 Omni Tea Brewer 茶配方，并使用专用茶协议和校验器。
+- 内置 xBloom 公布的五套 Omni Tea Brewer 茶配方，并使用专用茶协议和校验器；账号同步还可
+  导入所在地区当前返回的茶方案。
 - 可将获得授权的 xBloom App/API 或已解码 MMKV JSON 导入私有咖啡/茶目录；可选只读同步
-  仅覆盖用户本人账号与地区可见的官方列表。
+  覆盖本人账号可见的官方、自建、Product/xPod 与共享列表。
+- 可把本地咖啡/茶配方预览为 App 精确表单，并在显式确认后以幂等、只新增方式同步到账号；
+  凭据和会话令牌都不会落盘。
 - 同时列出保守的 Skill 基线和有引用的适配方案，交给用户选择。
 - 写入前确定性校验粉量、萃取/成品比例、bypass、水量、研磨、温度模式、水型、四态振动时机、
   流速、RPM 和 BLE opcode。
@@ -32,8 +35,8 @@ BLE 控制组合在一起，可用于 Hermes 及其他兼容 Agent Skills 的客
 - 分开呈现配方目标水量、机器本次累计出水和杯秤净增量，不会把它们误称为供水余量。
 - 可读取已隐藏序列号的机器信息、持久设置与机械调校，并为单位、屏幕、水源、注水半径和
   振动幅度提供独立门禁、读回校验和回滚。
-- 配方、目录导入和 BLE 能力都可完全本地运行；只有可选的私有云同步需要外置账号表单，
-  且该表单不会写入目录。
+- 配方设计、目录导入/查询和 BLE 能力都可完全本地运行；可选账号同步/新增使用临时凭据，
+  凭据和原始会话都不会写入目录。
 
 ## 配方如何生成
 
@@ -66,8 +69,8 @@ hermes config set web.search_backend ddgs
 ## 私有配方目录
 
 APK 本身没有内置一份全球静态配方库，而是按地区、账号和设备拉取并缓存记录。因此本项目
-可以收集获得授权的 JSON/缓存导出中全部配方，或用户本人账号与地区当时返回的全部官方
-咖啡/茶方案；不能把它说成全球所有私有或历史 xBloom 配方。
+可以收集获得授权的 JSON/缓存导出中全部配方，或用户本人账号与地区当时返回的官方、
+自建、Product/xPod 与 Shared 记录；不能把它说成全球所有私有或历史 xBloom 配方。
 
 ```text
 python scripts/xbloom.py catalog status
@@ -76,12 +79,17 @@ python scripts/xbloom.py catalog import-mmkv decoded-mmkv.json
 python scripts/xbloom.py catalog list --kind coffee --executable
 python scripts/xbloom.py catalog list --kind tea
 python scripts/xbloom.py catalog export <id> recipe.yaml
+python scripts/xbloom.py catalog login-sync --region china --language zh-cn
+python scripts/xbloom.py catalog push recipe.yaml --region china
 ```
 
 目录默认保存在安装目录外的 `~/.xbloom-studio-brew/catalog/catalog.json`，不会保留原始
 响应或凭据。xPod 与 J20 记录保持只读参考；通过校验的 Studio 咖啡和茶分别导出为受控 YAML。
-可选云同步复现了 APK 请求封装，但本项目尚未完成现网服务验证，所以必须显式配置，也不会
-成为隐藏依赖。详见[目录与 A/B/C 说明](skills/xbloom-studio-brew/references/catalog.md)。
+临时登录与只读同步已于 2026-07-14 在中国区现网验证，凭据和会话只存在于进程内。宿主通过
+`XBLOOM_ACCOUNT_EMAIL` 与 `XBLOOM_ACCOUNT_PASSWORD` 提供账号，密码不接受命令行参数。
+`catalog push` 默认只预览；只有同时给出 `--apply` 与
+`--confirm-write own-account-cloud-recipe` 才会写远端，发布测试从不调用现网写接口。详见
+[目录与 A/B/C 说明](skills/xbloom-studio-brew/references/catalog.md)。
 
 ## 安装
 
@@ -118,6 +126,7 @@ Agent 缓存和 Skill 升级不会破坏运行时。
 导入我授权提供的 xBloom 配方 JSON，列出 Studio 咖啡和茶方案，并导出其中一份。
 做一套冰美式风格闪冲，校验后装载到机器，但不要启动。
 使用官方绿茶模板，但只装载不要启动。
+预览这份本地配方同步到我的 xBloom 账号会写什么，但先不要上传。
 帮我称这个空杯：进入称重前保持秤盘为空，显示 ready 后提醒我再放杯子。
 ```
 
@@ -138,6 +147,11 @@ python scripts/xbloom.py bridge scale-start --duration 90
 python scripts/xbloom.py bridge tea-load assets/tea-green-official.yaml
 python scripts/xbloom.py bridge stop
 ```
+
+茶水量分两层：每段 80/90 ml 是可编程的壶内注水量，App 的
+`约 120 / 240 / 360 ml` 是虹吸完成后的估算成品量。浸泡结束后机器进入固件负责的收尾阶段，
+遥测名称虽为 `bypass`，却不是咖啡配方可配置的 bypass，也不能把它编码成用户可控的额外
+30 ml 注水。
 
 进入称重模式会自动把当时已有负载设为零。测物体绝对重量时先保持秤盘为空，收到 `ready`
 后再放物体；测杯中净重时则可以预先放好空杯。`--tare` 是进入后的额外再次去皮，并不能

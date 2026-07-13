@@ -19,7 +19,7 @@ schema and protocol; read `tea-brewing.md` and validate them with `tea-validate`
 | `water_ml` | Yes | Pours plus bypass for `hot`; pours plus bypass plus ice for `flash-brew`. |
 | `hot_water_ml` | Recommended/Yes | Sum of extraction pours; required for `flash-brew`. |
 | `bypass_ml` | Optional | Machine-executed post-brew bypass, whole 5-100 ml. Omit/zero to disable. |
-| `bypass_temp_c` | With bypass | `RT`, guarded numeric 80-95 C, or `BP`; forbidden without `bypass_ml`. |
+| `bypass_temp_c` | With bypass | `RT`, guarded numeric 40-95 C, or `BP`; forbidden without `bypass_ml`. |
 | `ice_g` | Flash only | 40-180 g; forbidden on hot recipes except zero/omitted. |
 | `time` | Optional | Display-only expected range; quote it as a string. |
 | `note` | Optional | Display-only preparation or flavor note. |
@@ -45,7 +45,7 @@ be 1:12 through 1:20.
 | --- | --- | --- |
 | `label` | Optional | Human-readable stage name. |
 | `ml` | Yes | 10-127 ml. Automatic protocol splitting is disabled. |
-| `temp_c` | Yes | `RT`, 80-95 C, or `BP`. |
+| `temp_c` | Yes | `RT`, 40-95 C, or `BP`. |
 | `pattern` | Yes | `spiral`, `circular`, or `center`. Legacy `ring` is accepted as an alias. First pour cannot be `center`. |
 | `vibration` | Recommended | Independent timing: `none`, `before`, `after`, or `both`; defaults to `none`. |
 | `agitation` | Deprecated | Legacy boolean accepted only for old files. Do not combine it with `vibration`. |
@@ -58,9 +58,9 @@ sections. Treat it as recipe-level grinder RPM and repeat it in non-center YAML 
 intent explicit. Do not use a center first pour because that would make this field ambiguous.
 
 `RT` and `BP` are the app's J15 mode tokens (`20` and `98` on the decoded model). `RT` means
-room-temperature/pass-through and does not actively cool water to exactly 20 C. The base protocol
-model can represent numeric 40-95 C, but the Agent-facing guarded schema deliberately keeps
-ordinary coffee stages at 80-95 C.
+room-temperature/pass-through and does not actively cool water to exactly 20 C. Numeric values use
+the app's 40-95 C range. `BP` is the app's separate boiling-point token; do not substitute `95` when
+the source recipe explicitly selects it.
 
 ## Example
 

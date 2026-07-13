@@ -1,6 +1,6 @@
 ---
 name: xbloom-studio-brew
-description: Design bean-specific hot pour-over and Americano-style flash-brew recipes for xBloom Studio, research cited roaster/cafe/xPod references, import or query a private app-visible coffee/tea catalog, run guarded Omni Tea Brewer recipes, dial in by taste, and operate bundled local BLE for diagnostics, settings, scale, grinder, temperature/volume water, recipe load, A/B/C presets, monitoring, cancel, persistent pause/resume, and explicitly gated physical starts. Use for xBloom Studio, Omni Dripper, xPod/NFC Recipe Cards, Omni Tea Brewer, official or saved coffee/tea recipes, iced coffee, C40 conversion, WAIT troubleshooting, electronic-scale readings, standalone grinding/water, or direct xBloom Bluetooth control.
+description: Design bean-specific hot pour-over and Americano-style flash-brew recipes for xBloom Studio, research cited roaster/cafe/xPod references, import/query/sync a private app-visible coffee/tea catalog, preview or explicitly add local account recipes, run guarded Omni Tea Brewer recipes, dial in by taste, and operate bundled local BLE for diagnostics, settings, scale, grinder, temperature/volume water, recipe load, A/B/C presets, monitoring, cancel, persistent pause/resume, and explicitly gated physical starts. Use for xBloom Studio, Omni Dripper, xPod/NFC Recipe Cards, Omni Tea Brewer, official or saved coffee/tea recipes, iced coffee, C40 conversion, WAIT troubleshooting, electronic-scale readings, standalone grinding/water, or direct xBloom Bluetooth control.
 ---
 
 # xBloom Studio Brew
@@ -18,8 +18,8 @@ Classify the request before acting:
 - **Recipe only:** design, save, validate, and explain the recipe. Do not scan or connect.
 - **Research and compare:** find credible public bean/recipe sources, distinguish native xBloom
   recipes from adapted manual brews, and let the user choose before creating an executable recipe.
-- **Private catalog:** import an authorized App/API or decoded-MMKV JSON export; optionally sync
-  only the user's own account/region-visible coffee, tea, or Easy snapshots with external config.
+- **Private catalog:** import authorized App/API or decoded-MMKV JSON; ephemerally sync official,
+  created, Product/xPod, and shared account recipes; preview or explicitly add local recipes.
 - **xPod reference:** preserve roaster intent but classify it `xPod-native`; adapt explicitly before
   using loose beans with Omni, and never assume an NFC card contains the full recipe payload.
 - **Dial-in:** inspect the previous recipe and tasted result, then change one variable.
@@ -83,17 +83,23 @@ python <skill-dir>/scripts/xbloom.py catalog list --kind coffee --executable
 python <skill-dir>/scripts/xbloom.py catalog list --kind tea
 python <skill-dir>/scripts/xbloom.py catalog show <id-or-name>
 python <skill-dir>/scripts/xbloom.py catalog export <id> <workspace-recipe.yaml>
+python <skill-dir>/scripts/xbloom.py catalog login-sync --region <china|international>
+python <skill-dir>/scripts/xbloom.py catalog push <recipe.yaml> --region <china|international>
 ```
 
 Treat “all” as all records in the supplied export or visible to the user's own account and region,
 not a global xBloom database. Keep the normalized catalog private: redistribution rights default
 to unknown. xPod and J20 entries are reference-only; tea exports use the dedicated tea path.
 
-Cloud sync is optional and currently has decoded/deterministic, not live-service, evidence. It
-requires `--config` or `XBLOOM_CLOUD_CONFIG`; keep that file outside the Skill/repository and never
-print, persist into the catalog, or request credentials in chat. Do not extract credentials from
-an app installation without explicit owner authorization. Use an authorized JSON export when the
-form is unavailable.
+`login-sync` reads all five account categories by default and was live-service verified against the
+China tenant on 2026-07-14. Supply email/password only through `XBLOOM_ACCOUNT_EMAIL` and
+`XBLOOM_ACCOUNT_PASSWORD` (or the hidden interactive password prompt); never print or persist them.
+The older explicit-form `sync` remains available through `--config`/`XBLOOM_CLOUD_CONFIG`.
+
+`catalog push` is an offline preview by default. Remote use is add-only and idempotent: it refuses
+same-name/different-parameter conflicts. Run `--apply --confirm-write own-account-cloud-recipe`
+only after the user explicitly approves that exact recipe and account mutation in the current
+interaction. Never use a live account merely to test the write path; tests must mock the endpoint.
 
 ## Prepare local BLE
 
@@ -224,6 +230,11 @@ recipe rewrite.
 Tea requires the dedicated siphon accessory and schema; never emulate it with a coffee no-grind
 recipe. Copy the closest official template from `assets/tea-*-official.yaml` to a workspace path,
 then read `references/tea-brewing.md`, adapt one variable at a time, and validate:
+
+Treat each stage's 80/90 ml as programmed chamber-fill water. The app's ~120/240/360 ml selector
+is approximate finished siphon output; firmware owns the post-soak finish and reports it as a
+`bypass` phase. It is not the generic configurable coffee bypass, and 120 ml must never be encoded
+as one stage merely to match the display.
 
 ```text
 python <skill-dir>/scripts/xbloom.py tea-validate <tea.yaml>

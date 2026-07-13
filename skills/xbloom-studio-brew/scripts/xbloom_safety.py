@@ -120,17 +120,17 @@ def strict_validate(recipe: Recipe) -> None:
     if not 60 <= total_machine_water <= 360:
         errors.append("total machine water (pours + bypass) must be 60-360 ml")
     if bypass_ml and int(recipe.bypass_temp_c) not in {20, 98} and not (
-        80 <= int(recipe.bypass_temp_c) <= 95
+        40 <= int(recipe.bypass_temp_c) <= 95
     ):
-        errors.append("bypass temperature must be RT, 80-95 C, or BP")
+        errors.append("bypass temperature must be RT, 40-95 C, or BP")
 
     legacy_agitation_count = 0
     non_center_rpms: set[int] = set()
     for index, pour in enumerate(recipe.pours, start=1):
         if not 10 <= int(pour.ml) <= 127:
             errors.append(f"pour {index} must be 10-127 ml; protocol auto-splitting is disabled")
-        if int(pour.temp_c) not in {20, 98} and not 80 <= int(pour.temp_c) <= 95:
-            errors.append(f"pour {index} temperature must be RT, 80-95 C, or BP")
+        if int(pour.temp_c) not in {20, 98} and not 40 <= int(pour.temp_c) <= 95:
+            errors.append(f"pour {index} temperature must be RT, 40-95 C, or BP")
         if not 0 <= int(pour.pause_s) <= 60:
             errors.append(f"pour {index} pause must be 0-60 s")
         flow10 = round(float(pour.flow_ml_s) * 10)

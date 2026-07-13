@@ -2,8 +2,9 @@
 
 The Android app does not bundle its full recipe library in the APK. It fetches
 account/region-visible records and caches them in MMKV. This module normalises
-authorised JSON exports or explicitly configured read-only cloud responses into
-a user-local catalog. It never stores request credentials or raw account blobs.
+authorised JSON exports or bounded own-account cloud responses into a user-local
+catalog, and can preview or explicitly add one guarded recipe. It never stores
+request credentials, login sessions, or raw account blobs.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import secrets
 from typing import Any, Callable, Iterable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from uuid import uuid4
 
 import yaml
 
@@ -34,27 +36,47 @@ CATALOG_PATH_ENV = "XBLOOM_CATALOG_PATH"
 CLOUD_CONFIG_ENV = "XBLOOM_CLOUD_CONFIG"
 MAX_IMPORT_BYTES = 25 * 1024 * 1024
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+ACCOUNT_EMAIL_ENV = "XBLOOM_ACCOUNT_EMAIL"
+ACCOUNT_PASSWORD_ENV = "XBLOOM_ACCOUNT_PASSWORD"
+CLOUD_WRITE_CONFIRM_SENTINEL = "own-account-cloud-recipe"
 
-# Public (not secret) key embedded in xBloom Android 2.2.2. The app RSA-encrypts
-# each JSON form with PKCS#1 v1.5, concatenates 1024-bit blocks, then base64
-# encodes the result before POSTing it as a JSON string.
+# Public (not secret) key used by BaseTransfer in xBloom Android 2.2.2 for the
+# legacy .thtml/.tuhtml account and recipe APIs. The APK also contains a second
+# RSAEncrypt class for a different request stack; it is not interchangeable.
+# BaseTransfer encrypts each JSON form with PKCS#1 v1.5, concatenates 1024-bit
+# blocks, then base64 encodes the result before POSTing it as a JSON string.
 APP_RSA_PUBLIC_KEY_B64 = (
-    "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCL4hLPPe84a15OhkORobBdV/1+"
-    "VPGR1WRJAZ11u27ng36Tg0UgLhRzLDSkmmeQZO3lqqM4eu1daLHjAc6eTPbPCNDB"
-    "IaRMKIpVEcpWzi0daQ03B+MvxYybMeO8K4WPL5bsUwFzk9iOtTi3SVPz6AU5XyI0"
-    "XzyfinbTGwNU1eAJJQIDAQAB"
+    "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC4LF40GZ72SdhMyl765K/i4nY5"
+    "CPcHz2Q1IKWKZ9S79xmK7G8pUhbVf4EZLvnNF1+9IvOFQUKV5Z7ZNNviqSpnql9t"
+    "AT+8+J/He0R7pcirvVSxgdr2i9V/C/gmqAEZ5qVTzRnd3uWdFoKzPdEBxP0IporJ1"
+    "VBbCv90yBSOhVxO+QIDAQAB"
 )
 
 BASE_URLS = {
     "international": "https://client-api.xbloom.com/",
     "china": "https://clientcn-api.xbloomcoffee.cn/",
 }
+LOGIN_ENDPOINT = "tMemberLogin.thtml"
+APP_VERSION = "2.2.2"
+LOGIN_INTERFACE_VERSION = 20240918
+CATALOG_INTERFACE_VERSION = 19700101
+APP_SKEY = "testskey"
+DEFAULT_CLIENT_TYPE = 7
 ENDPOINTS = {
     "coffee": "tHostRecipe.thtml",
     "tea": "tuTeaRecipe.tuhtml",
+    # This Studio/J15 endpoint returns both coffee and tea recipes created by
+    # the signed-in member. The older tuMyRecipeCreated endpoint omits tea.
+    "created": "tuMyTeaRecipeCreated.tuhtml",
+    "product": "tuMyRecipeProduct.tuhtml",
+    "shared": "tuMyRecipeShared.tuhtml",
     "easy": "tuEasyModeList.tuhtml",
     "easy-default": "tuEasyModeInitList.tuhtml",
 }
+DEFAULT_ACCOUNT_TARGETS = ("coffee", "tea", "created", "product", "shared")
+RECIPE_ADD_ENDPOINT = "tuRecipeAdd.tuhtml"
+RECIPE_WRITE_INTERFACE_VERSION = 20240918
+DEFAULT_RECIPE_COLOR = "#ADBDDB"
 APP_PLACE_LABELS = {
     1: "hot",
     2: "curated",
@@ -65,6 +87,7 @@ APP_PLACE_LABELS = {
 }
 CUP_TYPE_LABELS = {1: "xpod", 2: "omni", 3: "other", 4: "tea"}
 APP_PATTERN_LABELS = {1: "center", 2: "spiral", 3: "circular"}
+APP_PATTERN_VALUES = {value: key for key, value in APP_PATTERN_LABELS.items()}
 CODE_PATTERN_LABELS = {0: "center", 1: "circular", 2: "spiral"}
 VIBRATION_LABELS = {0: "none", 1: "before", 2: "after", 3: "both"}
 KNOWN_CONTAINERS = {
@@ -378,7 +401,15 @@ def _normalise_coffee(
     }
     ratio = _optional_float(_first(raw, "grandWater", "ratio"))
     if ratio is not None:
-        recipe["ratio"] = ratio
+        pour_total = sum(int(pour["ml"]) for pour in pours)
+        rounded_ratio_total = round(float(dose) * ratio)
+        if pour_total != rounded_ratio_total and abs(pour_total - rounded_ratio_total) <= 1:
+            warnings.append(
+                "app grandWater differs from the integer pour total by 1 ml; "
+                "ratio will be derived from pours"
+            )
+        else:
+            recipe["ratio"] = ratio
     else:
         warnings.append("missing grandWater ratio; ratio will be derived from pours and dose")
 
@@ -432,13 +463,16 @@ def _normalise_tea(raw: Mapping[str, Any], *, warnings: list[str]) -> dict[str, 
     if leaf is None:
         leaf = 4.0
         warnings.append("missing tea dose defaulted to 4 g")
+    if leaf <= 0:
+        raise CatalogError("tea dose must be positive")
     output = _optional_int(
         _first(raw, "outputMlPerSteep", "output_ml_per_steep")
     )
     if output is None:
         output = 120
         warnings.append(
-            "output_ml_per_steep inferred as 120 ml; this is display metadata, not a machine field"
+            "output_ml_per_steep inferred as ~120 ml; the app treats this as finished "
+            "siphon output metadata, not a programmed 120 ml pour"
         )
     pours = _normalise_pours(
         _first(raw, "pourList", "pours", "pourDataJSONStr"),
@@ -446,6 +480,13 @@ def _normalise_tea(raw: Mapping[str, Any], *, warnings: list[str]) -> dict[str, 
         tea=True,
         warnings=warnings,
     )
+    source_ratio = _optional_float(_first(raw, "grandWater", "ratio"))
+    derived_ratio = sum(int(pour["ml"]) for pour in pours) / float(leaf)
+    if source_ratio is not None and abs(source_ratio - derived_ratio) > 0.05:
+        warnings.append(
+            "tea grandWater does not match programmed water / leaf dose; the guarded "
+            "protocol will derive the ratio from the stages"
+        )
     return {
         "name": str(_first(raw, "theName", "name", default="Unnamed xBloom tea")),
         "kind": "tea",
@@ -465,6 +506,10 @@ def _origin(
 ) -> str:
     if context.get("slot") or context.get("easy_mode"):
         return "easy-mode"
+    if endpoint == ENDPOINTS["created"]:
+        return "user-created"
+    if endpoint == ENDPOINTS["shared"]:
+        return "shared"
     if cup_type == 1 or any(_first(raw, key) for key in ("podsId", "podsXid", "podsName")):
         return "xpod"
     if 6 in app_places:
@@ -558,17 +603,22 @@ def normalise_entry(
         executable = False
         validation_errors.append(str(exc))
     if kind == "tea":
-        tea_bypass_enabled = _optional_int(
-            _first(raw, "isEnableBypassWater", default=0)
-        ) == 1
+        has_tea_bypass_flag = "isEnableBypassWater" in raw
         tea_bypass_volume = _optional_float(
             _first(raw, "bypassVolume", "bypass_ml", default=0)
         ) or 0.0
-        if tea_bypass_enabled or tea_bypass_volume:
+        tea_bypass_enabled = (
+            _optional_int(raw.get("isEnableBypassWater")) == 1
+            if has_tea_bypass_flag
+            else bool(tea_bypass_volume)
+        )
+        if tea_bypass_enabled:
             executable = False
             validation_errors.append(
                 "tea record declares bypass that the guarded Omni Tea Brewer schema cannot represent"
             )
+        elif tea_bypass_volume:
+            warnings.append("disabled app bypass values were ignored")
     elif "isEnableBypassWater" in raw:
         coffee_bypass_enabled = _optional_int(raw.get("isEnableBypassWater")) == 1
         coffee_bypass_volume = _optional_float(
@@ -1102,11 +1152,518 @@ def _cloud_request(
         raise CatalogError(f"xBloom cloud {endpoint} returned invalid JSON") from exc
 
 
+def _normalise_region(region: str) -> str:
+    value = str(region).strip().lower()
+    aliases = {"intl": "international", "en": "international", "cn": "china", "zh": "china"}
+    value = aliases.get(value, value)
+    if value not in BASE_URLS:
+        raise CatalogError("cloud region must be international or china")
+    return value
+
+
+def _app_base_form(
+    *,
+    client_secret: str,
+    interface_version: int,
+    token: str = "",
+    member_id: int = 0,
+    language_type: int = 0,
+) -> dict[str, Any]:
+    """Build the fields serialised by Android BaseForm and ProjectForm."""
+
+    if not isinstance(client_secret, str) or not client_secret:
+        raise CatalogError("client secret identifier must be a non-empty string")
+    parsed_language = _required_int(language_type, "language_type")
+    if parsed_language not in {0, 1, 2, 3}:
+        raise CatalogError("language_type must be one of the app values 0-3")
+    return {
+        "skey": APP_SKEY,
+        "phoneType": "Android",
+        "appVersion": APP_VERSION,
+        "clientDetail": "Codex:xbloom-studio-brew",
+        "clientSecretStr": client_secret,
+        "interfaceVersion": interface_version,
+        "token": token,
+        "memberId": member_id,
+        "clientType": DEFAULT_CLIENT_TYPE,
+        "languageType": parsed_language,
+        "pageNumber": 1,
+        "countPerPage": 0,
+    }
+
+
+def _ephemeral_account_session(
+    *,
+    email: str,
+    password: str,
+    region: str,
+    language_type: int,
+    timeout: float,
+    opener: Callable[..., Any],
+    client_secret: str | None,
+) -> tuple[str, dict[str, Any]]:
+    """Login and return an in-memory app session form.
+
+    This private helper deliberately returns no raw login response. Callers must
+    not persist or emit the returned form because it contains a bearer token and
+    the app's per-install client identifier.
+    """
+
+    if not 1 <= float(timeout) <= 60:
+        raise CatalogError("catalog sync timeout must be 1-60 seconds")
+    if not isinstance(email, str) or not email.strip():
+        raise CatalogError("xBloom account email is required")
+    if not isinstance(password, str) or not password:
+        raise CatalogError("xBloom account password is required")
+    resolved_region = _normalise_region(region)
+    session_client = client_secret or str(uuid4())
+    login_form = _app_base_form(
+        client_secret=session_client,
+        interface_version=LOGIN_INTERFACE_VERSION,
+        language_type=language_type,
+    )
+    login_form.update(
+        {
+            "email": email.strip(),
+            "password": password,
+            "jpushId": "",
+        }
+    )
+    payload = _cloud_request(
+        base_url=BASE_URLS[resolved_region],
+        endpoint=LOGIN_ENDPOINT,
+        form=login_form,
+        timeout=float(timeout),
+        opener=opener,
+    )
+    if not isinstance(payload, Mapping) or payload.get("result") != "success":
+        result_code = payload.get("resultCode") if isinstance(payload, Mapping) else None
+        suffix = f" (resultCode={result_code})" if result_code is not None else ""
+        raise CatalogError(f"xBloom account login was rejected{suffix}")
+    token = payload.get("token")
+    member = payload.get("member")
+    if not isinstance(token, str) or not token or not isinstance(member, Mapping):
+        raise CatalogError("xBloom account login returned an incomplete session")
+    member_id = _optional_int(member.get("tableId"))
+    if member_id is None or member_id <= 0:
+        raise CatalogError("xBloom account login returned an invalid member session")
+    return resolved_region, _app_base_form(
+        client_secret=session_client,
+        interface_version=CATALOG_INTERFACE_VERSION,
+        token=token,
+        member_id=member_id,
+        language_type=language_type,
+    )
+
+
+def load_cloud_recipe(path: str | Path) -> tuple[Path, Recipe | TeaRecipe]:
+    """Load one guarded local recipe for account-cloud preview or upload."""
+
+    resolved = Path(path).expanduser().resolve(strict=True)
+    if resolved.suffix.lower() not in {".yaml", ".yml", ".json"}:
+        raise CatalogError("cloud recipe must be a local .yaml, .yml, or .json file")
+    try:
+        data = yaml.safe_load(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise CatalogError(f"could not read local recipe {resolved.name}") from exc
+    if not isinstance(data, dict):
+        raise CatalogError("cloud recipe must be a mapping")
+    try:
+        if str(data.get("kind", "")).strip().lower() == "tea":
+            recipe: Recipe | TeaRecipe = TeaRecipe.from_dict(data)
+        else:
+            recipe = Recipe.from_dict(data)
+            strict_validate(recipe)
+    except Exception as exc:
+        raise CatalogError(f"local recipe is not cloud-uploadable: {exc}") from exc
+    return resolved, recipe
+
+
+def _app_pour_record(
+    *,
+    index: int,
+    ml: int,
+    temp_c: int,
+    pattern: str,
+    pause_s: int,
+    flow_ml_s: float,
+    vibration: str = "none",
+    label: str | None = None,
+) -> dict[str, Any]:
+    pattern_name = str(pattern).strip().lower()
+    if pattern_name == "ring":
+        pattern_name = "circular"
+    if pattern_name not in APP_PATTERN_VALUES:
+        raise CatalogError(f"pour {index} has no Android app pattern mapping")
+    vibration_name = str(vibration).strip().lower()
+    if vibration_name not in VIBRATION_LABELS.values():
+        raise CatalogError(f"pour {index} has no Android app vibration mapping")
+    before = vibration_name in {"before", "both"}
+    after = vibration_name in {"after", "both"}
+    return {
+        "flowRate": float(flow_ml_s),
+        "isEnableVibrationAfter": 1 if after else 2,
+        "isEnableVibrationBefore": 1 if before else 2,
+        "pattern": APP_PATTERN_VALUES[pattern_name],
+        "pausing": int(pause_s),
+        "recipeId": 0,
+        "temperature": float(temp_c),
+        "theName": str(label or ("Bloom" if index == 1 else f"Pour{index - 1}")),
+        "volume": float(ml),
+    }
+
+
+def build_cloud_recipe_form(
+    recipe: Recipe | TeaRecipe,
+    *,
+    member_id: int | None = None,
+) -> dict[str, Any]:
+    """Map a guarded recipe to Android 2.2.2's ``RecipeEditForm`` fields."""
+
+    name = str(recipe.name).strip()
+    if not name:
+        raise CatalogError("cloud recipe name must not be empty")
+    if isinstance(recipe, TeaRecipe):
+        recipe.validate()
+        pours = [
+            _app_pour_record(
+                index=index,
+                ml=pour.ml,
+                temp_c=pour.temp_c,
+                pattern=pour.pattern,
+                pause_s=pour.pause_s,
+                flow_ml_s=pour.flow_ml_s,
+                label=pour.label,
+            )
+            for index, pour in enumerate(recipe.pours, start=1)
+        ]
+        form: dict[str, Any] = {
+            "adaptedModel": 1,
+            "bypassTemp": 85.0,
+            "bypassVolume": 5.0,
+            "cupType": 4,
+            "dose": float(recipe.leaf_g),
+            "grandWater": sum(pour.ml for pour in recipe.pours) / float(recipe.leaf_g),
+            "grinderSize": 50.0,
+            "isEnableBypassWater": 2,
+            "isSetGrinderSize": 2,
+            "pourDataJSONStr": json.dumps(
+                pours, ensure_ascii=False, separators=(",", ":")
+            ),
+            "rpm": 120,
+            "theColor": DEFAULT_RECIPE_COLOR,
+            "theName": name,
+        }
+        # The current tea editor sets creatorId explicitly. It is resolved only
+        # after login so previews remain account/session free.
+        if member_id is not None:
+            form["creatorId"] = _required_int(member_id, "member id")
+        return form
+
+    dripper = str(recipe.dripper or "Omni").strip().casefold()
+    if "omni" not in dripper and "xdripper" not in dripper:
+        raise CatalogError(
+            "only an Omni/xDripper loose-bean recipe can be added to the account; "
+            "adapt xPod or other-dripper recipes first"
+        )
+    rpm_values = {int(pour.rpm) for pour in recipe.pours if int(pour.rpm) > 0}
+    if len(rpm_values) > 1:
+        raise CatalogError(
+            "the Android account recipe schema has one global RPM; local pours use "
+            f"multiple values {sorted(rpm_values)}"
+        )
+    strict_validate(recipe)
+    rpm = next(iter(rpm_values), 120)
+    pours = [
+        _app_pour_record(
+            index=index,
+            ml=pour.ml,
+            temp_c=pour.temp_c,
+            pattern=pour.pattern,
+            pause_s=pour.pause_s,
+            flow_ml_s=pour.flow_ml_s,
+            vibration=str(pour.vibration or "none"),
+            label=pour.label,
+        )
+        for index, pour in enumerate(recipe.pours, start=1)
+    ]
+    enabled_bypass = bool(recipe.bypass_ml)
+    form = {
+        "adaptedModel": 1,
+        "cupType": 2,
+        "dose": float(recipe.dose_g),
+        "grandWater": float(recipe.effective_ratio),
+        "isEnableBypassWater": 1 if enabled_bypass else 2,
+        "isSetGrinderSize": 2 if recipe.no_grind else 1,
+        "pourDataJSONStr": json.dumps(
+            pours, ensure_ascii=False, separators=(",", ":")
+        ),
+        "rpm": rpm,
+        "theColor": DEFAULT_RECIPE_COLOR,
+        "theName": name,
+    }
+    if not recipe.no_grind:
+        form["grinderSize"] = float(recipe.grind)
+    if enabled_bypass:
+        form["bypassVolume"] = float(recipe.bypass_ml)
+        form["bypassTemp"] = float(recipe.bypass_temp_c)
+    return form
+
+
+def _cloud_form_semantics(form: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the brew-relevant, account-independent part of an app form."""
+
+    pours = _jsonish(form.get("pourDataJSONStr"))
+    if not isinstance(pours, list):
+        raise CatalogError("cloud recipe form has no pour list")
+    semantic_pours: list[dict[str, Any]] = []
+    for index, pour in enumerate(pours, start=1):
+        if not isinstance(pour, Mapping):
+            raise CatalogError(f"cloud recipe pour {index} is not an object")
+        semantic_pours.append(
+            {
+                key: pour.get(key)
+                for key in (
+                    "flowRate",
+                    "isEnableVibrationAfter",
+                    "isEnableVibrationBefore",
+                    "pattern",
+                    "pausing",
+                    "temperature",
+                    "volume",
+                )
+            }
+        )
+    return {
+        key: form.get(key)
+        for key in (
+            "adaptedModel",
+            "bypassTemp",
+            "bypassVolume",
+            "cupType",
+            "dose",
+            "grandWater",
+            "grinderSize",
+            "isEnableBypassWater",
+            "isSetGrinderSize",
+            "rpm",
+        )
+    } | {"pours": semantic_pours}
+
+
+def cloud_recipe_preview(recipe: Recipe | TeaRecipe) -> dict[str, Any]:
+    """Build a secret-free, non-writing preview of an account recipe add."""
+
+    form = build_cloud_recipe_form(recipe)
+    semantics = _cloud_form_semantics(form)
+    fingerprint = hashlib.sha256(
+        json.dumps(semantics, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    warnings = [
+        "preview only; no login or remote write was performed",
+        "apply is add-only and refuses a same-name recipe with different parameters",
+    ]
+    if isinstance(recipe, TeaRecipe):
+        warnings.append(
+            "tea output_ml_per_steep is display metadata; only each programmed 80/90 ml "
+            "steep is uploaded and firmware owns the siphon finish phase"
+        )
+    return {
+        "operation": "idempotent-add",
+        "endpoint": RECIPE_ADD_ENDPOINT,
+        "kind": "tea" if isinstance(recipe, TeaRecipe) else "coffee",
+        "name": str(recipe.name),
+        "fingerprint_sha256": fingerprint,
+        "app_recipe_form": form,
+        "dynamic_account_fields": [
+            "token",
+            "memberId",
+            "clientSecretStr",
+            *( ["creatorId"] if isinstance(recipe, TeaRecipe) else [] ),
+        ],
+        "confirmation_required": CLOUD_WRITE_CONFIRM_SENTINEL,
+        "write_performed": False,
+        "warnings": warnings,
+    }
+
+
+def push_cloud_recipe_with_login(
+    recipe: Recipe | TeaRecipe,
+    *,
+    email: str,
+    password: str,
+    region: str,
+    confirm_write: str,
+    language_type: int = 0,
+    timeout: float = 20.0,
+    opener: Callable[..., Any] = urlopen,
+    client_secret: str | None = None,
+) -> dict[str, Any]:
+    """Idempotently add one local recipe to the member's cloud account.
+
+    This is intentionally add-only. It refuses same-name/different-parameter
+    conflicts and never exposes or persists credentials or session fields.
+    """
+
+    if confirm_write != CLOUD_WRITE_CONFIRM_SENTINEL:
+        raise CatalogError(
+            "cloud recipe write requires the exact confirmation "
+            f"{CLOUD_WRITE_CONFIRM_SENTINEL!r}"
+        )
+    preview = cloud_recipe_preview(recipe)
+    region_name, session_form = _ephemeral_account_session(
+        email=email,
+        password=password,
+        region=region,
+        language_type=language_type,
+        timeout=timeout,
+        opener=opener,
+        client_secret=client_secret,
+    )
+    created_form = deepcopy(session_form)
+    created_form["adaptedModel"] = 1
+    created_payload = _cloud_request(
+        base_url=BASE_URLS[region_name],
+        endpoint=ENDPOINTS["created"],
+        form=created_form,
+        timeout=float(timeout),
+        opener=opener,
+    )
+    requested_name = str(recipe.name).strip().casefold()
+    requested_semantics = _cloud_form_semantics(build_cloud_recipe_form(recipe))
+    for raw, context in _candidate_records(created_payload):
+        raw_name = str(_first(raw, "theName", "name", default="")).strip()
+        if raw_name.casefold() != requested_name:
+            continue
+        try:
+            entry = normalise_entry(
+                raw,
+                context=context,
+                source_type="xbloom-cloud",
+                endpoint=ENDPOINTS["created"],
+                region=region_name,
+            )
+            existing_recipe: Recipe | TeaRecipe
+            if entry["kind"] == "tea":
+                existing_recipe = TeaRecipe.from_dict(entry["recipe"])
+            else:
+                existing_recipe = Recipe.from_dict(entry["recipe"])
+            existing_semantics = _cloud_form_semantics(
+                build_cloud_recipe_form(existing_recipe)
+            )
+        except Exception as exc:
+            raise CatalogError(
+                "the account already has a same-name recipe that could not be "
+                "safely compared; rename the local recipe"
+            ) from exc
+        if existing_semantics == requested_semantics:
+            return {
+                "status": "already-present",
+                "operation": "idempotent-add",
+                "region": region_name,
+                "kind": preview["kind"],
+                "name": str(recipe.name),
+                "remote_table_id": _optional_int(
+                    _first(raw, "tableId", "table_id", "recipeId")
+                ),
+                "write_performed": False,
+                "authenticated": True,
+                "credentials_persisted": False,
+                "session_persisted": False,
+            }
+        raise CatalogError(
+            "the account already has a different recipe with this name; rename "
+            "the local recipe instead of overwriting cloud data"
+        )
+
+    write_form = deepcopy(session_form)
+    write_form["interfaceVersion"] = RECIPE_WRITE_INTERFACE_VERSION
+    write_form.update(
+        build_cloud_recipe_form(
+            recipe,
+            member_id=_required_int(session_form.get("memberId"), "member id"),
+        )
+    )
+    payload = _cloud_request(
+        base_url=BASE_URLS[region_name],
+        endpoint=RECIPE_ADD_ENDPOINT,
+        form=write_form,
+        timeout=float(timeout),
+        opener=opener,
+    )
+    if not isinstance(payload, Mapping) or payload.get("result") != "success":
+        result_code = payload.get("resultCode") if isinstance(payload, Mapping) else None
+        suffix = f" (resultCode={result_code})" if result_code is not None else ""
+        raise CatalogError(f"xBloom cloud recipe add was rejected{suffix}")
+    table_id = _optional_int(payload.get("tableId"))
+    if table_id is None or table_id <= 0:
+        raise CatalogError("xBloom cloud recipe add returned no remote recipe id")
+    return {
+        "status": "created",
+        "operation": "idempotent-add",
+        "region": region_name,
+        "kind": preview["kind"],
+        "name": str(recipe.name),
+        "remote_table_id": table_id,
+        "write_performed": True,
+        "authenticated": True,
+        "credentials_persisted": False,
+        "session_persisted": False,
+    }
+
+
+def sync_cloud_with_login(
+    catalog: dict[str, Any],
+    *,
+    email: str,
+    password: str,
+    region: str = "international",
+    include: Iterable[str] = DEFAULT_ACCOUNT_TARGETS,
+    language_type: int = 0,
+    timeout: float = 20.0,
+    opener: Callable[..., Any] = urlopen,
+    client_secret: str | None = None,
+) -> dict[str, Any]:
+    """Login ephemerally, sync account-visible recipes, and discard the session.
+
+    The password, token, member id, client id, and raw login response are never
+    returned or added to the catalog. Callers must likewise avoid logging the
+    input credentials.
+    """
+
+    resolved_region, session_form = _ephemeral_account_session(
+        email=email,
+        password=password,
+        region=region,
+        language_type=language_type,
+        timeout=timeout,
+        opener=opener,
+        client_secret=client_secret,
+    )
+    result = sync_cloud(
+        catalog,
+        {
+            "region": resolved_region,
+            "adapted_model": 1,
+            "base_form": session_form,
+        },
+        include=include,
+        timeout=float(timeout),
+        opener=opener,
+    )
+    return {
+        **result,
+        "authenticated": True,
+        "credentials_persisted": False,
+        "session_persisted": False,
+    }
+
+
 def sync_cloud(
     catalog: dict[str, Any],
     config: Mapping[str, Any],
     *,
-    include: Iterable[str] = ("coffee", "tea"),
+    include: Iterable[str] = DEFAULT_ACCOUNT_TARGETS,
     timeout: float = 20.0,
     opener: Callable[..., Any] = urlopen,
 ) -> dict[str, Any]:
@@ -1131,7 +1688,7 @@ def sync_cloud(
     results: list[dict[str, Any]] = []
     for target in requested:
         form = deepcopy(dict(base_form))
-        if target in {"coffee", "tea"}:
+        if target in {"coffee", "tea", "created", "product", "shared"}:
             form["adaptedModel"] = adapted_model
         else:
             if not isinstance(easy, Mapping):
@@ -1158,6 +1715,21 @@ def sync_cloud(
             timeout=float(timeout),
             opener=opener,
         )
+        candidates = list(_candidate_records(payload, context={}))
+        if not candidates and isinstance(payload, Mapping) and payload.get("result") == "success":
+            results.append(
+                {
+                    "target": target,
+                    "endpoint": endpoint,
+                    "candidates": 0,
+                    "added": 0,
+                    "updated": 0,
+                    "rejected": 0,
+                    "rejections": [],
+                    "total": len(catalog.get("entries", [])),
+                }
+            )
+            continue
         try:
             stats = import_payload(
                 catalog,
@@ -1181,11 +1753,18 @@ def sync_cloud(
 
 
 __all__ = [
+    "ACCOUNT_EMAIL_ENV",
+    "ACCOUNT_PASSWORD_ENV",
+    "APP_RSA_PUBLIC_KEY_B64",
     "CATALOG_PATH_ENV",
     "CLOUD_CONFIG_ENV",
+    "CLOUD_WRITE_CONFIRM_SENTINEL",
+    "DEFAULT_ACCOUNT_TARGETS",
     "CatalogError",
     "app_encrypt_form",
+    "build_cloud_recipe_form",
     "catalog_summary",
+    "cloud_recipe_preview",
     "default_catalog_path",
     "empty_catalog",
     "export_entry",
@@ -1194,8 +1773,11 @@ __all__ = [
     "import_payload",
     "list_entries",
     "load_catalog",
+    "load_cloud_recipe",
     "load_cloud_config",
     "normalise_entry",
+    "push_cloud_recipe_with_login",
     "save_catalog",
     "sync_cloud",
+    "sync_cloud_with_login",
 ]

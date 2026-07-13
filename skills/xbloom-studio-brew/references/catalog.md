@@ -12,10 +12,12 @@ all records present in an authorized export or returned to the user's own accoun
 that moment. It does not mean every xBloom, roaster, private, deleted, experimental, or other-user
 recipe worldwide.
 
-The importer and request envelope have **D/T** evidence: they are derived from APK models and have
-deterministic tests. Live service authentication and response compatibility are not **H** evidence
-in this project. Prefer an authorized JSON/cache export whenever possible; treat cloud sync as a
-read-only interoperability path that may need updating when the service or app changes.
+The importer, request envelope, ephemeral login, and normalized endpoint mapping have **D/T**
+evidence: they are derived from APK models and have deterministic tests. A read-only compatibility
+check against the owner's China-region account succeeded on 2026-07-14 for official coffee, official
+tea, combined Studio-created recipes, Product/xPod recipes, and an empty Shared list. That is
+**live-service verified**, not **H**: hardware evidence labels apply only to Studio BLE behavior.
+Cloud contracts can still change, so authorized JSON/cache import remains a useful offline fallback.
 
 The normalized catalog is private state, not a redistributable recipe pack. Every entry defaults
 to `redistribution: unknown`. Do not commit, publish, or bulk-share catalog contents without
@@ -41,9 +43,10 @@ python <skill-dir>/scripts/xbloom.py doctor
 python <skill-dir>/scripts/xbloom.py catalog status
 ```
 
-`doctor` reports whether a cloud-config path exists, but never reads or prints its secret values.
-No initial configuration is required for JSON/MMKV import, query, export, validation, or A/B/C
-programming. Cloud sync alone requires separate account configuration.
+`doctor` reports only whether account environment variables and a cloud-config path are present;
+it never prints their values. No initial configuration is required for JSON/MMKV import, query,
+export, validation, or A/B/C programming. Account sync and remote add are optional and independent
+of BLE.
 
 ## Import an authorized export
 
@@ -89,7 +92,37 @@ Entry classifications matter:
   grinder values, remain reference-only with the original normalized number; they are never
   truncated or silently rounded into executable YAML.
 
-## Optional read-only cloud sync
+## Ephemeral own-account sync
+
+For the simplest current-account import, provide the account only through host environment
+variables. Never put a password in a command argument, recipe, Skill file, repository, or chat.
+Interactive terminals may omit the password variable and use the hidden prompt instead.
+
+```text
+XBLOOM_ACCOUNT_EMAIL=<own-account-email>
+XBLOOM_ACCOUNT_PASSWORD=<own-account-password>
+python <skill-dir>/scripts/xbloom.py catalog login-sync --region china --language zh-cn
+```
+
+Choose the actual account tenant: `china` or `international`. The default import reads all five
+account recipe categories:
+
+- `coffee`: xBloom/roaster official Studio coffee;
+- `tea`: official Omni Tea Brewer recipes;
+- `created`: the combined Studio/J15 endpoint containing the user's created coffee and tea;
+- `product`: Product/xPod recipes associated with the account;
+- `shared`: recipes shared to the account, which may legitimately be empty.
+
+Repeat `--include` to request only selected categories. The login session, token, member ID, and raw
+responses remain in process memory and are discarded after the bounded reads. Only normalized
+recipe records and safe provenance are written to the private catalog. Account sync never scans or
+connects to BLE.
+
+The 2026-07-14 China-tenant compatibility snapshot returned 9 official coffee, 6 official tea,
+2 combined created records, 6 Product/xPod records, and 0 shared records. Counts are evidence of the
+endpoint mapping, not a promise that another account or a later date will return the same catalog.
+
+## Advanced read-only request-form sync
 
 Keep the account form outside the repository and Skill directory. Set its path with
 `XBLOOM_CLOUD_CONFIG` or pass `--config` explicitly. The JSON object has this shape:
@@ -125,14 +158,14 @@ values and types from the user's own authorized app request; do not invent them,
 account, ask the Agent to reveal them in chat, or commit the file. `region` accepts
 `international` or `china`; `adapted_model` must remain `1` for Studio/J15.
 
-Sync the account/region-visible host coffee and tea lists:
+Sync the account/region-visible recipe categories:
 
 ```text
 python <skill-dir>/scripts/xbloom.py catalog sync --config <private-config.json>
 ```
 
-The default targets are `coffee` (`tHostRecipe.thtml`) and `tea` (`tuTeaRecipe.tuhtml`). Request
-current or default Easy-mode snapshots only when the `easy_mode` fields are known:
+The default targets are `coffee`, `tea`, `created`, `product`, and `shared`. Request current or
+default Easy-mode snapshots only when the `easy_mode` fields are known:
 
 ```text
 python <skill-dir>/scripts/xbloom.py catalog sync --config <private-config.json> \
@@ -143,6 +176,37 @@ The implementation reproduces the app's regional URL selection and chunked RSA/P
 envelope. It performs bounded reads, no automatic retry, no credential logging, and persists only
 normalized entries. A service error must be reported as a sync failure; never fall back to an
 unapproved endpoint or account.
+
+## Preview and add a local recipe to the account
+
+`catalog push` maps a guarded local coffee or tea YAML/JSON file to the current Android app form.
+Preview is offline and is always the default:
+
+```text
+python <skill-dir>/scripts/xbloom.py catalog push <recipe.yaml> --region china
+```
+
+Review the reported form, lossy-boundary warnings, and fingerprint. Only after the owner explicitly
+approves that exact account write may an Agent run:
+
+```text
+XBLOOM_ACCOUNT_EMAIL=<own-account-email>
+XBLOOM_ACCOUNT_PASSWORD=<own-account-password>
+python <skill-dir>/scripts/xbloom.py catalog push <recipe.yaml> --region china \
+  --apply --confirm-write own-account-cloud-recipe
+```
+
+The write path is deliberately **add-only**. It first reads the user's combined created list:
+an identical name and parameter fingerprint returns `already-present` without writing, while the
+same name with different parameters is refused rather than overwritten. Update, delete, share,
+pin, and profile mutation are not exposed. Release tests mock the add endpoint and never mutate a
+live account; the first real add remains an explicitly approved owner action.
+
+Cloud form conversion is stricter than local BLE execution. The Android created-recipe schema has
+one global grinder RPM, so a local coffee file with multiple non-zero RPM values is rejected rather
+than flattened. Tea uploads contain leaf mass and the programmed 80/90 ml stages; app-display
+metadata such as `output_ml_per_steep` is not a machine or cloud stage field. Disabled tea bypass
+placeholders are compatibility residue and are never interpreted as an extra pour.
 
 ## A/B/C compatibility
 

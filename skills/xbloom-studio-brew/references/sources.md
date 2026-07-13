@@ -1,6 +1,6 @@
 # Sources and evidence boundaries
 
-Checked 2026-07-12. Prefer official xBloom material for physical specifications, the vendored
+Checked through 2026-07-14. Prefer official xBloom material for physical specifications, the vendored
 project for decoded BLE behavior, and tasting feedback for recipe correction.
 
 ## Official xBloom material
@@ -50,12 +50,27 @@ The port is pinned by tests for:
   and six-character xPod XID reports.
 - Tea cup setup, recipe upload, execute separation, official green-tea blob, and native minute-pause
   transformation.
-- Host-coffee, tea, current-Easy, and default-Easy endpoint/form models; recursive JSON/MMKV
-  normalization; and the app's chunked RSA/PKCS#1-v1.5 request envelope. These catalog paths have
-  decoded/deterministic tests but no live-service verification in this project.
+- Official coffee/tea, combined Studio-created, Product/xPod, Shared, current-Easy, and default-Easy
+  endpoint/form models; recursive JSON/MMKV normalization; and the app's chunked
+  RSA/PKCS#1-v1.5 request envelope. The legacy account APIs use the public key embedded in
+  `BaseTransfer`; the APK's second `RSAEncrypt` key belongs to another request stack and is not
+  interchangeable.
+- Tea form compatibility details: bypass is explicitly disabled even though the shared edit model
+  retains unused volume/temperature placeholders; `grandWater` is programmed stage water divided
+  by leaf mass; and report `40520` names the firmware-owned post-soak finish `bypass` even though it
+  is not configurable coffee bypass.
 
-These are decoded, firmware-dependent behaviors, not an official xBloom API. Scale enter/read/exit
-has also been verified on `V12.0D.500`; a follow-up hardware observation confirmed that the entry
+These are decoded, firmware-dependent behaviors, not an official xBloom API. On 2026-07-14, an
+ephemeral owner-authorized China-tenant login verified read compatibility for
+`tHostRecipe.thtml` (9), `tuTeaRecipe.tuhtml` (6), `tuMyTeaRecipeCreated.tuhtml` (2),
+`tuMyRecipeProduct.tuhtml` (6), and `tuMyRecipeShared.tuhtml` (0). The combined created endpoint
+contained both Studio coffee and tea; the older coffee-only created endpoint did not. Tokens, raw
+responses, member IDs, and credentials were not persisted. The add-only `tuRecipeAdd.tuhtml` form
+is decoded and tested against a mock, but has deliberately not been used as a release-time live
+account mutation.
+
+Scale enter/read/exit has also been verified on `V12.0D.500`; a follow-up hardware observation
+confirmed that the entry
 command zeros a load already present. On 2026-07-13, a supervised RT-water run on the same firmware
 visually verified a running `center → spiral` command and confirmed explicit STOP echo `4507`, quit
 `8013`, and return to idle. The run was deliberately stopped around 100 ml of a 200 ml target, so it
@@ -78,9 +93,10 @@ xBloom's detailed support guide links the five share pages used for bundled asse
 - [Black tea](https://share-h5-test-cn.xbloomcoffee.cn/?id=ysyArYOVGRv3I7SulAsmXA%3D%3D)
 - [Oolong tea](https://share-h5-test-cn.xbloomcoffee.cn/?id=ZjhJp8TorA3kS9dFjZWgWA%3D%3D)
 
-The public response distinguishes the 90 ml programmed stage value from the displayed 120 ml
-per-steep output. It is test/public infrastructure, so the bundled snapshot is authoritative for
-this release while future Agents should re-check the live source before claiming it is unchanged.
+The public response distinguishes the 90 ml programmed stage value from the displayed approximate
+120 ml per-steep output. It is test/public infrastructure, so the bundled files pin that public
+snapshot. Current account records can differ—the 2026-07-14 China catalog included 80 ml second
+stages—so future Agents must identify which source the user chose rather than silently merging them.
 
 ## Public recipe research examples
 

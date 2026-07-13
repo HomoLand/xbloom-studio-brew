@@ -113,13 +113,18 @@ def test_guard_accepts_app_bypass_rt_and_pre_ground(tmp_path):
     assert recipe.bypass_temp_c == 20
 
 
-def test_guard_rejects_low_numeric_bypass_temperature(tmp_path):
+def test_guard_accepts_app_numeric_bypass_temperature_range(tmp_path):
     data = _hot_mapping()
     data["bypass_ml"] = 30
     data["bypass_temp_c"] = 60
     data["water_ml"] = int(data["hot_water_ml"]) + 30
-    with pytest.raises(SafetyError, match="bypass temperature"):
-        load_strict_recipe(_write(tmp_path, data))
+    assert load_strict_recipe(_write(tmp_path, data)).bypass_temp_c == 60
+
+
+def test_guard_accepts_official_low_temperature_iced_pour(tmp_path):
+    data = _hot_mapping()
+    data["pours"][0]["temp_c"] = 71
+    assert load_strict_recipe(_write(tmp_path, data)).pours[0].temp_c == 71
 
 
 def test_slot_guard_rejects_recipe_bypass_instead_of_dropping_it(tmp_path):

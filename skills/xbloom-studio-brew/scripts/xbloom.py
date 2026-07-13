@@ -37,6 +37,8 @@ GRINDER_STATE_FILE = STATE_DIR / "grinder-rest-state.json"
 CATALOG_FILE = STATE_DIR / "catalog" / "catalog.json"
 CATALOG_PATH_ENV = "XBLOOM_CATALOG_PATH"
 CLOUD_CONFIG_ENV = "XBLOOM_CLOUD_CONFIG"
+ACCOUNT_EMAIL_ENV = "XBLOOM_ACCOUNT_EMAIL"
+ACCOUNT_PASSWORD_ENV = "XBLOOM_ACCOUNT_PASSWORD"
 REMOTE_START_ENV = "XBLOOM_ENABLE_REMOTE_START"
 REMOTE_START_SENTINEL = "I_UNDERSTAND_REMOTE_HOT_WATER"
 REMOTE_GRINDER_ENV = "XBLOOM_ENABLE_REMOTE_GRINDER"
@@ -81,7 +83,10 @@ def reexec_in_local_runtime() -> None:
         return
     env = dict(os.environ)
     env["XBLOOM_SKILL_REEXEC"] = "1"
-    raise SystemExit(subprocess.call([str(target), __file__, *sys.argv[1:]], env=env, cwd=ROOT))
+    # Preserve the invoking terminal's working directory. Recipe/config paths
+    # are user inputs and must not change meaning merely because dependencies
+    # are provided by the external runtime.
+    raise SystemExit(subprocess.call([str(target), __file__, *sys.argv[1:]], env=env))
 
 
 def emit(data: dict[str, Any]) -> None:
@@ -351,6 +356,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     cloud_config_exists = bool(
         cloud_config_value and Path(cloud_config_value).expanduser().is_file()
     )
+    account_email_configured = bool(os.environ.get(ACCOUNT_EMAIL_ENV))
+    account_password_configured = bool(os.environ.get(ACCOUNT_PASSWORD_ENV))
     try:
         runtime_location = (
             "external"
@@ -381,6 +388,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "coffee_bypass": True,
             "coffee_temperature_modes": ["RT", "40-95 C", "BP"],
             "tea_recipe": (ROOT / "scripts" / "xbloom_ble" / "tea.py").exists(),
+            "tea_volume_semantics": {
+                "stage_ml": "programmed_chamber_fill",
+                "approx_120ml_per_steep": "firmware_managed_siphon_finish",
+                "generic_recipe_bypass": False,
+            },
             "scale": True,
             "grinder": True,
             "temperature_water": True,
@@ -407,9 +419,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 ROOT / "scripts" / "xbloom_catalog.py"
             ).exists(),
             "catalog_scope": "own-account-region-visible",
-            "catalog_cloud_sync": "explicit_authorized_app_form",
+            "catalog_cloud_sync": "ephemeral_login_or_explicit_authorized_app_form",
+            "catalog_account_targets": [
+                "official-coffee",
+                "official-tea",
+                "created-coffee-and-tea",
+                "product-xpod",
+                "shared",
+            ],
+            "catalog_cloud_push": "preview_default_idempotent_add_only",
             "catalog_path": str(catalog_path),
             "catalog_cloud_configured": cloud_config_exists,
+            "catalog_login_email_configured": account_email_configured,
+            "catalog_login_password_configured": account_password_configured,
+            "catalog_login_configured": (
+                account_email_configured and account_password_configured
+            ),
             "freesolo_live_adjust_protocol": True,
             "freesolo_live_adjust_hardware_verified": False,
             "freesolo_live_pattern_hardware_verified": True,
@@ -599,17 +624,25 @@ def cmd_catalog(args: argparse.Namespace) -> int:
     """Operate the private, user-local recipe catalog without touching BLE."""
 
     from xbloom_catalog import (
+        ACCOUNT_EMAIL_ENV,
+        ACCOUNT_PASSWORD_ENV,
         CLOUD_CONFIG_ENV,
+        CLOUD_WRITE_CONFIRM_SENTINEL,
+        DEFAULT_ACCOUNT_TARGETS,
         catalog_summary,
+        cloud_recipe_preview,
         default_catalog_path,
         export_entry,
         get_entry,
         import_json_file,
         list_entries,
         load_catalog,
+        load_cloud_recipe,
         load_cloud_config,
+        push_cloud_recipe_with_login,
         save_catalog,
         sync_cloud,
+        sync_cloud_with_login,
     )
 
     configured_path = getattr(args, "catalog_file", None)
@@ -706,7 +739,7 @@ def cmd_catalog(args: argparse.Namespace) -> int:
         result = sync_cloud(
             catalog,
             config,
-            include=args.include or ("coffee", "tea"),
+            include=args.include or DEFAULT_ACCOUNT_TARGETS,
             timeout=args.timeout,
         )
         save_catalog(catalog, catalog_path)
@@ -716,6 +749,95 @@ def cmd_catalog(args: argparse.Namespace) -> int:
                 "action": action,
                 "status": "synced",
                 "path": str(catalog_path),
+                **result,
+            }
+        )
+        return 0
+    if action == "login-sync":
+        email = args.email or os.environ.get(ACCOUNT_EMAIL_ENV)
+        if not email:
+            raise RuntimeError(
+                f"catalog login-sync requires --email or {ACCOUNT_EMAIL_ENV}"
+            )
+        password = os.environ.get(ACCOUNT_PASSWORD_ENV)
+        if not password:
+            if not sys.stdin.isatty():
+                raise RuntimeError(
+                    f"catalog login-sync requires {ACCOUNT_PASSWORD_ENV} in non-interactive use; "
+                    "passwords are intentionally not accepted as command arguments"
+                )
+            import getpass
+
+            password = getpass.getpass("xBloom account password: ")
+        result = sync_cloud_with_login(
+            catalog,
+            email=email,
+            password=password,
+            region=args.region,
+            include=args.include or DEFAULT_ACCOUNT_TARGETS,
+            language_type={"en": 0, "zh-cn": 3}[args.language],
+            timeout=args.timeout,
+        )
+        save_catalog(catalog, catalog_path)
+        emit(
+            {
+                "command": "catalog",
+                "action": action,
+                "status": "synced",
+                "path": str(catalog_path),
+                **result,
+            }
+        )
+        return 0
+    if action == "push":
+        recipe_path, recipe = load_cloud_recipe(args.recipe)
+        preview = cloud_recipe_preview(recipe)
+        if not args.apply:
+            emit(
+                {
+                    "command": "catalog",
+                    "action": action,
+                    "status": "preview",
+                    "recipe_path": str(recipe_path),
+                    **preview,
+                }
+            )
+            return 0
+        if args.confirm_write != CLOUD_WRITE_CONFIRM_SENTINEL:
+            raise RuntimeError(
+                "catalog push --apply requires --confirm-write "
+                f"{CLOUD_WRITE_CONFIRM_SENTINEL}"
+            )
+        email = args.email or os.environ.get(ACCOUNT_EMAIL_ENV)
+        if not email:
+            raise RuntimeError(
+                f"catalog push --apply requires --email or {ACCOUNT_EMAIL_ENV}"
+            )
+        password = os.environ.get(ACCOUNT_PASSWORD_ENV)
+        if not password:
+            if not sys.stdin.isatty():
+                raise RuntimeError(
+                    f"catalog push --apply requires {ACCOUNT_PASSWORD_ENV} in "
+                    "non-interactive use; passwords are intentionally not accepted "
+                    "as command arguments"
+                )
+            import getpass
+
+            password = getpass.getpass("xBloom account password: ")
+        result = push_cloud_recipe_with_login(
+            recipe,
+            email=email,
+            password=password,
+            region=args.region,
+            confirm_write=args.confirm_write,
+            language_type={"en": 0, "zh-cn": 3}[args.language],
+            timeout=args.timeout,
+        )
+        emit(
+            {
+                "command": "catalog",
+                "action": action,
+                "recipe_path": str(recipe_path),
                 **result,
             }
         )
@@ -1847,11 +1969,78 @@ def build_parser() -> argparse.ArgumentParser:
     catalog_sync.add_argument(
         "--include",
         action="append",
-        choices=("coffee", "tea", "easy", "easy-default"),
+        choices=(
+            "coffee",
+            "tea",
+            "created",
+            "product",
+            "shared",
+            "easy",
+            "easy-default",
+        ),
         default=None,
-        help="repeat to select targets; defaults to coffee and tea",
+        help="repeat to select targets; defaults to every account recipe category",
     )
     catalog_sync.add_argument("--timeout", type=float, default=20.0)
+    catalog_login_sync = catalog_sub.add_parser(
+        "login-sync",
+        help="ephemerally login and read official, created, product, and shared recipes",
+    )
+    catalog_login_sync.add_argument(
+        "--email",
+        help="account email; may instead use XBLOOM_ACCOUNT_EMAIL",
+    )
+    catalog_login_sync.add_argument(
+        "--region",
+        choices=("international", "china"),
+        required=True,
+        help="account tenant; APK defaults first-login Simplified Chinese users to china",
+    )
+    catalog_login_sync.add_argument(
+        "--language",
+        choices=("en", "zh-cn"),
+        default="en",
+        help="catalog response language",
+    )
+    catalog_login_sync.add_argument(
+        "--include",
+        action="append",
+        choices=("coffee", "tea", "created", "product", "shared"),
+        default=None,
+        help="repeat to select targets; defaults to every account recipe category",
+    )
+    catalog_login_sync.add_argument("--timeout", type=float, default=20.0)
+    catalog_push = catalog_sub.add_parser(
+        "push",
+        help="preview an add-only local-to-account recipe sync; --apply writes remotely",
+    )
+    catalog_push.add_argument("recipe", help="guarded local coffee or tea YAML/JSON")
+    catalog_push.add_argument(
+        "--email",
+        help="account email for --apply; may instead use XBLOOM_ACCOUNT_EMAIL",
+    )
+    catalog_push.add_argument(
+        "--region",
+        choices=("international", "china"),
+        required=True,
+        help="account tenant; preview uses it only as explicit operator context",
+    )
+    catalog_push.add_argument(
+        "--language",
+        choices=("en", "zh-cn"),
+        default="en",
+    )
+    catalog_push.add_argument(
+        "--apply",
+        action="store_true",
+        help="perform the remote idempotent add after the preview has been reviewed",
+    )
+    catalog_push.add_argument(
+        "--confirm-write",
+        default="",
+        help="with --apply, must be exactly: own-account-cloud-recipe",
+    )
+    catalog_push.add_argument("--timeout", type=float, default=20.0)
     load = sub.add_parser("load", help="load and arm a recipe; never starts brewing")
     load.add_argument("recipe")
     monitor = sub.add_parser("monitor", help="stream status/weights without starting")

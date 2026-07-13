@@ -223,6 +223,12 @@ def test_official_green_tea_blob_is_byte_exact():
     assert code.hex() == "105a550100ec0078235a550000f100002332c2"
 
 
+def test_tea_suffix_tracks_programmed_water_ratio_not_finished_120ml_display():
+    code = build_tea_recipe_code(GREEN_POURS, grand_water=42.5)
+    # 42.5 * 10 = 425; Java byteValue keeps the low byte, 0xa9.
+    assert code[-2:] == bytes.fromhex("32a9")
+
+
 def test_tea_pause_minute_encoding_matches_native_transform():
     code = build_tea_recipe_code(
         [{"ml": 90, "temp": 99, "pattern": "ring", "pause": 120, "flow": 3.5}]

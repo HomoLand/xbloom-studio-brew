@@ -6,12 +6,18 @@ from pathlib import Path
 import pytest
 
 import xbloom
+import xbloom_catalog
 from xbloom_ble.recipe import Recipe
 from xbloom_ble.tea import TeaRecipe
 from xbloom_catalog import (
+    APP_RSA_PUBLIC_KEY_B64,
+    CLOUD_WRITE_CONFIRM_SENTINEL,
+    DEFAULT_ACCOUNT_TARGETS,
     CatalogError,
     app_encrypt_form,
+    build_cloud_recipe_form,
     catalog_summary,
+    cloud_recipe_preview,
     empty_catalog,
     export_entry,
     get_entry,
@@ -19,9 +25,12 @@ from xbloom_catalog import (
     import_payload,
     list_entries,
     load_catalog,
+    load_cloud_recipe,
     load_cloud_config,
+    push_cloud_recipe_with_login,
     save_catalog,
     sync_cloud,
+    sync_cloud_with_login,
 )
 from xbloom_safety import strict_validate
 
@@ -233,6 +242,23 @@ def test_fractional_app_dose_is_retained_as_reference_without_truncation():
     assert "whole grams" in entry["validation_errors"][0]
 
 
+def test_one_ml_app_ratio_rounding_is_derived_from_pours_with_warning():
+    catalog = empty_catalog()
+    raw = _coffee()
+    raw["grandWater"] = 16.5
+    raw["pourList"][-1]["volume"] = 97
+    import_payload(catalog, {"list": [raw]})
+    entry = get_entry(catalog, "101")
+    assert sum(pour["ml"] for pour in entry["recipe"]["pours"]) == 247
+    assert "ratio" not in entry["recipe"]
+    assert entry["executable"] is True
+    assert entry["slot_compatible"] is True
+    assert any(
+        "differs from the integer pour total by 1 ml" in warning
+        for warning in entry["warnings"]
+    )
+
+
 def test_tea_bypass_is_reference_only_instead_of_silently_dropped():
     catalog = empty_catalog()
     import_payload(
@@ -251,6 +277,28 @@ def test_tea_bypass_is_reference_only_instead_of_silently_dropped():
     entry = get_entry(catalog, "202")
     assert entry["executable"] is False
     assert "cannot represent" in entry["validation_errors"][0]
+
+
+def test_disabled_tea_bypass_residue_is_ignored_like_the_app():
+    catalog = empty_catalog()
+    import_payload(
+        catalog,
+        {
+            "list": [
+                {
+                    **_tea(),
+                    "isEnableBypassWater": 2,
+                    "bypassVolume": 5,
+                    "bypassTemp": 40,
+                }
+            ]
+        },
+    )
+    entry = get_entry(catalog, "202")
+    assert entry["executable"] is True
+    assert entry["slot_compatible"] is False
+    assert entry["validation_errors"] == []
+    assert "disabled app bypass values were ignored" in entry["warnings"]
 
 
 def test_disabled_app_bypass_values_are_not_accidentally_enabled():
@@ -329,6 +377,12 @@ def test_import_skips_bad_records_but_reports_rejections():
 
 
 def test_app_encryption_is_chunked_rsa_and_hides_plaintext():
+    assert APP_RSA_PUBLIC_KEY_B64 == (
+        "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC4LF40GZ72SdhMyl765K/i4nY5"
+        "CPcHz2Q1IKWKZ9S79xmK7G8pUhbVf4EZLvnNF1+9IvOFQUKV5Z7ZNNviqSpnql9t"
+        "AT+8+J/He0R7pcirvVSxgdr2i9V/C/gmqAEZ5qVTzRnd3uWdFoKzPdEBxP0IporJ1"
+        "VBbCv90yBSOhVxO+QIDAQAB"
+    )
     encrypted = app_encrypt_form(
         {"token": "visible-only-before-encryption", "padding": "x" * 200},
         randbytes=lambda length: b"\x01" * length,
@@ -338,7 +392,7 @@ def test_app_encryption_is_chunked_rsa_and_hides_plaintext():
     assert len(ciphertext) % 128 == 0
     assert b"visible-only-before-encryption" not in ciphertext
     assert hashlib.sha256(encrypted.encode("ascii")).hexdigest() == (
-        "f577066fb2da960f47aba7c44b8c88f6750ee25d80babe0a3abb7c0c82d6eb2d"
+        "ccd5005bf1516569d08d4c1f47e2e6f3b732c8c7efe9cffcdedfa7c3f225297c"
     )
 
 
@@ -389,6 +443,137 @@ def test_cloud_sync_uses_explicit_config_and_imports_only_normalised_response(tm
     assert result["scope"] == "own-account-region-visible"
     assert result["total"] == 1
     assert "private-token" not in json.dumps(catalog)
+
+
+def test_login_sync_uses_app_forms_and_never_returns_or_persists_credentials(monkeypatch):
+    email = "account@example.test"
+    password = "private-password"
+    token = "private-session-token"
+    observed = []
+
+    def request(**kwargs):
+        observed.append(kwargs)
+        if kwargs["endpoint"] == xbloom_catalog.LOGIN_ENDPOINT:
+            form = kwargs["form"]
+            assert form["email"] == email
+            assert form["password"] == password
+            assert form["jpushId"] == ""
+            assert form["token"] == ""
+            assert form["memberId"] == 0
+            assert form["interfaceVersion"] == xbloom_catalog.LOGIN_INTERFACE_VERSION
+            return {
+                "result": "success",
+                "resultCode": 0,
+                "token": token,
+                "member": {"tableId": 42, "email": email},
+                "projectToken": "unused-project-token",
+                "projectRefreshToken": "unused-refresh-token",
+            }
+        form = kwargs["form"]
+        assert kwargs["endpoint"] == xbloom_catalog.ENDPOINTS["coffee"]
+        assert form["token"] == token
+        assert form["memberId"] == 42
+        assert form["clientSecretStr"] == "fixed-client-id"
+        assert form["interfaceVersion"] == xbloom_catalog.CATALOG_INTERFACE_VERSION
+        return {"list": [_coffee()]}
+
+    monkeypatch.setattr(xbloom_catalog, "_cloud_request", request)
+    catalog = empty_catalog()
+    result = sync_cloud_with_login(
+        catalog,
+        email=email,
+        password=password,
+        region="international",
+        include=("coffee",),
+        language_type=3,
+        client_secret="fixed-client-id",
+    )
+
+    assert [call["endpoint"] for call in observed] == [
+        xbloom_catalog.LOGIN_ENDPOINT,
+        xbloom_catalog.ENDPOINTS["coffee"],
+    ]
+    assert result["authenticated"] is True
+    assert result["credentials_persisted"] is False
+    assert result["session_persisted"] is False
+    serialised = json.dumps({"result": result, "catalog": catalog})
+    for secret in (email, password, token, "unused-project-token", "fixed-client-id"):
+        assert secret not in serialised
+
+
+def test_login_sync_rejection_is_redacted(monkeypatch):
+    email = "account@example.test"
+    password = "private-password"
+
+    def rejected(**_kwargs):
+        return {
+            "result": "fail",
+            "resultCode": 40001,
+            "info": f"bad account {email} {password}",
+        }
+
+    monkeypatch.setattr(xbloom_catalog, "_cloud_request", rejected)
+    with pytest.raises(CatalogError, match="resultCode=40001") as raised:
+        sync_cloud_with_login(
+            empty_catalog(),
+            email=email,
+            password=password,
+            include=("coffee",),
+        )
+    assert email not in str(raised.value)
+    assert password not in str(raised.value)
+
+
+def test_login_sync_cli_reads_password_only_from_environment(
+    monkeypatch, tmp_path, capsys
+):
+    email = "account@example.test"
+    password = "private-password"
+    observed = {}
+
+    def sync(catalog, **kwargs):
+        observed.update(kwargs)
+        return {
+            "scope": "own-account-region-visible",
+            "region": kwargs["region"],
+            "targets": [],
+            "total": 0,
+            "coffee": 0,
+            "tea": 0,
+            "executable": 0,
+            "slot_compatible": 0,
+            "updated_at": catalog["updated_at"],
+            "authenticated": True,
+            "credentials_persisted": False,
+            "session_persisted": False,
+        }
+
+    monkeypatch.setattr(xbloom, "reexec_in_local_runtime", lambda: None)
+    monkeypatch.setattr(xbloom_catalog, "sync_cloud_with_login", sync)
+    monkeypatch.setenv(xbloom.ACCOUNT_EMAIL_ENV, email)
+    monkeypatch.setenv(xbloom.ACCOUNT_PASSWORD_ENV, password)
+    path = tmp_path / "catalog.json"
+    assert xbloom.main(
+        [
+            "catalog",
+            "--catalog-file",
+            str(path),
+            "login-sync",
+            "--region",
+            "china",
+            "--language",
+            "zh-cn",
+        ]
+    ) == 0
+    output = capsys.readouterr().out
+    assert observed["email"] == email
+    assert observed["password"] == password
+    assert observed["language_type"] == 3
+    assert email not in output
+    assert password not in output
+    saved = path.read_text(encoding="utf-8")
+    assert email not in saved
+    assert password not in saved
 
 
 def test_cloud_config_rejects_wrong_field_types_and_non_studio_sync(tmp_path):
@@ -491,3 +676,253 @@ def test_catalog_cli_status_does_not_invent_an_update_time(
     status = json.loads(capsys.readouterr().out)
     assert status["exists"] is False
     assert status["updated_at"] is None
+
+
+def test_account_sync_targets_cover_official_created_product_and_empty_shared(
+    monkeypatch,
+):
+    responses = {
+        xbloom_catalog.ENDPOINTS["coffee"]: {"list": [_coffee()]},
+        xbloom_catalog.ENDPOINTS["tea"]: {"list": [_tea()]},
+        xbloom_catalog.ENDPOINTS["created"]: {
+            "result": "success",
+            "list": [
+                {
+                    **_coffee(table_id=303),
+                    "theName": "My Coffee",
+                    "appPlace": [4],
+                }
+            ],
+        },
+        xbloom_catalog.ENDPOINTS["product"]: {
+            "result": "success",
+            "list": [
+                {
+                    **_coffee(table_id=404, cup_type=1),
+                    "theName": "My xPod",
+                }
+            ],
+        },
+        xbloom_catalog.ENDPOINTS["shared"]: {"result": "success", "list": []},
+    }
+    calls = []
+
+    def request(**kwargs):
+        calls.append(kwargs["endpoint"])
+        return responses[kwargs["endpoint"]]
+
+    monkeypatch.setattr(xbloom_catalog, "_cloud_request", request)
+    catalog = empty_catalog()
+    result = sync_cloud(
+        catalog,
+        {
+            "region": "china",
+            "adapted_model": 1,
+            "base_form": {"token": "session", "memberId": 42},
+        },
+    )
+
+    assert tuple(target["target"] for target in result["targets"]) == DEFAULT_ACCOUNT_TARGETS
+    assert calls == [xbloom_catalog.ENDPOINTS[target] for target in DEFAULT_ACCOUNT_TARGETS]
+    assert result["total"] == 4
+    assert get_entry(catalog, "303")["origin"] == "user-created"
+    assert get_entry(catalog, "404")["origin"] == "xpod"
+    assert result["targets"][-1]["candidates"] == 0
+
+
+def test_tea_cloud_form_keeps_finished_output_out_of_programmed_pours():
+    recipe = TeaRecipe.from_dict(
+        {
+            "name": "Two-stage tea",
+            "kind": "tea",
+            "leaf_g": 4,
+            "output_ml_per_steep": 120,
+            "pours": [
+                {"ml": 90, "temp_c": 90, "pause_s": 20, "flow_ml_s": 3.5},
+                {"ml": 80, "temp_c": 90, "pause_s": 15, "flow_ml_s": 3.5},
+            ],
+        }
+    )
+    form = build_cloud_recipe_form(recipe)
+    pours = json.loads(form["pourDataJSONStr"])
+
+    assert [pour["volume"] for pour in pours] == [90.0, 80.0]
+    assert form["grandWater"] == 42.5
+    assert form["isEnableBypassWater"] == 2
+    assert form["bypassVolume"] == 5.0
+    assert "output_ml_per_steep" not in form
+    preview = cloud_recipe_preview(recipe)
+    assert preview["write_performed"] is False
+    assert preview["confirmation_required"] == CLOUD_WRITE_CONFIRM_SENTINEL
+    assert any("firmware owns" in warning for warning in preview["warnings"])
+
+
+def test_coffee_cloud_form_accepts_public_omni_dripper_name():
+    mapping = xbloom_catalog.normalise_entry(_coffee())["recipe"]
+    mapping["dripper"] = "Omni Dripper 2"
+
+    form = build_cloud_recipe_form(Recipe.from_dict(mapping))
+
+    assert form["cupType"] == 2
+
+
+def test_coffee_cloud_form_refuses_lossy_multiple_rpm_mapping():
+    recipe = Recipe.from_dict(
+        {
+            "name": "Mixed RPM",
+            "dose_g": 10,
+            "grind": 60,
+            "pours": [
+                {
+                    "ml": 50,
+                    "temp_c": 92,
+                    "pattern": "spiral",
+                    "rpm": 80,
+                    "flow_ml_s": 3.2,
+                },
+                {
+                    "ml": 100,
+                    "temp_c": 90,
+                    "pattern": "circular",
+                    "rpm": 100,
+                    "flow_ml_s": 3.2,
+                },
+            ],
+        }
+    )
+    with pytest.raises(CatalogError, match="one global RPM"):
+        build_cloud_recipe_form(recipe)
+
+
+def test_cloud_push_gate_prevents_login_or_write(monkeypatch):
+    recipe = Recipe.from_dict(xbloom_catalog.normalise_entry(_coffee())["recipe"])
+
+    def unexpected(**_kwargs):
+        raise AssertionError("confirmation must be checked before any request")
+
+    monkeypatch.setattr(xbloom_catalog, "_cloud_request", unexpected)
+    with pytest.raises(CatalogError, match="exact confirmation"):
+        push_cloud_recipe_with_login(
+            recipe,
+            email="account@example.test",
+            password="private-password",
+            region="china",
+            confirm_write="",
+        )
+
+
+def test_cloud_push_is_idempotent_and_never_returns_session_secrets(monkeypatch):
+    email = "account@example.test"
+    password = "private-password"
+    token = "private-session-token"
+    remote = {**_coffee(), "appPlace": [4]}
+    calls = []
+
+    def request(**kwargs):
+        calls.append(kwargs)
+        if kwargs["endpoint"] == xbloom_catalog.LOGIN_ENDPOINT:
+            return {
+                "result": "success",
+                "token": token,
+                "member": {"tableId": 42},
+            }
+        if kwargs["endpoint"] == xbloom_catalog.ENDPOINTS["created"]:
+            return {"result": "success", "list": [remote]}
+        raise AssertionError("an already-present recipe must not be added again")
+
+    monkeypatch.setattr(xbloom_catalog, "_cloud_request", request)
+    recipe = Recipe.from_dict(xbloom_catalog.normalise_entry(remote)["recipe"])
+    result = push_cloud_recipe_with_login(
+        recipe,
+        email=email,
+        password=password,
+        region="china",
+        confirm_write=CLOUD_WRITE_CONFIRM_SENTINEL,
+        client_secret="fixed-client-id",
+    )
+
+    assert result["status"] == "already-present"
+    assert result["write_performed"] is False
+    assert [call["endpoint"] for call in calls] == [
+        xbloom_catalog.LOGIN_ENDPOINT,
+        xbloom_catalog.ENDPOINTS["created"],
+    ]
+    serialised = json.dumps(result)
+    for secret in (email, password, token, "fixed-client-id"):
+        assert secret not in serialised
+
+
+def test_cloud_push_tea_uses_recipe_add_form_but_test_never_writes_live(monkeypatch):
+    observed = []
+
+    def request(**kwargs):
+        observed.append(kwargs)
+        if kwargs["endpoint"] == xbloom_catalog.LOGIN_ENDPOINT:
+            return {
+                "result": "success",
+                "token": "session",
+                "member": {"tableId": 42},
+            }
+        if kwargs["endpoint"] == xbloom_catalog.ENDPOINTS["created"]:
+            return {"result": "success", "list": []}
+        assert kwargs["endpoint"] == xbloom_catalog.RECIPE_ADD_ENDPOINT
+        return {"result": "success", "tableId": 999}
+
+    monkeypatch.setattr(xbloom_catalog, "_cloud_request", request)
+    recipe = TeaRecipe.from_dict(
+        {
+            "name": "Local green tea",
+            "kind": "tea",
+            "leaf_g": 4,
+            "output_ml_per_steep": 120,
+            "pours": [
+                {"ml": 90, "temp_c": 85, "pause_s": 20, "flow_ml_s": 3.5}
+            ],
+        }
+    )
+    result = push_cloud_recipe_with_login(
+        recipe,
+        email="account@example.test",
+        password="private-password",
+        region="china",
+        confirm_write=CLOUD_WRITE_CONFIRM_SENTINEL,
+    )
+
+    write = observed[-1]
+    assert write["endpoint"] == xbloom_catalog.RECIPE_ADD_ENDPOINT
+    assert write["form"]["interfaceVersion"] == xbloom_catalog.RECIPE_WRITE_INTERFACE_VERSION
+    assert write["form"]["creatorId"] == 42
+    assert write["form"]["grandWater"] == 22.5
+    assert json.loads(write["form"]["pourDataJSONStr"])[0]["volume"] == 90.0
+    assert result["status"] == "created"
+    assert result["remote_table_id"] == 999
+    assert result["write_performed"] is True
+
+
+def test_catalog_push_defaults_to_offline_preview_without_credentials(
+    monkeypatch, tmp_path, capsys
+):
+    source = tmp_path / "tea.json"
+    source.write_text(
+        json.dumps(
+            {
+                "name": "Preview tea",
+                "kind": "tea",
+                "leaf_g": 4,
+                "output_ml_per_steep": 120,
+                "pours": [
+                    {"ml": 90, "temp_c": 85, "pause_s": 20, "flow_ml_s": 3.5}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(xbloom, "reexec_in_local_runtime", lambda: None)
+    monkeypatch.delenv(xbloom.ACCOUNT_EMAIL_ENV, raising=False)
+    monkeypatch.delenv(xbloom.ACCOUNT_PASSWORD_ENV, raising=False)
+
+    assert xbloom.main(["catalog", "push", str(source), "--region", "china"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "preview"
+    assert output["write_performed"] is False
+    assert output["app_recipe_form"]["theName"] == "Preview tea"
