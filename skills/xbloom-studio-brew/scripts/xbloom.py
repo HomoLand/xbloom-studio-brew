@@ -65,7 +65,14 @@ def reexec_in_local_runtime() -> None:
 
 
 def emit(data: dict[str, Any]) -> None:
-    print(json.dumps(data, ensure_ascii=False, sort_keys=True))
+    payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+    try:
+        print(payload, flush=True)
+    except UnicodeEncodeError:
+        # Windows gateway/terminal sessions may still expose a legacy code page.
+        # Preserve valid JSON by escaping only when the active stream cannot
+        # represent a device name or decoded diagnostic character.
+        print(json.dumps(data, ensure_ascii=True, sort_keys=True), flush=True)
 
 
 def parse_water_temperature(value: str) -> int:

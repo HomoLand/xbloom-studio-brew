@@ -150,7 +150,7 @@ cd skills/xbloom-studio-brew
 python scripts/bootstrap.py --dev
 ```
 
-The current suite contains 167 passing tests and 4 hardware/platform skips. Release tests never
+The current suite contains 168 passing tests and 4 hardware/platform skips. Release tests never
 activate the grinder or dispense hot water; the scale enter/read/exit path is hardware-verified on
 firmware `V12.0D.500`.
 

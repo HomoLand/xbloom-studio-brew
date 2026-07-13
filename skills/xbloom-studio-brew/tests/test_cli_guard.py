@@ -5,6 +5,27 @@ import pytest
 import xbloom
 
 
+def test_emit_falls_back_to_ascii_for_legacy_windows_console(monkeypatch):
+    class NarrowConsole:
+        encoding = "gbk"
+
+        def __init__(self):
+            self.text = ""
+
+        def write(self, value):
+            value.encode(self.encoding)
+            self.text += value
+            return len(value)
+
+        def flush(self):
+            return None
+
+    stream = NarrowConsole()
+    monkeypatch.setattr(xbloom.sys, "stdout", stream)
+    xbloom.emit({"device": "XBLOOM \ufffd"})
+    assert "\\ufffd" in stream.text
+
+
 def test_save_slots_parser_accepts_exactly_three_recipes():
     args = xbloom.build_parser().parse_args(["save-slots", "a.yaml", "b.yaml", "c.yaml"])
     assert args.recipes == ["a.yaml", "b.yaml", "c.yaml"]
