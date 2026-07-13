@@ -29,10 +29,11 @@ an alias). ``vibration`` is independent and accepts ``none``, ``before``,
 ``after``, or ``both``. The old ``agitation`` boolean remains readable for
 backward compatibility but should not be used in new recipes. Pour and bypass temperatures accept the
 official ``RT`` (room-temperature pass-through) and ``BP`` (boiling-point) tokens.
-The metadata fields (``dripper``, ``kind``,
-``water_ml``, ``hot_water_ml``, ``ice_g``, ``time``, ``note``, and per-pour
-``label``) are optional context that round-trips through YAML but never reaches
-the machine.
+The metadata fields (``dripper``, ``kind``, ``water_ml``, ``hot_water_ml``,
+``ice_g``, ``time``, ``note``, and per-pour ``label``) are optional context that
+round-trips through YAML but never reaches the machine. In particular,
+``kind: flash-brew`` is a manual-over-ice serving classification, not a distinct
+Studio program.
 """
 
 from __future__ import annotations
@@ -161,9 +162,9 @@ class Recipe:
     sent to the machine and *not* range-checked against hardware limits:
 
     * ``dripper`` — the dripper/brewer used (e.g. "Omni").
-    * ``kind`` — recipe kind / preset base (e.g. "custom", "medium-auto").
+    * ``kind`` — local serving classification; never a device mode.
     * ``water_ml`` — total brew water (may exceed Σ pours for bypass/iced brews).
-    * ``hot_water_ml`` / ``ice_g`` — iced-brew specifics (hot water over ice).
+    * ``hot_water_ml`` / ``ice_g`` — manual-over-ice serving accounting.
     * ``time`` — expected brew time as a display string (e.g. "~2:00").
     * ``note`` — free-text notes about the recipe.
     """

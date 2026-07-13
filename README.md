@@ -45,6 +45,12 @@ Agent Skills-compatible clients.
 - Runs recipe design, catalog import/query, and BLE workflows locally without an app account;
   optional account sync/add uses ephemeral credentials and never stores credentials or raw sessions.
 
+> [!IMPORTANT]
+> Flash brew is a serving method, not a separate xBloom Studio program. The machine runs the same
+> coffee pour-over protocol and dispenses only the programmed water; `kind: flash-brew`, `ice_g`,
+> and final-water accounting are local metadata that tell the user to preload measured ice in the
+> receiving vessel before starting. They are never sent as an iced-mode or ice command.
+
 ## How recipes are produced
 
 ```text
@@ -112,6 +118,11 @@ used by release tests. See the [catalog and A/B/C guide](skills/xbloom-studio-br
 ```text
 hermes skills install HomoLand/xbloom-studio-brew/skills/xbloom-studio-brew
 ```
+
+Release `v1.0.1` and later pass Hermes' community-source guard as `SAFE`; the runtime scripts remain
+fully scanned, while development-only tests and local cache/runtime directories are declared in
+the standard `.skillignore`. The original `v1.0.0` source is functional, but Hermes' installer
+blocked it after mistaking test fixtures and ordinary environment configuration reads for secrets.
 
 ### Other Agent Skills clients
 

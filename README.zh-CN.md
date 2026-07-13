@@ -41,6 +41,11 @@ BLE 控制组合在一起，可用于 Hermes 及其他兼容 Agent Skills 的客
 - 配方设计、目录导入/查询和 BLE 能力都可完全本地运行；可选账号同步/新增使用临时凭据，
   凭据和原始会话都不会写入目录。
 
+> [!IMPORTANT]
+> 闪冲是一种出品方式，不是 xBloom Studio 的独立程序。机器仍执行同一套咖啡热注水协议，
+> 只输出配方中编程的水；`kind: flash-brew`、`ice_g` 和最终水量只是本地出品与安全元数据，
+> 用来提醒用户在启动前把称好的冰放入接收杯，绝不会作为“冰冲模式”或出冰指令发给机器。
+
 ## 配方如何生成
 
 ```text
@@ -102,6 +107,10 @@ python scripts/xbloom.py catalog push recipe.yaml --region china
 ```text
 hermes skills install HomoLand/xbloom-studio-brew/skills/xbloom-studio-brew
 ```
+
+`v1.0.1` 及后续版本在 Hermes 的社区来源安全扫描中为 `SAFE`：实际运行脚本仍会被完整扫描，
+仅通过标准 `.skillignore` 声明开发测试、缓存和本地运行时目录。原始 `v1.0.0` 源码本身可用，
+但 Hermes 安装器会把测试夹具和常规环境配置读取误判成凭据并阻止安装。
 
 ### 其他 Agent Skills 客户端
 

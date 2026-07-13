@@ -1,4 +1,5 @@
 name: Example Bright Flash Brew
+# Local serving metadata only: Studio has no separate iced/flash program.
 kind: flash-brew
 dripper: Omni Dripper 2
 dose_g: 15
@@ -6,9 +7,10 @@ grind: 52
 ratio: 10
 water_ml: 240
 hot_water_ml: 150
+# Weigh this into the receiving vessel before start; the machine never dispenses ice.
 ice_g: 90
 time: "2:00-2:40"
-note: Put 90 g clean ice in the receiving vessel before loading this recipe.
+note: Run the normal coffee pour-over program over 90 g clean ice preloaded before start.
 pours:
   - label: Bloom
     ml: 40

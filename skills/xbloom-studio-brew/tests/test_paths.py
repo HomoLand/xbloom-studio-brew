@@ -25,6 +25,20 @@ def test_state_and_runtime_environment_overrides_are_independent(tmp_path):
     assert xbloom_paths.skill_runtime_dir(environ) == runtime
 
 
+def test_environment_helpers_are_explicit_and_return_a_copy():
+    source = {"XBLOOM_TEST_VALUE": "configured"}
+
+    assert (
+        xbloom_paths.environment_value("XBLOOM_TEST_VALUE", environ=source)
+        == "configured"
+    )
+    assert xbloom_paths.environment_value("MISSING", "fallback", source) == "fallback"
+
+    copied = xbloom_paths.environment_copy(source)
+    copied["XBLOOM_TEST_VALUE"] = "changed"
+    assert source["XBLOOM_TEST_VALUE"] == "configured"
+
+
 def test_runtime_defaults_below_overridden_state(tmp_path):
     state = tmp_path / "agent-state"
 

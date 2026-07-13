@@ -92,14 +92,16 @@ Apply only the smallest relevant adjustment to the chosen roast profile.
 
 ## Build a flash brew
 
-Use `kind: flash-brew` for Japanese-style coffee brewed hot over ice. This is the closest
-automated xBloom option to an iced Americano, but it is not espresso and must be described as
-"Americano-style flash brew" or "冰美式风格闪冲" rather than a true Americano.
+Use `kind: flash-brew` for Japanese-style coffee brewed hot over manually preloaded ice. xBloom
+Studio has no separate flash/iced program: it runs the normal coffee pour-over stages and never
+receives `kind` or `ice_g`. The local fields protect serving math and remind the operator about the
+ice. This is the closest automated xBloom method to an iced Americano, but it is not espresso and
+must be described as "Americano-style flash brew" or "冰美式风格闪冲" rather than a true Americano.
 
 Design from final beverage water first:
 
 1. Choose a final ratio of about 1:15-16 for the first cup.
-2. Put 35-40% of final water into clean ice in the receiving vessel.
+2. Allocate 35-40% of final water to clean ice placed in the receiving vessel before `start`.
 3. Brew the remaining 60-65% as hot water through the coffee.
 4. Use a grind 2-4 steps finer and a temperature 1-2 C hotter than the comparable hot recipe,
    while staying inside the guarded limits.
@@ -116,10 +118,12 @@ Reliable 15 g starting point:
 - RPM: 100.
 
 In flash-brew YAML, `ratio` is the hot machine-water ratio and must equal the sum of pours
-divided by dose. `water_ml` is the final water and must equal `hot_water_ml + ice_g`.
+divided by dose. `water_ml` is the final serving water and must equal `hot_water_ml + ice_g`.
+`kind`, `ice_g`, and final `water_ml` remain local metadata; changing them alone cannot change the
+machine frames.
 
 Do not ask the machine to dispense cold bypass water. Put the measured ice in the receiving
-vessel before loading the recipe. Use a vessel large enough for the final drink and melting ice.
+vessel before starting the recipe. Use a vessel large enough for the final drink and melting ice.
 
 ## Convert C40 clicks
 

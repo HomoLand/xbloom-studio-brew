@@ -162,9 +162,16 @@ def strict_validate(recipe: Recipe) -> None:
             if not 12 <= total_machine_water / float(recipe.dose_g) <= 20:
                 errors.append("hot bypass final water ratio must be 1:12 through 1:20")
         elif not 12 <= machine_ratio <= 20:
-            errors.append("hot recipe ratio must be 1:12 through 1:20")
+            errors.append(
+                "local kind=hot final serving ratio must be 1:12 through 1:20; "
+                "xBloom has no separate flash program, so a concentrated cloud "
+                "program may instead need confirmed local ice metadata"
+            )
         if recipe.ice_g not in (None, 0):
-            errors.append("hot recipes cannot declare ice_g")
+            errors.append(
+                "local kind=hot cannot declare ice_g; use kind=flash-brew only "
+                "for manual vessel-ice metadata, not as a machine mode"
+            )
         if recipe.hot_water_ml is not None and int(recipe.hot_water_ml) != total_hot:
             errors.append("hot_water_ml must equal the extraction-pour total")
         if recipe.water_ml is not None and int(recipe.water_ml) != total_machine_water:
@@ -217,6 +224,9 @@ def recipe_summary(recipe: Recipe, path: str | Path) -> dict[str, Any]:
     return {
         "name": recipe.name,
         "kind": (recipe.kind or "hot"),
+        "machine_program": "coffee-pour-over",
+        "machine_dispenses_ice": False,
+        "manual_preload_ice_g": int(recipe.ice_g or 0),
         "dose_g": int(recipe.dose_g),
         "grind": int(recipe.grind),
         "hot_water_ml": recipe.total_water_ml,

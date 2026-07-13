@@ -213,9 +213,12 @@ one global grinder RPM, so a local coffee file with multiple non-zero RPM values
 than flattened. The APK reads persisted pours ordered by their stage name, so upload replaces local
 display labels with the App's sortable `Bloom`, `Pour 2`, `Pour 3`, ... names; JSON array position
 alone is not sufficient to preserve execution order. Tea uses its corresponding canonical labels.
-For flash brew, the cloud record stores only the hot extraction program: ice mass, final water,
-time, and note remain local/manual preparation, so keep the ice requirement visible in the cloud
-recipe name. Tea uploads contain leaf mass and the programmed 80/90 ml stages; app-display metadata
+For flash brew, the cloud record stores only the same coffee pour-over program used for hot service:
+ice mass, final water, time, and note remain local/manual preparation, so keep the ice requirement
+visible in the cloud recipe name. A downloaded concentrated recipe whose name mentions ice is not
+necessarily stored incorrectly; it is incomplete for guarded local execution until the user confirms
+the ice mass/final target and creates a local `flash-brew` wrapper around the unchanged stages. Tea
+uploads contain leaf mass and the programmed 80/90 ml stages; app-display metadata
 such as `output_ml_per_steep` is not a machine or cloud stage field. Disabled tea bypass placeholders
 are compatibility residue and are never interpreted as an extra pour.
 

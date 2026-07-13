@@ -106,8 +106,8 @@ Do not generalize the existing running `center -> spiral` evidence to these path
 
 - [ ] Run one complete conservative hot coffee and compare recipe target, machine water meter, and
   cup-scale delta through natural terminal cleanup.
-- [ ] Run one flash brew only when measured ice and the receiving vessel are ready; ice remains
-  physical preparation, not a cloud/App recipe field.
+- [ ] Run one flash serving only when measured ice and the receiving vessel are ready; Studio runs
+  the normal coffee pour-over program, while ice remains physical preparation outside BLE/App data.
 
 ## Deliberately excluded
 

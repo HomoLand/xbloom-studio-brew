@@ -833,6 +833,58 @@ def test_flash_cloud_preview_discloses_manual_ice_boundary():
     assert any("ordered by stage name" in item for item in preview["warnings"])
 
 
+def test_downloaded_ice_named_program_requires_local_serving_metadata():
+    form = build_cloud_recipe_form(_flash_recipe())
+    raw = {
+        **form,
+        "tableId": 778,
+        "appPlace": [4],
+        "pourList": json.loads(form["pourDataJSONStr"]),
+    }
+    raw.pop("pourDataJSONStr")
+
+    entry = xbloom_catalog.normalise_entry(raw)
+
+    assert entry["machine_program"] == "coffee-pour-over"
+    assert entry["executable"] is False
+    assert entry["manual_preparation"] == {
+        "status": "ice-metadata-required",
+        "ice_g": None,
+        "final_water_ml": None,
+        "machine_dispenses_ice": False,
+        "machine_stages_change_required": False,
+    }
+    assert "same coffee pour-over program" in entry["validation_errors"][0]
+    assert any("not malformed" in item for item in entry["warnings"])
+
+
+def test_loading_legacy_catalog_adds_manual_ice_semantics(tmp_path):
+    form = build_cloud_recipe_form(_flash_recipe())
+    raw = {
+        **form,
+        "tableId": 779,
+        "appPlace": [4],
+        "pourList": json.loads(form["pourDataJSONStr"]),
+    }
+    raw.pop("pourDataJSONStr")
+    entry = xbloom_catalog.normalise_entry(raw)
+    entry.pop("machine_program")
+    entry.pop("manual_preparation")
+    entry["warnings"] = []
+    entry["validation_errors"] = ["legacy ratio error"]
+
+    path = tmp_path / "catalog.json"
+    save_catalog({**empty_catalog(), "entries": [entry]}, path)
+    loaded = load_catalog(path)
+    migrated = get_entry(loaded, "779")
+
+    assert migrated["machine_program"] == "coffee-pour-over"
+    assert migrated["manual_preparation"]["status"] == "ice-metadata-required"
+    assert migrated["validation_errors"][0] == xbloom_catalog.MANUAL_ICE_INCOMPLETE
+    listed = list_entries(loaded)[0]
+    assert listed["manual_preparation"]["machine_dispenses_ice"] is False
+
+
 def test_coffee_cloud_form_refuses_lossy_multiple_rpm_mapping():
     recipe = Recipe.from_dict(
         {
