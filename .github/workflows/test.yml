@@ -11,7 +11,7 @@ permissions:
 jobs:
   test:
     env:
-      XBLOOM_SKILL_STATE_DIR: ${{ runner.temp }}/xbloom-studio-brew-state
+      XBLOOM_SKILL_STATE_DIR: ${{ github.workspace }}/.xbloom-studio-brew-state
     strategy:
       fail-fast: false
       matrix:
