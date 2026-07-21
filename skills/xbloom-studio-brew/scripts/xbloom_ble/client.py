@@ -7,9 +7,10 @@ Safety model: loading and starting are **separate, explicit** operations.
 :meth:`XBloomClient.load_recipe` only *loads* (writes ``a4, a6, a8, 41`` and
 returns once the machine is armed at STATE ``0x1f``) — it never starts a brew, so
 a load can never brew by accident. :meth:`XBloomClient.start` is the deliberate
-"go": it sends commit (``0x42``) + start (``0x46``) to launch the brew remotely,
-exactly like the app's Brew button. :meth:`XBloomClient.brew` is the convenience
-that loads then starts. :meth:`XBloomClient.cancel_brew` aborts (``0x47``).
+"go": it sends commit (``0x42``), observes whether the machine starts automatically,
+and uses the state-sensitive ``0x46`` fallback only after a stable awaiting-confirm
+recheck. :meth:`XBloomClient.brew` is the convenience that loads then starts.
+:meth:`XBloomClient.cancel_brew` aborts (``0x47``).
 
 ⚠️ Starting coffee/tea or standalone water physically dispenses hot water, and
 standalone grinding runs a motor. Public Agent workflows must use the gated CLI,
@@ -574,6 +575,37 @@ class XBloomClient:
             if event.state in states:
                 return event
 
+    async def _observe_commit_outcome(
+        self, acted_states: set[int], timeout: float
+    ) -> tuple[StatusEvent | None, bool]:
+        """Observe a coffee commit without treating transient 0x1e as a stall.
+
+        Firmware V12.0D.500 normally reports ``awaiting_confirm`` immediately before
+        ``starting``. Command 40518 means pause once that transition has happened, so
+        returning on the first 0x1e creates a start/pause race. Consume the complete
+        observation window, returning early only for an acted/refusal state, while
+        remembering whether awaiting-confirm was actually observed.
+        """
+
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        saw_awaiting_confirm = False
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return None, saw_awaiting_confirm
+            try:
+                event = await asyncio.wait_for(self._notif_queue.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return None, saw_awaiting_confirm
+            if event.is_heartbeat:
+                continue
+            log.debug("commit status: %s", event.state_name)
+            if event.state in acted_states:
+                return event, saw_awaiting_confirm
+            if event.state == STATE_AWAITING_CONFIRM:
+                saw_awaiting_confirm = True
+
     async def start(self, *, settle: float = 8.0) -> StatusEvent:
         """Start the currently-armed brew (call :meth:`load_recipe` first).
 
@@ -585,11 +617,13 @@ class XBloomClient:
         * If the machine reaches **grinding (0x22)** or **brewing (0x3b)** on its own,
           the brew is underway — we do **not** send ``0x46`` (sending it into a running
           brew aborts it back to armed — verified on hardware).
-        * Only if it **stalls in awaiting-confirm** do we send the ``0x46`` start frame
-          to nudge it (this is what the vendor app's capture needed).
+        * A transient **awaiting-confirm (0x1e)** is not a stall. We keep observing the
+          full window because tested firmware normally emits ``0x1e -> 0x22``.
+        * Only if no acted state arrives and a new status query still reports
+          awaiting-confirm do we send the ``0x46`` compatibility frame.
 
-        The state-sensitive 40518 compatibility frame is sent only after a fresh
-        ``awaiting_confirm`` report. A silent/unknown commit outcome fails closed.
+        Command 40518 is also pause while running. A silent/unknown commit outcome or
+        an awaiting-confirm state that cannot be freshly revalidated fails closed.
 
         ⚠️ This physically dispenses near-boiling water. Only call it when the machine
         is ready (water/beans/cup in) and someone intends to brew.
@@ -602,26 +636,50 @@ class XBloomClient:
             log.info("→ 0x42 commit (start the brew)")
             await self._client.write_gatt_char(CHAR_COMMAND, build_commit(), response=False)
             # After commit the machine either acts (auto-proceeds to grinding/brewing, or
-            # refuses with no-water/no-beans), or reports awaiting-confirm. In ANY
-            # "acted" case we must NOT send 40518 — the APK names it pause, and hardware
+            # refuses with no-water/no-beans), or remains in awaiting-confirm. A transient
+            # awaiting-confirm is part of the normal V12.0D.500 auto-start sequence. In
+            # ANY acted case we must NOT send 40518: the APK names it pause, and hardware
             # proves that sending it into a running brew aborts back to armed.
             acted = {STATE_STARTING, STATE_BREWING, STATE_NO_WATER, STATE_NO_BEANS}
-            ev = await self._drain_for_any(acted | {STATE_AWAITING_CONFIRM}, settle)
-            if ev is None:
+            ev, saw_awaiting = await self._observe_commit_outcome(acted, settle)
+            if ev is not None:
+                log.info("machine acted on commit (%s) — not sending 40518", ev.state_name)
+                return ev
+            if not saw_awaiting:
                 raise XBloomError(
                     "commit outcome is unconfirmed; refusing state-sensitive 40518 control"
                 )
+
+            # The first 0x1e report is historical by now. Query the current state and
+            # require a fresh 0x1e before using the compatibility control. If the machine
+            # progressed during the observation window, return that state instead.
+            log.info("awaiting-confirm persisted through observation — rechecking current state")
+            await self._client.write_gatt_char(
+                CHAR_COMMAND, build_status_query(), response=False
+            )
+            recheck_timeout = min(2.0, max(0.05, float(settle)), self.ack_timeout)
+            ev = await self._drain_for_any(
+                acted | {STATE_AWAITING_CONFIRM}, recheck_timeout
+            )
+            if ev is None:
+                raise XBloomError(
+                    "machine was awaiting-confirm, but current state could not be revalidated; "
+                    "refusing state-sensitive 40518 control"
+                )
             if ev.state in acted:
-                log.info("machine acted on commit (%s) — not sending 0x46", ev.state_name)
+                log.info("machine acted before recheck (%s) — not sending 40518", ev.state_name)
                 return ev
-            # A fresh awaiting-confirm state makes the hardware-derived start meaning
-            # unambiguous for this instant; only then emit the APK's pause command.
-            log.info("machine explicitly awaiting confirm — → state-sensitive 40518")
+
+            log.info("machine still awaiting confirm after recheck — → state-sensitive 40518")
             await self._client.write_gatt_char(CHAR_COMMAND, build_start(), response=False)
-            ev = await self._drain_for_any(acted, 5.0)
-            if ev is not None:
+            ev = await self._drain_for_any(acted | {STATE_ARMED}, 5.0)
+            if ev is not None and ev.state in acted:
                 log.info("brew started (%s)", ev.state_name)
                 return ev
+            if ev is not None and ev.state == STATE_ARMED:
+                raise XBloomError(
+                    "40518 returned the machine to armed; possible start/pause race"
+                )
             raise XBloomError("40518 was sent from awaiting-confirm, but start is unconfirmed")
         finally:
             await self._stop_notify()

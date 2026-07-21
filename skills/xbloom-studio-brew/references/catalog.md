@@ -204,8 +204,8 @@ python <skill-dir>/scripts/xbloom.py catalog push <recipe.yaml> --region china \
 
 The write path is deliberately **add-only**. It first reads the user's combined created list:
 an identical name and parameter fingerprint returns `already-present` without writing, while the
-same name with different parameters is refused rather than overwritten. Update, delete, share,
-pin, and profile mutation are not exposed. Release tests mock the add endpoint and never mutate a
+same name with different parameters is refused rather than overwritten. Share, pin, overwrite,
+and profile mutation are not exposed. Release tests mock the add endpoint and never mutate a
 live account; every real addition remains an explicitly approved owner action.
 
 Cloud form conversion is stricter than local BLE execution. The Android created-recipe schema has
@@ -221,6 +221,60 @@ the ice mass/final target and creates a local `flash-brew` wrapper around the un
 uploads contain leaf mass and the programmed 80/90 ml stages; app-display metadata
 such as `output_ml_per_steep` is not a machine or cloud stage field. Disabled tea bypass placeholders
 are compatibility residue and are never interpreted as an extra pour.
+
+
+## Delete a created account recipe
+
+`catalog delete` maps to the official App endpoint `tuRecipeDelete.tuhtml`. Preview is offline by
+default and requires either `--table-id` or a local catalog `--id` that resolves to a remote
+tableId:
+
+```text
+python <skill-dir>/scripts/xbloom.py catalog delete --region china --table-id 12345
+python <skill-dir>/scripts/xbloom.py catalog delete --region china --id "My Recipe Name"
+```
+
+Only after the owner explicitly approves that exact delete may an Agent run:
+
+```text
+XBLOOM_ACCOUNT_EMAIL=<own-account-email>
+XBLOOM_ACCOUNT_PASSWORD=<own-account-password>
+python <skill-dir>/scripts/xbloom.py catalog delete --region china --table-id 12345 \
+  --apply --confirm-delete own-account-cloud-recipe-delete
+```
+
+Before writing, the Skill logs in ephemerally, re-reads the member created list, and refuses any
+tableId that is not present there. Optional name matching further refuses a mismatch. Delete is
+irreversible on the account and does not clear machine A/B/C slots or local YAML files. Official,
+product, shared, and other non-owned records must not be targeted.
+
+## Import App brew history into the local journal
+
+The official App stores brew records behind `tuBrewRecordList.tuhtml`. The Skill can import those
+records into the local journal so phone-only brews are still reviewable:
+
+```text
+XBLOOM_ACCOUNT_EMAIL=<own-account-email>
+XBLOOM_ACCOUNT_PASSWORD=<own-account-password>
+python <skill-dir>/scripts/xbloom.py catalog history-sync --region china
+```
+
+Imported rows are marked `source: app-cloud` and are coarser than local BLE telemetry: recipe name,
+dose, brew time, cup type, and create timestamp are preserved; full stage telemetry is not. Local
+Skill-driven runs are written separately by the CLI into:
+
+```text
+~/.xbloom-studio-brew/brew-history.jsonl
+```
+
+Inspect or annotate the journal without BLE:
+
+```text
+python <skill-dir>/scripts/xbloom.py history status
+python <skill-dir>/scripts/xbloom.py history list --limit 20
+python <skill-dir>/scripts/xbloom.py history note <event_id> "brighter citrus, a bit thin"
+```
+
 
 ## A/B/C compatibility
 

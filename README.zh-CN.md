@@ -89,6 +89,10 @@ python scripts/xbloom.py catalog list --kind tea
 python scripts/xbloom.py catalog export <id> recipe.yaml
 python scripts/xbloom.py catalog login-sync --region china --language zh-cn
 python scripts/xbloom.py catalog push recipe.yaml --region china
+python scripts/xbloom.py catalog delete --region china --table-id <id>
+python scripts/xbloom.py catalog history-sync --region china
+python scripts/xbloom.py history status
+python scripts/xbloom.py history list --limit 20
 ```
 
 目录默认保存在安装目录外的 `~/.xbloom-studio-brew/catalog/catalog.json`，不会保留原始
@@ -96,9 +100,7 @@ python scripts/xbloom.py catalog push recipe.yaml --region china
 临时登录、默认五类读取以及两次经所有者明确批准的只新增写入，已于 2026-07-14 在中国区
 现网验证，包括云端回读与零写入幂等复验；凭据和会话只存在于进程内。宿主通过
 `XBLOOM_ACCOUNT_EMAIL` 与 `XBLOOM_ACCOUNT_PASSWORD` 提供账号，密码不接受命令行参数。
-`catalog push` 默认只预览；只有同时给出 `--apply` 与
-`--confirm-write own-account-cloud-recipe` 才会写远端，发布测试从不调用现网写接口。详见
-[目录与 A/B/C 说明](skills/xbloom-studio-brew/references/catalog.md)。
+`catalog push` 默认只预览；只有同时给出 `--apply` 与 `--confirm-write own-account-cloud-recipe` 才会写远端。`catalog delete` 同样默认只预览；只有同时给出 `--apply` 与 `--confirm-delete own-account-cloud-recipe-delete` 才会删除，且只接受当前账号自建列表中的 `tableId`。本地冲泡日志默认写在 `~/.xbloom-studio-brew/brew-history.jsonl`。发布测试不会调用线上写/删接口。详见[目录与 A/B/C 说明](skills/xbloom-studio-brew/references/catalog.md)。
 
 ## 安装
 

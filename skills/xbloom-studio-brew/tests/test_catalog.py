@@ -12,12 +12,16 @@ from xbloom_ble.tea import TeaRecipe
 from xbloom_catalog import (
     APP_RSA_PUBLIC_KEY_B64,
     CLOUD_WRITE_CONFIRM_SENTINEL,
+    CLOUD_DELETE_CONFIRM_SENTINEL,
     DEFAULT_ACCOUNT_TARGETS,
     CatalogError,
     app_encrypt_form,
     build_cloud_recipe_form,
     catalog_summary,
     cloud_recipe_preview,
+    cloud_recipe_delete_preview,
+    delete_cloud_recipe_with_login,
+    fetch_cloud_brew_records_with_login,
     empty_catalog,
     export_entry,
     get_entry,
@@ -1090,3 +1094,199 @@ def test_catalog_push_defaults_to_offline_preview_without_credentials(
     assert output["status"] == "preview"
     assert output["write_performed"] is False
     assert output["app_recipe_form"]["theName"] == "Preview tea"
+
+
+
+def test_cloud_delete_preview_requires_table_id_or_catalog_entry():
+    with pytest.raises(CatalogError, match="positive remote tableId"):
+        cloud_recipe_delete_preview()
+
+
+def test_cloud_delete_gate_prevents_login_or_write(monkeypatch):
+    def unexpected(**_kwargs):
+        raise AssertionError("confirmation must be checked before any request")
+
+    monkeypatch.setattr(xbloom_catalog, "_cloud_request", unexpected)
+    with pytest.raises(CatalogError, match="exact confirmation"):
+        delete_cloud_recipe_with_login(
+            table_id=123,
+            email="account@example.test",
+            password="private-password",
+            region="china",
+            confirm_delete="",
+        )
+
+
+def test_cloud_delete_refuses_unknown_created_table_id(monkeypatch):
+    calls = []
+
+    def request(**kwargs):
+        calls.append(kwargs["endpoint"])
+        if kwargs["endpoint"] == xbloom_catalog.LOGIN_ENDPOINT:
+            return {"result": "success", "token": "session", "member": {"tableId": 42}}
+        if kwargs["endpoint"] == xbloom_catalog.ENDPOINTS["created"]:
+            return {"result": "success", "list": [{**_coffee(table_id=999), "appPlace": [4]}]}
+        raise AssertionError(f"unexpected endpoint {kwargs['endpoint']}")
+
+    monkeypatch.setattr(xbloom_catalog, "_cloud_request", request)
+    with pytest.raises(CatalogError, match="no created-account recipe"):
+        delete_cloud_recipe_with_login(
+            table_id=123,
+            email="account@example.test",
+            password="private-password",
+            region="china",
+            confirm_delete=CLOUD_DELETE_CONFIRM_SENTINEL,
+        )
+    assert calls == [xbloom_catalog.LOGIN_ENDPOINT, xbloom_catalog.ENDPOINTS["created"]]
+
+
+def test_cloud_delete_is_created_list_gated_and_never_returns_session_secrets(monkeypatch):
+    email = "account@example.test"
+    password = "private-password"
+    token = "private-session-token"
+    remote = {**_coffee(table_id=555), "appPlace": [4], "theName": "Owned Coffee"}
+    calls = []
+
+    def request(**kwargs):
+        calls.append(kwargs)
+        if kwargs["endpoint"] == xbloom_catalog.LOGIN_ENDPOINT:
+            return {
+                "result": "success",
+                "token": token,
+                "member": {"tableId": 42},
+            }
+        if kwargs["endpoint"] == xbloom_catalog.ENDPOINTS["created"]:
+            return {"result": "success", "list": [remote]}
+        assert kwargs["endpoint"] == xbloom_catalog.RECIPE_DELETE_ENDPOINT
+        assert kwargs["form"]["tableId"] == 555
+        return {"result": "success"}
+
+    monkeypatch.setattr(xbloom_catalog, "_cloud_request", request)
+    result = delete_cloud_recipe_with_login(
+        table_id=555,
+        email=email,
+        password=password,
+        region="china",
+        confirm_delete=CLOUD_DELETE_CONFIRM_SENTINEL,
+        expected_name="Owned Coffee",
+        client_secret="fixed-client-id",
+    )
+    assert result["status"] == "deleted"
+    assert result["write_performed"] is True
+    assert result["remote_table_id"] == 555
+    assert [call["endpoint"] for call in calls] == [
+        xbloom_catalog.LOGIN_ENDPOINT,
+        xbloom_catalog.ENDPOINTS["created"],
+        xbloom_catalog.RECIPE_DELETE_ENDPOINT,
+    ]
+    serialised = json.dumps(result)
+    for secret in (email, password, token, "fixed-client-id"):
+        assert secret not in serialised
+
+
+def test_catalog_delete_defaults_to_offline_preview_without_credentials(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(xbloom, "reexec_in_local_runtime", lambda: None)
+    monkeypatch.delenv(xbloom.ACCOUNT_EMAIL_ENV, raising=False)
+    monkeypatch.delenv(xbloom.ACCOUNT_PASSWORD_ENV, raising=False)
+    assert (
+        xbloom.main(
+            ["catalog", "delete", "--region", "china", "--table-id", "123"]
+        )
+        == 0
+    )
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "preview"
+    assert output["write_performed"] is False
+    assert output["remote_table_id"] == 123
+    assert output["endpoint"] == "tuRecipeDelete.tuhtml"
+
+
+def test_fetch_cloud_brew_records_normalises_group_payload(monkeypatch):
+    calls = []
+
+    def request(**kwargs):
+        calls.append(kwargs["endpoint"])
+        if kwargs["endpoint"] == xbloom_catalog.LOGIN_ENDPOINT:
+            return {"result": "success", "token": "session", "member": {"tableId": 42}}
+        assert kwargs["endpoint"] == xbloom_catalog.BREW_RECORD_LIST_ENDPOINT
+        return {
+            "result": "success",
+            "gList": [
+                {
+                    "groupName": "2026-07",
+                    "list": [
+                        {
+                            "tableId": 88,
+                            "recipeName": "Morning Flash",
+                            "dose": 15.0,
+                            "brewTime": 125,
+                            "cupType": 2,
+                            "isHavePod": 0,
+                            "createTimeStamp": 1784000000,
+                            "lineChartData": "1,2,3",
+                        }
+                    ],
+                }
+            ],
+        }
+
+    monkeypatch.setattr(xbloom_catalog, "_cloud_request", request)
+    result = fetch_cloud_brew_records_with_login(
+        email="account@example.test",
+        password="private-password",
+        region="china",
+    )
+    assert result["count"] == 1
+    record = result["records"][0]
+    assert record["remote_table_id"] == 88
+    assert record["recipe_name"] == "Morning Flash"
+    assert record["serving_kind"] == "coffee"
+    assert record["has_line_chart"] is True
+    assert calls == [
+        xbloom_catalog.LOGIN_ENDPOINT,
+        xbloom_catalog.BREW_RECORD_LIST_ENDPOINT,
+    ]
+
+
+def test_catalog_history_sync_imports_into_local_journal(monkeypatch, tmp_path, capsys):
+    history_file = tmp_path / "brew-history.jsonl"
+    monkeypatch.setenv(xbloom.HISTORY_PATH_ENV, str(history_file))
+    monkeypatch.setattr(xbloom, "reexec_in_local_runtime", lambda: None)
+    monkeypatch.setenv(xbloom.ACCOUNT_EMAIL_ENV, "account@example.test")
+    monkeypatch.setenv(xbloom.ACCOUNT_PASSWORD_ENV, "private-password")
+
+    def request(**kwargs):
+        if kwargs["endpoint"] == xbloom_catalog.LOGIN_ENDPOINT:
+            return {"result": "success", "token": "session", "member": {"tableId": 42}}
+        if kwargs["endpoint"] == xbloom_catalog.BREW_RECORD_LIST_ENDPOINT:
+            return {
+                "result": "success",
+                "gList": [
+                    {
+                        "groupName": "Today",
+                        "list": [
+                            {
+                                "tableId": 11,
+                                "recipeName": "Phone Brew",
+                                "dose": 15,
+                                "brewTime": 110,
+                                "cupType": 2,
+                                "createTimeStamp": 1784000100,
+                            }
+                        ],
+                    }
+                ],
+            }
+        raise AssertionError(kwargs["endpoint"])
+
+    monkeypatch.setattr(xbloom_catalog, "_cloud_request", request)
+    assert xbloom.main(["catalog", "history-sync", "--region", "china"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "synced"
+    assert output["imported"] == 1
+    assert history_file.exists()
+    rows = [json.loads(line) for line in history_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert rows[-1]["source"] == "app-cloud"
+    assert rows[-1]["recipe_name"] == "Phone Brew"

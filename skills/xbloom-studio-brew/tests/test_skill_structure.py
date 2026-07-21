@@ -40,6 +40,7 @@ def test_skill_references_and_assets_exist():
         "scripts/bootstrap.py",
         "scripts/xbloom_paths.py",
         "scripts/xbloom_catalog.py",
+        "scripts/xbloom_history.py",
         "scripts/xbloom_ble/bridge.py",
         "agents/openai.yaml",
         "LICENSE",

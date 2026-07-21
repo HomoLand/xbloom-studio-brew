@@ -30,6 +30,10 @@ Agent Skills-compatible clients.
   catalog; ephemeral account sync covers official, user-created, Product/xPod, and shared lists.
 - Previews local coffee/tea recipes as exact App forms and can explicitly perform an idempotent,
   add-only account upload without storing credentials or session tokens.
+- Deletes only member-created cloud recipes after an offline preview and an exact owner confirm
+  phrase; official/shared/product recipes stay read-only.
+- Keeps a local brew journal from load/start/cancel/complete telemetry and can import coarser App
+  brew-history records for phone-only sessions used in dial-in.
 - Shows a conservative Skill baseline plus cited adaptations for the user to compare.
 - Validates dose, extraction/final ratios, bypass, water totals, grind, temperature modes, pattern,
   four-state vibration timing, flow, RPM, and BLE opcodes before writes.
@@ -97,6 +101,10 @@ python scripts/xbloom.py catalog list --kind tea
 python scripts/xbloom.py catalog export <id> recipe.yaml
 python scripts/xbloom.py catalog login-sync --region china --language zh-cn
 python scripts/xbloom.py catalog push recipe.yaml --region china
+python scripts/xbloom.py catalog delete --region china --table-id <id>
+python scripts/xbloom.py catalog history-sync --region china
+python scripts/xbloom.py history status
+python scripts/xbloom.py history list --limit 20
 ```
 
 The default catalog lives outside the installed Skill under
@@ -108,8 +116,12 @@ explicitly owner-approved add-only writes were live-service verified against the
 memory-only.
 Set `XBLOOM_ACCOUNT_EMAIL` and `XBLOOM_ACCOUNT_PASSWORD` in the host environment; passwords are
 never accepted as command arguments. `catalog push` is preview-only unless the user explicitly
-adds both `--apply` and `--confirm-write own-account-cloud-recipe`; the live write endpoint is not
-used by release tests. See the [catalog and A/B/C guide](skills/xbloom-studio-brew/references/catalog.md).
+adds both `--apply` and `--confirm-write own-account-cloud-recipe`. `catalog delete` is also
+preview-only unless the user adds both `--apply` and
+`--confirm-delete own-account-cloud-recipe-delete`, and it only accepts a currently created
+`tableId`. The local brew journal defaults to `~/.xbloom-studio-brew/brew-history.jsonl`. Live
+cloud write/delete endpoints are not used by release tests. See the
+[catalog and A/B/C guide](skills/xbloom-studio-brew/references/catalog.md).
 
 ## Install
 

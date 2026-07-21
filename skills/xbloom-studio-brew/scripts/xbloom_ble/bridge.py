@@ -854,8 +854,26 @@ class BridgeCore:
         if not path.is_file() or _sha256(path) != state.get("recipe_sha256"):
             raise BridgeError("recipe changed or disappeared since it was loaded")
         self._reset_liquid_telemetry()
+        state.update(status="start_pending", start_requested_at=time.time())
+        _atomic_json(self.coffee_state_file, state, private=True)
         self.phase = "starting"
-        event = await self.client.start()
+        try:
+            event = await self.client.start()
+        except BaseException as exc:
+            self.phase = "control_unconfirmed"
+            self.last_error = f"coffee start outcome is unconfirmed: {exc}"
+            state.update(
+                status="start_unconfirmed",
+                start_unconfirmed_at=time.time(),
+                last_state=self.machine_state or state.get("last_state"),
+            )
+            _atomic_json(self.coffee_state_file, state, private=True)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise BridgeError(
+                f"{self.last_error}; inspect bridge events/status, then cancel or use "
+                "the physical control; do not retry start"
+            ) from exc
         self.phase = "running"
         self.last_error = None
         self._saw_active = event.state in ACTIVE_STATE_BYTES or self._saw_active
