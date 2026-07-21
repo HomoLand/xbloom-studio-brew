@@ -77,7 +77,10 @@ ENDPOINTS = {
 }
 DEFAULT_ACCOUNT_TARGETS = ("coffee", "tea", "created", "product", "shared")
 RECIPE_ADD_ENDPOINT = "tuRecipeAdd.tuhtml"
+RECIPE_DELETE_ENDPOINT = "tuRecipeDelete.tuhtml"
+BREW_RECORD_LIST_ENDPOINT = "tuBrewRecordList.tuhtml"
 RECIPE_WRITE_INTERFACE_VERSION = 20240918
+CLOUD_DELETE_CONFIRM_SENTINEL = "own-account-cloud-recipe-delete"
 DEFAULT_RECIPE_COLOR = "#ADBDDB"
 APP_PLACE_LABELS = {
     1: "hot",
@@ -1871,22 +1874,301 @@ def sync_cloud(
     }
 
 
+def cloud_recipe_delete_preview(
+    *,
+    table_id: int | None = None,
+    identifier: str | None = None,
+    catalog: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a secret-free, non-writing preview of an account recipe delete."""
+
+    resolved_table_id = _optional_int(table_id)
+    entry: dict[str, Any] | None = None
+    if catalog is not None and identifier:
+        entry = get_entry(catalog, identifier)
+        if resolved_table_id is None:
+            resolved_table_id = _optional_int(entry.get("table_id"))
+        elif entry.get("table_id") is not None and int(entry["table_id"]) != int(resolved_table_id):
+            raise CatalogError(
+                f"catalog entry {identifier!r} has table_id={entry.get('table_id')}, "
+                f"not {resolved_table_id}"
+            )
+    if resolved_table_id is None or resolved_table_id <= 0:
+        raise CatalogError("cloud recipe delete requires a positive remote tableId")
+    warnings = [
+        "preview only; no login or remote write was performed",
+        "delete is irreversible on the xBloom account and only removes the cloud recipe, "
+        "not machine A/B/C slots or local YAML files",
+        "only delete recipes you own; official/product/shared records must not be targeted",
+    ]
+    if entry is not None and entry.get("origin") not in {"user-created", "created"}:
+        warnings.append(
+            f"local catalog origin is {entry.get('origin')!r}; confirm this tableId is "
+            "one of your created recipes before applying"
+        )
+    preview: dict[str, Any] = {
+        "operation": "delete",
+        "endpoint": RECIPE_DELETE_ENDPOINT,
+        "remote_table_id": int(resolved_table_id),
+        "confirmation_required": CLOUD_DELETE_CONFIRM_SENTINEL,
+        "write_performed": False,
+        "warnings": warnings,
+    }
+    if entry is not None:
+        preview.update(
+            {
+                "catalog_id": entry.get("id"),
+                "name": entry.get("name"),
+                "kind": entry.get("kind"),
+                "origin": entry.get("origin"),
+            }
+        )
+    return preview
+
+
+def delete_cloud_recipe_with_login(
+    *,
+    table_id: int,
+    email: str,
+    password: str,
+    region: str,
+    confirm_delete: str,
+    language_type: int = 0,
+    timeout: float = 20.0,
+    opener: Callable[..., Any] = urlopen,
+    client_secret: str | None = None,
+    expected_name: str | None = None,
+) -> dict[str, Any]:
+    """Delete one member-created cloud recipe by remote tableId."""
+
+    if confirm_delete != CLOUD_DELETE_CONFIRM_SENTINEL:
+        raise CatalogError(
+            "cloud recipe delete requires the exact confirmation "
+            f"{CLOUD_DELETE_CONFIRM_SENTINEL!r}"
+        )
+    remote_table_id = _required_int(table_id, "remote table id")
+    if remote_table_id <= 0:
+        raise CatalogError("remote table id must be positive")
+    region_name, session_form = _ephemeral_account_session(
+        email=email,
+        password=password,
+        region=region,
+        language_type=language_type,
+        timeout=timeout,
+        opener=opener,
+        client_secret=client_secret,
+    )
+    created_form = deepcopy(session_form)
+    created_form["adaptedModel"] = 1
+    created_payload = _cloud_request(
+        base_url=BASE_URLS[region_name],
+        endpoint=ENDPOINTS["created"],
+        form=created_form,
+        timeout=float(timeout),
+        opener=opener,
+    )
+    matched: dict[str, Any] | None = None
+    for raw, context in _candidate_records(created_payload):
+        candidate_id = _optional_int(_first(raw, "tableId", "table_id", "recipeId"))
+        if candidate_id != remote_table_id:
+            continue
+        try:
+            entry = normalise_entry(
+                raw,
+                context=context,
+                source_type="xbloom-cloud",
+                endpoint=ENDPOINTS["created"],
+                region=region_name,
+            )
+        except Exception as exc:
+            raise CatalogError(
+                "the target cloud recipe exists but could not be safely inspected before delete"
+            ) from exc
+        matched = entry
+        break
+    if matched is None:
+        raise CatalogError(
+            f"no created-account recipe with tableId={remote_table_id} was found; "
+            "refusing to delete an unknown remote id"
+        )
+    if expected_name and str(matched.get("name", "")).strip().casefold() != str(expected_name).strip().casefold():
+        raise CatalogError(
+            f"remote recipe name {matched.get('name')!r} does not match expected "
+            f"{expected_name!r}; refusing delete"
+        )
+    delete_form = deepcopy(session_form)
+    delete_form["interfaceVersion"] = RECIPE_WRITE_INTERFACE_VERSION
+    delete_form["tableId"] = remote_table_id
+    payload = _cloud_request(
+        base_url=BASE_URLS[region_name],
+        endpoint=RECIPE_DELETE_ENDPOINT,
+        form=delete_form,
+        timeout=float(timeout),
+        opener=opener,
+    )
+    if not isinstance(payload, Mapping) or payload.get("result") != "success":
+        result_code = payload.get("resultCode") if isinstance(payload, Mapping) else None
+        suffix = f" (resultCode={result_code})" if result_code is not None else ""
+        raise CatalogError(f"xBloom cloud recipe delete was rejected{suffix}")
+    return {
+        "status": "deleted",
+        "operation": "delete",
+        "region": region_name,
+        "remote_table_id": remote_table_id,
+        "name": matched.get("name"),
+        "kind": matched.get("kind"),
+        "write_performed": True,
+        "authenticated": True,
+        "credentials_persisted": False,
+        "session_persisted": False,
+    }
+
+
+def _normalise_brew_record(raw: Mapping[str, Any], *, group_name: str | None = None) -> dict[str, Any]:
+    """Reduce one App brew-record object to a secret-free journal row."""
+
+    table_id = _optional_int(_first(raw, "tableId", "table_id"))
+    create_ts = _optional_int(_first(raw, "createTimeStamp", "create_time_stamp"))
+    recorded_at = None
+    if create_ts is not None and create_ts > 0:
+        seconds = create_ts / 1000.0 if create_ts > 10_000_000_000 else float(create_ts)
+        recorded_at = datetime.fromtimestamp(seconds, tz=timezone.utc).replace(microsecond=0).isoformat()
+    cup_type = _optional_int(_first(raw, "cupType", "cup_type"))
+    is_pod = _optional_int(_first(raw, "isHavePod", "is_have_pod"))
+    dose = _optional_float(_first(raw, "dose", "dose_g"))
+    brew_time = _optional_int(_first(raw, "brewTime", "brew_time"))
+    recipe_name = _first(raw, "recipeName", "recipe_name", "theName", "name", default="")
+    recipe_vo = raw.get("recipeVo") if isinstance(raw.get("recipeVo"), Mapping) else {}
+    if not recipe_name and isinstance(recipe_vo, Mapping):
+        recipe_name = _first(recipe_vo, "theName", "name", default="") or ""
+    if cup_type == 4:
+        serving_kind = "tea"
+    elif is_pod == 1:
+        serving_kind = "xpod"
+    else:
+        serving_kind = "coffee"
+    line_chart = _first(raw, "lineChartData", "line_chart_data", default="")
+    return {
+        key: value
+        for key, value in {
+            "remote_table_id": table_id,
+            "recipe_name": str(recipe_name).strip() or None,
+            "serving_kind": serving_kind,
+            "machine_program": (
+                "omni-tea-brewer" if serving_kind == "tea" else "coffee-pour-over"
+            ),
+            "cup_type": CUP_TYPE_LABELS.get(cup_type, str(cup_type) if cup_type is not None else None),
+            "dose_g": dose,
+            "brew_time_s": brew_time,
+            "create_time_stamp": create_ts,
+            "recorded_at": recorded_at,
+            "has_line_chart": bool(str(line_chart or "").strip()),
+            "is_pod": True if is_pod == 1 else False if is_pod == 0 else None,
+            "machine_id": _optional_int(_first(raw, "machineId", "machine_id")),
+            "member_used_recipes_id": _optional_int(
+                _first(raw, "memberUsedRecipesId", "member_used_recipes_id")
+            ),
+            "group_name": group_name or _first(raw, "groupName", "group_name"),
+            "recipe_color": _first(raw, "recipeColor", "recipe_color"),
+            "device_id": _first(raw, "device_id", "deviceId"),
+            "mac": _first(raw, "mac"),
+        }.items()
+        if value not in (None, "", [], {})
+    }
+
+
+def fetch_cloud_brew_records_with_login(
+    *,
+    email: str,
+    password: str,
+    region: str,
+    language_type: int = 0,
+    timeout: float = 20.0,
+    keyword: str | None = None,
+    have_pod: int | None = None,
+    opener: Callable[..., Any] = urlopen,
+    client_secret: str | None = None,
+) -> dict[str, Any]:
+    """Fetch App brew-history records with an ephemeral account session."""
+
+    region_name, session_form = _ephemeral_account_session(
+        email=email,
+        password=password,
+        region=region,
+        language_type=language_type,
+        timeout=timeout,
+        opener=opener,
+        client_secret=client_secret,
+    )
+    form = deepcopy(session_form)
+    form["adaptedModel"] = 1
+    form["pageNumber"] = 1
+    form["countPerPage"] = 0
+    if keyword:
+        form["keyword"] = str(keyword)
+    if have_pod is not None:
+        form["isHavePod"] = int(have_pod)
+    payload = _cloud_request(
+        base_url=BASE_URLS[region_name],
+        endpoint=BREW_RECORD_LIST_ENDPOINT,
+        form=form,
+        timeout=float(timeout),
+        opener=opener,
+    )
+    if not isinstance(payload, Mapping) or payload.get("result") != "success":
+        result_code = payload.get("resultCode") if isinstance(payload, Mapping) else None
+        suffix = f" (resultCode={result_code})" if result_code is not None else ""
+        raise CatalogError(f"xBloom brew-record list was rejected{suffix}")
+    groups = payload.get("gList")
+    if groups is None:
+        groups = payload.get("list") or payload.get("data") or []
+    if not isinstance(groups, list):
+        raise CatalogError("xBloom brew-record list returned an unexpected payload shape")
+    records: list[dict[str, Any]] = []
+    for group in groups:
+        if not isinstance(group, Mapping):
+            continue
+        group_name = str(group.get("groupName") or group.get("group_name") or "") or None
+        items = group.get("list") if isinstance(group.get("list"), list) else [group]
+        for item in items:
+            if isinstance(item, Mapping):
+                records.append(_normalise_brew_record(item, group_name=group_name))
+    return {
+        "status": "fetched",
+        "region": region_name,
+        "count": len(records),
+        "records": records,
+        "authenticated": True,
+        "credentials_persisted": False,
+        "session_persisted": False,
+        "endpoint": BREW_RECORD_LIST_ENDPOINT,
+    }
+
+
+
+
 __all__ = [
     "ACCOUNT_EMAIL_ENV",
     "ACCOUNT_PASSWORD_ENV",
     "APP_RSA_PUBLIC_KEY_B64",
+    "BREW_RECORD_LIST_ENDPOINT",
     "CATALOG_PATH_ENV",
     "CLOUD_CONFIG_ENV",
+    "CLOUD_DELETE_CONFIRM_SENTINEL",
     "CLOUD_WRITE_CONFIRM_SENTINEL",
     "DEFAULT_ACCOUNT_TARGETS",
+    "RECIPE_DELETE_ENDPOINT",
     "CatalogError",
     "app_encrypt_form",
     "build_cloud_recipe_form",
     "catalog_summary",
+    "cloud_recipe_delete_preview",
     "cloud_recipe_preview",
     "default_catalog_path",
+    "delete_cloud_recipe_with_login",
     "empty_catalog",
     "export_entry",
+    "fetch_cloud_brew_records_with_login",
     "get_entry",
     "import_json_file",
     "import_payload",

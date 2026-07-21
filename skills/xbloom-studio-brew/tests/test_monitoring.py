@@ -5,9 +5,18 @@ import time
 import pytest
 
 import xbloom
+import xbloom_history
 import xbloom_ble.client as client_module
 import xbloom_safety
 from xbloom_ble.telemetry import StatusEvent
+
+
+def _isolate_history(monkeypatch, tmp_path):
+    history_file = tmp_path / "brew-history.jsonl"
+    monkeypatch.setenv(xbloom.HISTORY_PATH_ENV, str(history_file))
+    monkeypatch.setenv(xbloom_history.HISTORY_PATH_ENV, str(history_file))
+    return history_file
+
 
 
 class FakeTelemetryClient:
@@ -153,9 +162,14 @@ def test_monitor_and_cancel_reuse_loaded_workflow_address(monkeypatch, tmp_path)
         asyncio.run(xbloom.resolve_control_address("other-device", 1))
 
 
+@pytest.mark.parametrize(
+    "workflow_status",
+    ["start_pending", "start_unconfirmed", "completion_unconfirmed"],
+)
 def test_monitor_reattach_uses_active_hint_and_clears_confirmed_state(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, workflow_status
 ):
+    _isolate_history(monkeypatch, tmp_path)
     coffee_state = tmp_path / "coffee.json"
     tea_state = tmp_path / "tea.json"
     monkeypatch.setattr(xbloom, "STATE_FILE", coffee_state)
@@ -164,7 +178,7 @@ def test_monitor_reattach_uses_active_hint_and_clears_confirmed_state(
         {
             "address": "recorded-device",
             "machine": "xBloom",
-            "status": "completion_unconfirmed",
+            "status": workflow_status,
         }
     )
 
@@ -236,6 +250,7 @@ def test_start_clears_state_only_after_terminal_confirmation(
     expected_rc,
     state_exists,
 ):
+    _isolate_history(monkeypatch, tmp_path)
     state_path = tmp_path / "armed.json"
     monkeypatch.setattr(xbloom, "STATE_FILE", state_path)
     monkeypatch.setenv(xbloom.REMOTE_START_ENV, xbloom.REMOTE_START_SENTINEL)
@@ -299,3 +314,64 @@ def test_start_clears_state_only_after_terminal_confirmation(
         saved = xbloom.state_read()
         assert saved["status"] == "completion_unconfirmed"
         assert saved["last_state"] == "starting"
+
+
+def test_start_failure_is_persisted_and_retry_is_refused(monkeypatch, tmp_path):
+    _isolate_history(monkeypatch, tmp_path)
+    state_path = tmp_path / "armed.json"
+    monkeypatch.setattr(xbloom, "STATE_FILE", state_path)
+    monkeypatch.setenv(xbloom.REMOTE_START_ENV, xbloom.REMOTE_START_SENTINEL)
+    xbloom.state_write(
+        {
+            "address": "recorded-device",
+            "machine": "xBloom",
+            "recipe_sha256": "same-hash",
+            "loaded_at": time.time(),
+            "status": "armed",
+            "last_state": "armed",
+        }
+    )
+    calls = []
+
+    class FailingStartClient:
+        def __init__(self, address):
+            assert address == "recorded-device"
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return None
+
+        async def start(self):
+            calls.append("start")
+            assert xbloom.state_read()["status"] == "start_pending"
+            raise RuntimeError("start acknowledgement lost")
+
+    monkeypatch.setattr(client_module, "XBloomClient", FailingStartClient)
+    monkeypatch.setattr(
+        xbloom,
+        "load_recipe",
+        lambda _path: (Path("recipe.yaml"), object(), {"recipe_sha256": "same-hash"}),
+    )
+    monkeypatch.setattr(xbloom_safety, "recipe_sha256", lambda _path: "same-hash")
+    args = xbloom.build_parser().parse_args(
+        [
+            "start",
+            "recipe.yaml",
+            "--confirm-ready",
+            xbloom.READY_SENTINEL,
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="acknowledgement lost"):
+        asyncio.run(xbloom.async_start(args))
+    saved = xbloom.state_read()
+    assert saved["status"] == "start_unconfirmed"
+    assert saved["last_state"] == "armed"
+    assert "start_requested_at" in saved
+    assert "start_unconfirmed_at" in saved
+
+    with pytest.raises(RuntimeError, match="do not retry"):
+        asyncio.run(xbloom.async_start(args))
+    assert calls == ["start"]

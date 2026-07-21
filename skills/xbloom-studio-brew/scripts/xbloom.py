@@ -36,7 +36,9 @@ STATE_FILE = STATE_DIR / "armed-state.json"
 TEA_STATE_FILE = STATE_DIR / "tea-loaded-state.json"
 GRINDER_STATE_FILE = STATE_DIR / "grinder-rest-state.json"
 CATALOG_FILE = STATE_DIR / "catalog" / "catalog.json"
+HISTORY_FILE = STATE_DIR / "brew-history.jsonl"
 CATALOG_PATH_ENV = "XBLOOM_CATALOG_PATH"
+HISTORY_PATH_ENV = "XBLOOM_HISTORY_PATH"
 CLOUD_CONFIG_ENV = "XBLOOM_CLOUD_CONFIG"
 ACCOUNT_EMAIL_ENV = "XBLOOM_ACCOUNT_EMAIL"
 ACCOUNT_PASSWORD_ENV = "XBLOOM_ACCOUNT_PASSWORD"
@@ -159,6 +161,68 @@ def state_clear(path: Path | None = None) -> None:
         path.unlink()
     except FileNotFoundError:
         pass
+
+
+
+
+def history_path() -> Path:
+    configured = environment_value(HISTORY_PATH_ENV)
+    if configured:
+        return Path(configured).expanduser()
+    return HISTORY_FILE
+
+
+def record_history_event(
+    *,
+    command: str,
+    outcome: str,
+    state: dict[str, Any] | None = None,
+    summary: dict[str, Any] | None = None,
+    monitor: dict[str, Any] | None = None,
+    error: str | None = None,
+    note: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Best-effort local journal write; never block machine control on logging."""
+
+    try:
+        from xbloom_history import append_event, event_from_workflow
+
+        event = event_from_workflow(
+            command=command,
+            outcome=outcome,
+            state=state,
+            summary=summary,
+            monitor=monitor,
+            error=error,
+            note=note,
+            extra=extra,
+        )
+        return append_event(event, path=history_path())
+    except Exception as exc:  # pragma: no cover - logging must stay non-fatal
+        emit(
+            {
+                "command": "history",
+                "status": "write_failed",
+                "error": str(exc),
+                "type": type(exc).__name__,
+            }
+        )
+        return None
+
+
+def account_password_for_catalog(action: str) -> str:
+    password = environment_value(ACCOUNT_PASSWORD_ENV)
+    if password:
+        return password
+    if not sys.stdin.isatty():
+        raise RuntimeError(
+            f"catalog {action} requires {ACCOUNT_PASSWORD_ENV} in non-interactive use; "
+            "passwords are intentionally not accepted as command arguments"
+        )
+    import getpass
+
+    return getpass.getpass("xBloom account password: ")
 
 
 def ensure_no_loaded_workflow() -> None:
@@ -429,7 +493,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 "shared",
             ],
             "catalog_cloud_push": "preview_default_idempotent_add_only",
+            "catalog_cloud_delete": "preview_default_created_tableid_only",
             "catalog_path": str(catalog_path),
+            "brew_history": True,
+            "brew_history_path": str(history_path()),
+            "app_brew_history_sync": "ephemeral_login_import_only",
             "catalog_cloud_configured": cloud_config_exists,
             "catalog_login_email_configured": account_email_configured,
             "catalog_login_password_configured": account_password_configured,
@@ -628,12 +696,16 @@ def cmd_catalog(args: argparse.Namespace) -> int:
         ACCOUNT_EMAIL_ENV,
         ACCOUNT_PASSWORD_ENV,
         CLOUD_CONFIG_ENV,
+        CLOUD_DELETE_CONFIRM_SENTINEL,
         CLOUD_WRITE_CONFIRM_SENTINEL,
         DEFAULT_ACCOUNT_TARGETS,
         catalog_summary,
+        cloud_recipe_delete_preview,
         cloud_recipe_preview,
         default_catalog_path,
+        delete_cloud_recipe_with_login,
         export_entry,
+        fetch_cloud_brew_records_with_login,
         get_entry,
         import_json_file,
         list_entries,
@@ -645,6 +717,7 @@ def cmd_catalog(args: argparse.Namespace) -> int:
         sync_cloud,
         sync_cloud_with_login,
     )
+    from xbloom_history import import_app_records
 
     configured_path = getattr(args, "catalog_file", None)
     catalog_path = (
@@ -760,16 +833,7 @@ def cmd_catalog(args: argparse.Namespace) -> int:
             raise RuntimeError(
                 f"catalog login-sync requires --email or {ACCOUNT_EMAIL_ENV}"
             )
-        password = environment_value(ACCOUNT_PASSWORD_ENV)
-        if not password:
-            if not sys.stdin.isatty():
-                raise RuntimeError(
-                    f"catalog login-sync requires {ACCOUNT_PASSWORD_ENV} in non-interactive use; "
-                    "passwords are intentionally not accepted as command arguments"
-                )
-            import getpass
-
-            password = getpass.getpass("xBloom account password: ")
+        password = account_password_for_catalog("login-sync")
         result = sync_cloud_with_login(
             catalog,
             email=email,
@@ -814,17 +878,7 @@ def cmd_catalog(args: argparse.Namespace) -> int:
             raise RuntimeError(
                 f"catalog push --apply requires --email or {ACCOUNT_EMAIL_ENV}"
             )
-        password = environment_value(ACCOUNT_PASSWORD_ENV)
-        if not password:
-            if not sys.stdin.isatty():
-                raise RuntimeError(
-                    f"catalog push --apply requires {ACCOUNT_PASSWORD_ENV} in "
-                    "non-interactive use; passwords are intentionally not accepted "
-                    "as command arguments"
-                )
-            import getpass
-
-            password = getpass.getpass("xBloom account password: ")
+        password = account_password_for_catalog("push")
         result = push_cloud_recipe_with_login(
             recipe,
             email=email,
@@ -843,7 +897,142 @@ def cmd_catalog(args: argparse.Namespace) -> int:
             }
         )
         return 0
+    if action == "delete":
+        preview = cloud_recipe_delete_preview(
+            table_id=getattr(args, "table_id", None),
+            identifier=getattr(args, "identifier", None),
+            catalog=catalog,
+        )
+        if not args.apply:
+            emit(
+                {
+                    "command": "catalog",
+                    "action": action,
+                    "status": "preview",
+                    **preview,
+                }
+            )
+            return 0
+        if args.confirm_delete != CLOUD_DELETE_CONFIRM_SENTINEL:
+            raise RuntimeError(
+                "catalog delete --apply requires --confirm-delete "
+                f"{CLOUD_DELETE_CONFIRM_SENTINEL}"
+            )
+        email = args.email or environment_value(ACCOUNT_EMAIL_ENV)
+        if not email:
+            raise RuntimeError(
+                f"catalog delete --apply requires --email or {ACCOUNT_EMAIL_ENV}"
+            )
+        password = account_password_for_catalog("delete")
+        result = delete_cloud_recipe_with_login(
+            table_id=int(preview["remote_table_id"]),
+            email=email,
+            password=password,
+            region=args.region,
+            confirm_delete=args.confirm_delete,
+            expected_name=preview.get("name"),
+            language_type={"en": 0, "zh-cn": 3}[args.language],
+            timeout=args.timeout,
+        )
+        if result.get("write_performed"):
+            remote_id = result.get("remote_table_id")
+            before = len(catalog.get("entries") or [])
+            catalog["entries"] = [
+                entry
+                for entry in catalog.get("entries") or []
+                if entry.get("table_id") != remote_id
+            ]
+            if len(catalog.get("entries") or []) != before:
+                save_catalog(catalog, catalog_path)
+                result["local_catalog_removed"] = True
+            else:
+                result["local_catalog_removed"] = False
+        emit({"command": "catalog", "action": action, **result})
+        return 0
+    if action == "history-sync":
+        email = args.email or environment_value(ACCOUNT_EMAIL_ENV)
+        if not email:
+            raise RuntimeError(
+                f"catalog history-sync requires --email or {ACCOUNT_EMAIL_ENV}"
+            )
+        password = account_password_for_catalog("history-sync")
+        fetched = fetch_cloud_brew_records_with_login(
+            email=email,
+            password=password,
+            region=args.region,
+            language_type={"en": 0, "zh-cn": 3}[args.language],
+            timeout=args.timeout,
+            keyword=args.keyword or None,
+            have_pod=args.have_pod,
+        )
+        imported = import_app_records(
+            fetched.get("records") or [],
+            path=history_path(),
+            region=fetched.get("region"),
+        )
+        emit(
+            {
+                "command": "catalog",
+                "action": action,
+                "status": "synced",
+                "region": fetched.get("region"),
+                "fetched": fetched.get("count"),
+                "history_path": str(history_path()),
+                **imported,
+                "authenticated": True,
+                "credentials_persisted": False,
+                "session_persisted": False,
+            }
+        )
+        return 0
     raise RuntimeError(f"unknown catalog action {action}")
+
+
+def cmd_history(args: argparse.Namespace) -> int:
+    """Inspect or annotate the local brew journal without touching BLE."""
+
+    from xbloom_history import HistoryError, add_note, history_summary, list_events
+
+    action = args.history_action
+    path = history_path()
+    try:
+        if action == "status":
+            emit({"command": "history", "action": action, **history_summary(path)})
+            return 0
+        if action == "list":
+            events = list_events(
+                path=path,
+                limit=int(args.limit),
+                source=args.source,
+                outcome=args.outcome,
+                query=args.query,
+                recipe_sha256=args.recipe_sha256,
+            )
+            emit(
+                {
+                    "command": "history",
+                    "action": action,
+                    "path": str(path),
+                    "count": len(events),
+                    "events": events,
+                }
+            )
+            return 0
+        if action == "note":
+            event = add_note(args.event_id, args.note, path=path)
+            emit(
+                {
+                    "command": "history",
+                    "action": action,
+                    "status": "noted",
+                    "path": str(path),
+                    "event": event,
+                }
+            )
+            return 0
+    except HistoryError as exc:
+        raise RuntimeError(str(exc)) from exc
+    raise RuntimeError(f"unknown history action {action}")
 
 
 async def async_load(args: argparse.Namespace) -> int:
@@ -858,31 +1047,37 @@ async def async_load(args: argparse.Namespace) -> int:
         armed = await client.load_recipe(recipe)
     if armed.state_name != "armed":
         raise RuntimeError(f"machine did not arm; state={armed.state_name}")
-    state_write(
-        {
-            "address": address,
-            "machine": name,
-            "recipe_path": str(path),
-            "recipe_sha256": summary["recipe_sha256"],
-            "loaded_at": time.time(),
-            "status": "armed",
-            "firmware": firmware,
-            "target_dispensed_water_ml": summary["target_dispensed_water_ml"],
-            "serving_kind": summary["kind"],
-            "machine_program": summary["machine_program"],
-            "manual_preload_ice_g": summary["manual_preload_ice_g"],
-        }
+    state = {
+        "address": address,
+        "machine": name,
+        "recipe_path": str(path),
+        "recipe_sha256": summary["recipe_sha256"],
+        "loaded_at": time.time(),
+        "status": "armed",
+        "firmware": firmware,
+        "target_dispensed_water_ml": summary["target_dispensed_water_ml"],
+        "serving_kind": summary["kind"],
+        "machine_program": summary["machine_program"],
+        "manual_preload_ice_g": summary["manual_preload_ice_g"],
+    }
+    state_write(state)
+    history_event = record_history_event(
+        command="load",
+        outcome="loaded",
+        state=state,
+        summary=summary,
     )
-    emit(
-        {
-            "command": "load",
-            "status": "armed",
-            "machine": name,
-            "firmware": firmware,
-            "remote_start_sent": False,
-            **summary,
-        }
-    )
+    payload = {
+        "command": "load",
+        "status": "armed",
+        "machine": name,
+        "firmware": firmware,
+        "remote_start_sent": False,
+        **summary,
+    }
+    if history_event:
+        payload["history_event_id"] = history_event["event_id"]
+    emit(payload)
     return 0
 
 
@@ -1152,7 +1347,8 @@ async def async_monitor(args: argparse.Namespace) -> int:
     if len(workflow_records) > 1:
         raise RuntimeError("multiple loaded workflow records exist; run cancel before monitoring")
     active_already = any(
-        record.get("status") in {"running", "completion_unconfirmed"}
+        record.get("status")
+        in {"start_pending", "start_unconfirmed", "running", "completion_unconfirmed"}
         for _path, record in workflow_records
     )
     address, name = await resolve_control_address(args.address, args.scan_timeout)
@@ -1172,25 +1368,43 @@ async def async_monitor(args: argparse.Namespace) -> int:
             active_already=active_already,
         )
     state_records_cleared = 0
+    history_event = None
     if result.terminal_confirmed:
+        if len(workflow_records) == 1:
+            state = workflow_records[0][1]
+            history_event = record_history_event(
+                command="monitor",
+                outcome="completed",
+                state=state,
+                monitor={**result.summary(), **volume_comparison(state, result)},
+            )
         for path, _record in workflow_records:
             state_clear(path)
             state_records_cleared += 1
-    emit(
-        {
-            "command": "monitor",
-            "status": (
-                result.terminal_state if result.terminal_confirmed else "duration_elapsed"
-            ),
-            "state_records_cleared": state_records_cleared,
-            **result.summary(),
-            **(
-                volume_comparison(workflow_records[0][1], result)
-                if len(workflow_records) == 1
-                else {}
-            ),
-        }
-    )
+    elif len(workflow_records) == 1 and result.saw_active:
+        state = workflow_records[0][1]
+        history_event = record_history_event(
+            command="monitor",
+            outcome="completion_unconfirmed",
+            state=state,
+            monitor={**result.summary(), **volume_comparison(state, result)},
+        )
+    payload = {
+        "command": "monitor",
+        "status": (
+            result.terminal_state if result.terminal_confirmed else "duration_elapsed"
+        ),
+        "state_records_cleared": state_records_cleared,
+        **result.summary(),
+        **(
+            volume_comparison(workflow_records[0][1], result)
+            if len(workflow_records) == 1
+            else {}
+        ),
+    }
+    if history_event:
+        payload["history_event_id"] = history_event["event_id"]
+    emit(payload)
     return 0
 
 
@@ -1400,32 +1614,39 @@ async def async_tea_load(args: argparse.Namespace) -> int:
     firmware = require_write_preflight(preflight)
     async with XBloomClient(address) as client:
         ack = await client.load_tea_recipe(recipe)
-    state_write(
-        {
-            "address": address,
-            "machine": name,
-            "recipe_path": str(path),
-            "recipe_sha256": summary["recipe_sha256"],
-            "loaded_at": time.time(),
-            "status": "tea_loaded",
-            "firmware": firmware,
-            "target_dispensed_water_ml": summary["programmed_water_ml"],
-        },
-        TEA_STATE_FILE,
+    state = {
+        "address": address,
+        "machine": name,
+        "recipe_path": str(path),
+        "recipe_sha256": summary["recipe_sha256"],
+        "loaded_at": time.time(),
+        "status": "tea_loaded",
+        "firmware": firmware,
+        "target_dispensed_water_ml": summary["programmed_water_ml"],
+        "serving_kind": "tea",
+        "machine_program": "omni-tea-brewer",
+    }
+    state_write(state, TEA_STATE_FILE)
+    history_event = record_history_event(
+        command="tea-load",
+        outcome="loaded",
+        state=state,
+        summary=summary,
     )
-    emit(
-        {
-            "command": "tea-load",
-            "status": "tea_loaded",
-            "machine": name,
-            "firmware": firmware,
-            "verified_by_command": (
-                f"0x{ack.command_code:04x}" if ack.command_code is not None else None
-            ),
-            "remote_start_sent": False,
-            **summary,
-        }
-    )
+    payload = {
+        "command": "tea-load",
+        "status": "tea_loaded",
+        "machine": name,
+        "firmware": firmware,
+        "verified_by_command": (
+            f"0x{ack.command_code:04x}" if ack.command_code is not None else None
+        ),
+        "remote_start_sent": False,
+        **summary,
+    }
+    if history_event:
+        payload["history_event_id"] = history_event["event_id"]
+    emit(payload)
     return 0
 
 
@@ -1479,6 +1700,15 @@ async def async_tea_start(args: argparse.Namespace) -> int:
             active_already=True,
         )
     state_record_cleared = finalize_workflow_state(state, TEA_STATE_FILE, result)
+    history_event = record_history_event(
+        command="tea-start",
+        outcome=(
+            "completed" if result.terminal_confirmed else "completion_unconfirmed"
+        ),
+        state=state,
+        summary=summary,
+        monitor={**result.summary(), **volume_comparison(state, result)},
+    )
     output = {
         "command": "tea-start",
         "status": (
@@ -1488,6 +1718,8 @@ async def async_tea_start(args: argparse.Namespace) -> int:
         **result.summary(),
         **volume_comparison(state, result),
     }
+    if history_event:
+        output["history_event_id"] = history_event["event_id"]
     if not result.terminal_confirmed:
         output["next_action"] = "run monitor or cancel; do not assume tea completed"
     emit(output)
@@ -1564,6 +1796,15 @@ async def async_tea_brew(args: argparse.Namespace) -> int:
         )
 
     state_record_cleared = finalize_workflow_state(state, TEA_STATE_FILE, result)
+    history_event = record_history_event(
+        command="tea-brew",
+        outcome=(
+            "completed" if result.terminal_confirmed else "completion_unconfirmed"
+        ),
+        state=state,
+        summary=summary,
+        monitor={**result.summary(), **volume_comparison(state, result)},
+    )
     output = {
         "command": "tea-brew",
         "status": (
@@ -1573,6 +1814,8 @@ async def async_tea_brew(args: argparse.Namespace) -> int:
         **result.summary(),
         **volume_comparison(state, result),
     }
+    if history_event:
+        output["history_event_id"] = history_event["event_id"]
     if not result.terminal_confirmed:
         output["next_action"] = "run monitor or cancel; do not assume tea completed"
     emit(output)
@@ -1583,6 +1826,14 @@ async def async_cancel(args: argparse.Namespace) -> int:
     from xbloom_ble.client import XBloomClient
 
     address, name = await resolve_control_address(args.address, args.scan_timeout)
+    prior_state = None
+    for path in (STATE_FILE, TEA_STATE_FILE):
+        if path.exists():
+            try:
+                prior_state = state_read(path)
+                break
+            except RuntimeError:
+                pass
     async with XBloomClient(address) as client:
         await client.cancel_brew()
         if TEA_STATE_FILE.exists():
@@ -1591,15 +1842,22 @@ async def async_cancel(args: argparse.Namespace) -> int:
         await asyncio.sleep(0.5)
     state_clear()
     state_clear(TEA_STATE_FILE)
-    emit(
-        {
-            "command": "cancel",
-            "status": "cancel_sent",
-            "machine": name,
-            "coffee_state_cleared": True,
-            "tea_state_cleared": True,
-        }
+    history_event = record_history_event(
+        command="cancel",
+        outcome="cancelled",
+        state=prior_state or {"machine": name, "address": address},
+        extra={"machine": name},
     )
+    payload = {
+        "command": "cancel",
+        "status": "cancel_sent",
+        "machine": name,
+        "coffee_state_cleared": True,
+        "tea_state_cleared": True,
+    }
+    if history_event:
+        payload["history_event_id"] = history_event["event_id"]
+    emit(payload)
     return 0
 
 
@@ -1619,13 +1877,18 @@ async def async_start(args: argparse.Namespace) -> int:
         raise RuntimeError("start --progress-interval must be 0.1-60 seconds")
     path, _recipe, summary = load_recipe(args.recipe)
     state = state_read()
+    state_status = state.get("status")
+    if state_status in {"start_pending", "start_unconfirmed"}:
+        raise RuntimeError(
+            "previous start outcome is unconfirmed; run monitor or cancel; do not retry"
+        )
+    if state_status != "armed":
+        raise RuntimeError("armed-state record is not armed; load the recipe again")
     age = time.time() - float(state.get("loaded_at", 0))
     if age < 0 or age > ARM_MAX_AGE_SECONDS:
         raise RuntimeError("armed state is older than 5 minutes; load the recipe again")
     if state.get("recipe_sha256") != recipe_sha256(path):
         raise RuntimeError("recipe changed since it was loaded")
-    if state.get("status") != "armed":
-        raise RuntimeError("armed-state record is not armed; load the recipe again")
     address = str(state.get("address") or "")
     if not address:
         raise RuntimeError("armed state has no machine address")
@@ -1633,7 +1896,19 @@ async def async_start(args: argparse.Namespace) -> int:
         raise RuntimeError("requested machine differs from the armed machine")
 
     async with XBloomClient(address) as client:
-        event = await client.start()
+        state = dict(state)
+        state.update(status="start_pending", start_requested_at=time.time())
+        state_write(state, STATE_FILE)
+        try:
+            event = await client.start()
+        except BaseException:
+            state.update(
+                status="start_unconfirmed",
+                start_unconfirmed_at=time.time(),
+                last_state=state.get("last_state"),
+            )
+            state_write(state, STATE_FILE)
+            raise
         state = mark_workflow_started(state, STATE_FILE, event.state_name)
         emit(
             {
@@ -1657,6 +1932,15 @@ async def async_start(args: argparse.Namespace) -> int:
             active_already=(bool(event.raw) and event.state_name in ACTIVE_STATES),
         )
     state_record_cleared = finalize_workflow_state(state, STATE_FILE, result)
+    history_event = record_history_event(
+        command="start",
+        outcome=(
+            "completed" if result.terminal_confirmed else "completion_unconfirmed"
+        ),
+        state=state,
+        summary=summary,
+        monitor={**result.summary(), **volume_comparison(state, result)},
+    )
     output = {
         "command": "start",
         "status": (
@@ -1666,6 +1950,8 @@ async def async_start(args: argparse.Namespace) -> int:
         **result.summary(),
         **volume_comparison(state, result),
     }
+    if history_event:
+        output["history_event_id"] = history_event["event_id"]
     if not result.terminal_confirmed:
         output["next_action"] = "run monitor or cancel; do not assume brew completed"
     emit(output)
@@ -2052,6 +2338,102 @@ def build_parser() -> argparse.ArgumentParser:
         help="with --apply, must be exactly: own-account-cloud-recipe",
     )
     catalog_push.add_argument("--timeout", type=float, default=20.0)
+    catalog_delete = catalog_sub.add_parser(
+        "delete",
+        help="preview delete of one created cloud recipe by tableId/catalog id; --apply writes remotely",
+    )
+    catalog_delete.add_argument(
+        "--table-id",
+        type=int,
+        default=None,
+        help="remote created-recipe tableId from the account catalog",
+    )
+    catalog_delete.add_argument(
+        "--id",
+        dest="identifier",
+        default=None,
+        help="local catalog id/name used only to resolve a remote tableId for preview",
+    )
+    catalog_delete.add_argument(
+        "--email",
+        help="account email for --apply; may instead use XBLOOM_ACCOUNT_EMAIL",
+    )
+    catalog_delete.add_argument(
+        "--region",
+        choices=("international", "china"),
+        required=True,
+    )
+    catalog_delete.add_argument(
+        "--language",
+        choices=("en", "zh-cn"),
+        default="en",
+    )
+    catalog_delete.add_argument(
+        "--apply",
+        action="store_true",
+        help="perform the remote delete after the preview has been reviewed",
+    )
+    catalog_delete.add_argument(
+        "--confirm-delete",
+        default="",
+        help="with --apply, must be exactly: own-account-cloud-recipe-delete",
+    )
+    catalog_delete.add_argument("--timeout", type=float, default=20.0)
+    catalog_history_sync = catalog_sub.add_parser(
+        "history-sync",
+        help="import App brew-history records into the local journal via ephemeral login",
+    )
+    catalog_history_sync.add_argument(
+        "--email",
+        help="account email; may instead use XBLOOM_ACCOUNT_EMAIL",
+    )
+    catalog_history_sync.add_argument(
+        "--region",
+        choices=("international", "china"),
+        required=True,
+    )
+    catalog_history_sync.add_argument(
+        "--language",
+        choices=("en", "zh-cn"),
+        default="en",
+    )
+    catalog_history_sync.add_argument("--keyword", default="")
+    catalog_history_sync.add_argument(
+        "--have-pod",
+        type=int,
+        choices=(0, 1),
+        default=None,
+        help="optional App filter: 0=non-pod, 1=pod",
+    )
+    catalog_history_sync.add_argument("--timeout", type=float, default=20.0)
+    history = sub.add_parser(
+        "history",
+        help="inspect the local brew journal or attach a tasting note",
+    )
+    history_sub = history.add_subparsers(dest="history_action", required=True)
+    history_sub.add_parser("status", help="show journal path and counts")
+    history_list = history_sub.add_parser("list", help="list recent journal events")
+    history_list.add_argument("--limit", type=int, default=20)
+    history_list.add_argument("--source", choices=("local-skill", "app-cloud"))
+    history_list.add_argument(
+        "--outcome",
+        choices=(
+            "loaded",
+            "started",
+            "completed",
+            "completion_unconfirmed",
+            "cancelled",
+            "failed",
+            "imported",
+        ),
+    )
+    history_list.add_argument("--query")
+    history_list.add_argument("--recipe-sha256")
+    history_note = history_sub.add_parser(
+        "note", help="append a tasting/operator note linked to an existing event"
+    )
+    history_note.add_argument("event_id")
+    history_note.add_argument("note")
     load = sub.add_parser("load", help="load and arm a recipe; never starts brewing")
     load.add_argument("recipe")
     monitor = sub.add_parser("monitor", help="stream status/weights without starting")
@@ -2270,6 +2652,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_doctor(args)
         if args.command == "catalog":
             return cmd_catalog(args)
+        if args.command == "history":
+            return cmd_history(args)
         require_runtime()
         if args.command == "bridge":
             return cmd_bridge(args)

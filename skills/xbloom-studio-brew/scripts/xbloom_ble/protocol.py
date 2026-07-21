@@ -52,11 +52,12 @@ Starting a brew (commit / state-sensitive compatibility control / cancel)
 Loading only *arms* the machine. To start the brew remotely, the captured
 workflow uses these control frames:
 
-* command 8002 (legacy ``42 1f``) — **commit**: the machine moves to ``0x1e``
-  (awaiting-confirm) and shows its ~99 s add-beans countdown.
+* command 8002 (legacy ``42 1f``) — **commit**: the machine passes through ``0x1e``
+  (awaiting-confirm); tested firmware can then auto-proceed to starting.
 * command 40518 (``46 9e``) — APK 2.2.2 calls this **pause**. Target-firmware
   captures also prove a start meaning while the machine has freshly reported
-  ``awaiting_confirm``. Never infer that meaning from a timeout alone.
+  ``awaiting_confirm``. Never send it on the first transient ``0x1e``: observe the
+  auto-start window and freshly recheck that the machine is still awaiting.
 * command 40519 (``47 9e``) — **cancel**: abort a committed/running brew.
 
 All three carry the constant one-byte payload ``01``. The builders reproduce
@@ -927,8 +928,9 @@ def build_start() -> bytes:
     ``awaiting_confirm``; while running they pause/abort. Constant payload ``01``,
     seq ``0x9e``; captured frame ``580101469e0c0000000180a1``.
 
-    ⚠️ Emit only with a fresh awaiting-confirm precondition and an intentional,
-    physically ready brew. A timeout is not evidence of that state.
+    ⚠️ Emit only after the auto-start observation window and a fresh current-state
+    recheck still reports awaiting-confirm, with an intentional, physically ready
+    brew. A timeout or the first transient 0x1e is not evidence of a stall.
     """
     return xbloom_frame(START_OPCODE, BREW_SEQ, b"\x01")
 

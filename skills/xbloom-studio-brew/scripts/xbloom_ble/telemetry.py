@@ -40,7 +40,8 @@ Note on the brew sequence (observed on firmware V12.0D.500): after commit the
 machine goes ``awaiting_confirm (0x1e) → starting (0x22)``, then **grinds SILENTLY**
 — it emits no ``0x57`` *status* frame for ~20 s (only the scale stream, reading ~0)
 — before it reports the pour as ``0x10``. Consumers must not treat that gap as a
-stalled brew.
+stalled brew or send state-sensitive command 40518 merely because the first 0x1e
+was observed.
 
 The state ``0x1f`` (armed) is what :meth:`XBloomClient.load_recipe` waits for
 after sending the four LOAD frames — the machine is armed and prompting the human.

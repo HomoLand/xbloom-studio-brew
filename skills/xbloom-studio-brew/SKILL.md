@@ -1,6 +1,6 @@
 ---
 name: xbloom-studio-brew
-description: Design bean-specific hot pour-over and manual-over-ice Americano-style flash-brew recipes for xBloom Studio, research cited roaster/cafe/xPod references, import/query/sync a private app-visible coffee/tea catalog, preview or explicitly add local account recipes, run guarded Omni Tea Brewer recipes, dial in by taste, and operate bundled local BLE for diagnostics, settings, scale, grinder, temperature/volume water, recipe load, A/B/C presets, monitoring, cancel, persistent pause/resume, and explicitly gated physical starts. Use for xBloom Studio, Omni Dripper, xPod/NFC Recipe Cards, Omni Tea Brewer, official or saved coffee/tea recipes, iced coffee, C40 conversion, WAIT troubleshooting, electronic-scale readings, standalone grinding/water, or direct xBloom Bluetooth control.
+description: Design bean-specific hot pour-over and manual-over-ice Americano-style flash-brew recipes for xBloom Studio, research cited roaster/cafe/xPod references, import/query/sync a private app-visible coffee/tea catalog, preview or explicitly add/delete local account recipes, import App brew history, keep a local brew journal for dial-in, run guarded Omni Tea Brewer recipes, dial in by taste, and operate bundled local BLE for diagnostics, settings, scale, grinder, temperature/volume water, recipe load, A/B/C presets, monitoring, cancel, persistent pause/resume, and explicitly gated physical starts. Use for xBloom Studio, Omni Dripper, xPod/NFC Recipe Cards, Omni Tea Brewer, official or saved coffee/tea recipes, iced coffee, C40 conversion, WAIT troubleshooting, electronic-scale readings, standalone grinding/water, brew history, or direct xBloom Bluetooth control.
 ---
 
 # xBloom Studio Brew
@@ -19,10 +19,12 @@ Classify the request before acting:
 - **Research and compare:** find credible public bean/recipe sources, distinguish native xBloom
   recipes from adapted manual brews, and let the user choose before creating an executable recipe.
 - **Private catalog:** import authorized App/API or decoded-MMKV JSON; ephemerally sync official,
-  created, Product/xPod, and shared account recipes; preview or explicitly add local recipes.
+  created, Product/xPod, and shared account recipes; preview or explicitly add/delete local recipes;
+  import App brew-history records into the local journal.
 - **xPod reference:** preserve roaster intent but classify it `xPod-native`; adapt explicitly before
   using loose beans with Omni, and never assume an NFC card contains the full recipe payload.
-- **Dial-in:** inspect the previous recipe and tasted result, then change one variable.
+- **Dial-in:** inspect the previous recipe, local brew journal, and tasted result, then change one variable.
+- **Brew journal:** local load/start/cancel/complete telemetry plus optional App history import.
 - **Load to machine:** validate, preflight firmware/state, and arm the recipe. Do not start it.
 - **Brew now:** load first, then require current physical-readiness confirmation before `start`.
 - **Tea:** use the dedicated tea schema and Omni Tea Brewer protocol; keep load and execute separate.
@@ -97,6 +99,11 @@ python <skill-dir>/scripts/xbloom.py catalog show <id-or-name>
 python <skill-dir>/scripts/xbloom.py catalog export <id> <workspace-recipe.yaml>
 python <skill-dir>/scripts/xbloom.py catalog login-sync --region <china|international>
 python <skill-dir>/scripts/xbloom.py catalog push <recipe.yaml> --region <china|international>
+python <skill-dir>/scripts/xbloom.py catalog delete --region <china|international> --table-id <id>
+python <skill-dir>/scripts/xbloom.py catalog history-sync --region <china|international>
+python <skill-dir>/scripts/xbloom.py history status
+python <skill-dir>/scripts/xbloom.py history list --limit 20
+python <skill-dir>/scripts/xbloom.py history note <event_id> "tasting notes"
 ```
 
 Treat “all” as all records in the supplied export or visible to the user's own account and region,
@@ -114,6 +121,15 @@ never print or persist them. The older explicit-form `sync` remains available th
 same-name/different-parameter conflicts. Run `--apply --confirm-write own-account-cloud-recipe`
 only after the user explicitly approves that exact recipe and account mutation in the current
 interaction. Never use a live account merely to test the write path; tests must mock the endpoint.
+
+`catalog delete` is also preview-first. It deletes only a member-created cloud recipe by remote
+`tableId`, after verifying that id is present in the account created list. Apply only with
+`--apply --confirm-delete own-account-cloud-recipe-delete`.
+
+`catalog history-sync` imports App brew-history records into the local journal so phone-only
+brews can still be reviewed. Local BLE runs are written automatically by `load`/`start`/
+`tea-start`/`tea-brew`/`monitor`/`cancel` into `~/.xbloom-studio-brew/brew-history.jsonl`.
+Use `history status|list|note` for dial-in review. App history is coarser than local telemetry.
 
 ## Prepare local BLE
 
@@ -236,9 +252,9 @@ python <skill-dir>/scripts/xbloom.py bridge cancel
 ```
 
 Only send pause/resume when bridge status shows a compatible running/paused activity. Command
-`40518` is state-sensitive: the same app command confirms start only after a fresh
-`awaiting_confirm` state and pauses while running. It is not an unconditional start opcode or a
-recipe rewrite.
+`40518` is state-sensitive: it can confirm a stable awaiting start but pauses while running. Treat
+the first `awaiting_confirm` as transitional; let the CLI observe auto-start and freshly recheck
+state before fallback. Never retry `40518` after an unconfirmed start; inspect, monitor, or cancel.
 
 ## Use the Omni Tea Brewer
 

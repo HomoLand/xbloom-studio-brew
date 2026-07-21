@@ -222,13 +222,24 @@ def test_start_acts_on_commit_without_0x46():
     assert 0x46 not in _cmds(fake)  # machine acted -> don't nudge
 
 
+def test_start_does_not_pause_transient_awaiting_confirm():
+    fake = FakeBleak()
+    # Real V12.0D.500 sequence: 0x1e is transitional, then grinding starts.
+    fake.script[0x42] = [ACK_42, AWAITING_CONFIRM, STARTING]
+    c = _client(fake)
+    ev = run(c.start(settle=0.05))
+    assert ev.state_name == "starting"
+    assert 0x46 not in _cmds(fake)
+
+
 def test_start_nudges_with_0x46_when_stalled():
     fake = FakeBleak()
     fake.script[0x42] = [ACK_42, AWAITING_CONFIRM]
+    fake.script[0x56] = [AWAITING_CONFIRM]  # fresh current-state recheck
     fake.script[0x46] = [STARTING]      # the nudge gets it going
     c = _client(fake)
     ev = run(c.start(settle=0.05))
-    assert 0x46 in _cmds(fake)
+    assert _cmds(fake)[-3:] == [0x42, 0x56, 0x46]
     assert ev.state_name == "starting"
 
 
@@ -252,11 +263,43 @@ def test_start_refuses_state_sensitive_40518_when_commit_state_is_silent():
 def test_start_fails_if_40518_outcome_is_unconfirmed():
     fake = FakeBleak()
     fake.script[0x42] = [AWAITING_CONFIRM]
+    fake.script[0x56] = [AWAITING_CONFIRM]
     fake.script[0x46] = []
     c = _client(fake)
     with pytest.raises(XBloomError, match="start is unconfirmed"):
         run(c.start(settle=0.02))
     assert 0x46 in _cmds(fake)
+
+
+def test_start_reports_if_40518_returns_machine_to_armed():
+    fake = FakeBleak()
+    fake.script[0x42] = [AWAITING_CONFIRM]
+    fake.script[0x56] = [AWAITING_CONFIRM]
+    fake.script[0x46] = [ARMED]
+    c = _client(fake)
+    with pytest.raises(XBloomError, match="possible start/pause race"):
+        run(c.start(settle=0.02))
+
+
+def test_start_refuses_40518_when_awaiting_state_cannot_be_revalidated():
+    fake = FakeBleak()
+    fake.script[0x42] = [AWAITING_CONFIRM]
+    fake.script[0x56] = []
+    c = _client(fake)
+    with pytest.raises(XBloomError, match="current state could not be revalidated"):
+        run(c.start(settle=0.02))
+    assert 0x56 in _cmds(fake)
+    assert 0x46 not in _cmds(fake)
+
+
+def test_start_accepts_progress_observed_by_current_state_recheck():
+    fake = FakeBleak()
+    fake.script[0x42] = [AWAITING_CONFIRM]
+    fake.script[0x56] = [STARTING]
+    c = _client(fake)
+    ev = run(c.start(settle=0.02))
+    assert ev.state_name == "starting"
+    assert 0x46 not in _cmds(fake)
 
 
 # ── brew (load + start) & cancel ───────────────────────────────────────────

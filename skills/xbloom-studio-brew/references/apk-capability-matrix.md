@@ -39,8 +39,9 @@ Literal parity is neither possible nor desirable in one Agent Skill:
   while it runs.
 - Login/account mutation, recipe edit/share/pin, history, store/cart, device sharing, cloud logs,
   and J20 remote control are mobile/cloud services rather than Studio BLE appliance commands. The
-  Skill exposes only bounded own-account catalog reads and an idempotent add-only recipe subset;
-  overwrite/delete/share/profile actions remain excluded.
+  Skill exposes bounded own-account catalog reads, an idempotent add-only recipe upload,
+  preview-first created-recipe delete, App brew-history import into a local journal, and local
+  BLE brew-journal writes. Overwrite/share/pin/profile mutation remain excluded.
 - NFC is an Android tag reader that extracts an xPod identifier and asks xBloom's cloud for the
   recipe. The tag does not contain a complete portable brew program.
 - Firmware flashing and calibration can leave the machine unusable. Knowing their commands is not
@@ -68,20 +69,20 @@ evidence.
 | --- | --- | --- | --- |
 | Discovery and machine info | Connect over BLE; read model, firmware, units, water source, mode, and calibration baselines | **Available** through `scan`/`probe` and bridge; serial is redacted | **D/T/H**; more reports can still be modeled |
 | Coffee recipe | Dose, grinder/no-grind, pours, patterns, four-state vibration timing, flow, pause, RPM, bypass, RT/BP temperatures | **Available** as guarded YAML | **D/T/H** for the retained capture-compatible program; legacy `agitation` is input-only and normalizes to `vibration` |
-| Coffee execution | Load, arm, state-sensitive confirm/start, monitor, pause/resume, cancel, save A/B/C | **Available** one-shot and through the bridge | **D/T/H**; control-grade telemetry is not cloud app-history parity |
+| Coffee execution | Load, arm, state-sensitive confirm/start, monitor, pause/resume, cancel, save A/B/C | **Available** one-shot and through the bridge | **D/T/H**; local brew journal captures load/start/cancel/complete telemetry; App brew history can be imported separately and is coarser than control-grade telemetry |
 | Electronic scale | Enter, mandatory entry auto-zero, explicit re-tare, units, host timer, signed weight | **Available** one-shot and through the bridge | **D/T/H** for enter/read/re-tare/exit; persistent unit writes are only **D/T** |
 | FreeSolo grinder | Size, RPM, start, pause, resume, stop, exit | **Available** one-shot and through the bridge with cooldown | **D/T** in this project ledger; motor actions remain excluded from unattended tests |
 | FreeSolo brewer | Volume, RT/heated temperature, flow, circular/spiral/center pattern, tank/direct-feed source, pause/resume, live pattern/temp changes, stop, exit | **Available** for bounded dispense and bridge controls | Base dispense and running pattern switch are **D/T/H** on `V12.0D.500`; live temperature is **D/T**, not **P**; paused-state behavior is unmeasured; live volume/flow change is not exposed |
 | Omni Tea Brewer | Upload dedicated tea program, execute on the same or a later connection, and receive soak/pause/restart/finish reports | **Available** one-shot and through the bridge | Dedicated frames/templates are **D/T**. Programmed 80/90 ml fills are distinct from approximate 120 ml finished output; report `40520` is a firmware-owned siphon finish, not configurable coffee bypass; phase reports do not imply intervention commands |
 | Auto/Easy mode | Write the atomic A/B/C slot set, switch PRO/AUTO, and report order/count/mode | **Available** as one atomic A/B/C operation | **D/T/H** for the atomic batch and mode transition; command `11510` cannot represent bypass or tea, and arbitrary order/count editing is not public |
-| Private recipe catalog | Fetch official coffee/tea, combined Studio-created, Product/xPod, Shared, current Easy, and default Easy records; add a local created recipe | **Available** for authorized JSON/decoded-MMKV import, ephemeral own-account reads, and preview-first add-only upload | Import, normalization, app-compatible RSA envelope, secret non-persistence, idempotency, and conflict refusal are **D/T**. All five default reads plus two owner-approved additions, readback, stage ordering, and no-write replay were live-service verified on the China tenant on 2026-07-14. Live-service evidence is not hardware **H**; release tests still mock writes; no global-catalog claim |
+| Private recipe catalog | Fetch official coffee/tea, combined Studio-created, Product/xPod, Shared, current Easy, and default Easy records; add a local created recipe; delete a created recipe by tableId | **Available** for authorized JSON/decoded-MMKV import, ephemeral own-account reads, preview-first add-only upload, and preview-first created-recipe delete | Import, normalization, app-compatible RSA envelope, secret non-persistence, idempotency, and conflict refusal are **D/T**. Delete uses `tuRecipeDelete.tuhtml` after re-checking the created list. All five default reads plus two owner-approved additions, readback, stage ordering, and no-write replay were live-service verified on the China tenant on 2026-07-14. Live-service evidence is not hardware **H**; release tests still mock writes; no global-catalog claim |
 | Units, display, water source | Set weight unit, temperature unit, display brightness, persistent water source | **Available** with readback/rollback one-shot and through the bridge | **D/T**; physical setting changes have not been supervised by this project |
 | Pour radius and vibration amplitude | Read/write advanced mechanical tuning | **Available** with baseline-derived levels and rollback | **D/T**; APK UI ranges are enforced, physical writes remain unobserved |
 | Grinder calibration | Drive the grinder to its zero/calibration position | **Excluded by default** | Service-grade motor action; vendor app/physical procedure should own it |
 | Scale calibration / descaling | Guided physical maintenance screens | **Vendor-guided** | The Studio APK screens are mainly procedural, not a missing normal brew command |
 | Firmware update | Download firmware, enter upgrade mode, transfer with YMODEM | **Excluded by default** | High bricking risk, signed-image/update-policy questions, and no recovery path in the Skill |
 | NFC/xPod card | Read NfcV blocks, extract a six-character XID, fetch cloud recipe | **Reference input only** | Portable hosts may lack NFC; an authorized imported/fetched xPod record remains reference-only until explicit Omni adaptation |
-| Account and cloud | Login/profile, browse/edit/share/pin recipes, history, device sharing, logs | **Catalog read plus add-only subset** | Login is ephemeral; official/created/Product/Shared reads persist only normalized recipes. Local coffee/tea upload is preview-first, add-only, and exact-confirmation gated. Profile, overwrite/delete, share/pin, history, logs, and credential extraction remain excluded |
+| Account and cloud | Login/profile, browse/edit/share/pin recipes, history, device sharing, logs | **Catalog read, add-only upload, created delete, history import** | Login is ephemeral; official/created/Product/Shared reads persist only normalized recipes. Local coffee/tea upload is preview-first, add-only, and exact-confirmation gated. Created-recipe delete and App brew-history import are preview/login gated and never persist credentials. Profile, overwrite, share/pin, and credential extraction remain excluded |
 | Store and content UI | Product catalog, cart, articles, notifications, app updates | **Not a machine-control feature** | Use the official app/site |
 | xBloom Original (`J20`) | Wi-Fi/cloud machine control and J20-specific maintenance | **Out of scope** | It is a different product family in the same APK |
 
@@ -101,7 +102,7 @@ definitions above.
 | `8104` | Cup-geometry compatibility data | Internal fixed capture-compatible values; **D/T/H**; not a recipe temperature field |
 | `8001` / `8004` | Send coffee recipe with grinder / no-grind | Available; **D/T/H** |
 | `8002` | Commit loaded recipe | Available inside guarded start; **D/T/H** |
-| `40518` | Confirm start only while freshly awaiting; pause while running | Available with state-sensitive dispatch; **D/T/H** |
+| `40518` | Confirm start only after awaiting remains stable through observation and a fresh recheck; pause while running | Available with state-sensitive dispatch; **D/T/H** |
 | `40524` | Resume paused recipe | Available through bridge; **D/T/H** |
 | `40519` | Stop/cancel recipe | Available; **D/T/H** |
 | `8017` | Exit recipe pre-start screen | Available in unload/cancel recovery; **D/T/H** |

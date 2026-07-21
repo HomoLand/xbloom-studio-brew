@@ -62,6 +62,7 @@ class FakeBridgeClient:
         self.listeners = set()
         self.calls = []
         self.fail_grinder_pause = False
+        self.fail_coffee_start = False
         self.coffee_terminal_on_pause = False
         self.machine_info = {
             "serial_number": "private",
@@ -137,6 +138,8 @@ class FakeBridgeClient:
 
     async def start(self):
         self.calls.append("coffee_start")
+        if self.fail_coffee_start:
+            raise RuntimeError("start acknowledgement lost")
         event = _event(state=0x22, name="starting")
         self.emit(event)
         return event
@@ -319,6 +322,35 @@ def test_coffee_lifecycle_uses_one_held_client(tmp_path):
     asyncio.run(go())
     assert fake.calls.count("connect") == 1
     assert "coffee_pause" in fake.calls and "coffee_resume" in fake.calls
+
+
+def test_coffee_start_failure_requires_recovery_instead_of_retry(tmp_path):
+    core, fake = _core(tmp_path)
+    fake.fail_coffee_start = True
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        await core.rpc("coffee.load", {"recipe": str(recipe)})
+        with pytest.raises(BridgeError, match="do not retry start"):
+            await core.rpc("coffee.start", {"confirmation": READY_SENTINEL})
+
+        status = core.status()
+        assert status["activity"] == "coffee"
+        assert status["phase"] == "control_unconfirmed"
+        saved = json.loads(core.coffee_state_file.read_text(encoding="utf-8"))
+        assert saved["status"] == "start_unconfirmed"
+        assert "start_requested_at" in saved
+        assert "start_unconfirmed_at" in saved
+
+        with pytest.raises(BridgeError, match="no loaded coffee recipe"):
+            await core.rpc("coffee.start", {"confirmation": READY_SENTINEL})
+        assert fake.calls.count("coffee_start") == 1
+
+        await core.rpc("cancel")
+        assert not core.coffee_state_file.exists()
+        await core.shutdown()
+
+    asyncio.run(go())
 
 
 def test_coffee_terminal_during_pause_does_not_restore_stale_paused_state(tmp_path):

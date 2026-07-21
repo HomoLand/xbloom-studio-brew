@@ -28,6 +28,21 @@ These need only a release-regression run when their code path changes.
 
 ## P0: close the important physical gaps
 
+### H00 — Coffee start transient-state regression
+
+Incident evidence from 2026-07-14 on firmware `V12.0D.500`: load reached `armed`; start then
+reported transient `awaiting_confirm`, the Omni moved, and an immediate command `40518` paused it.
+The CLI returned `start is unconfirmed`. This is not a cup-movement or flash-recipe failure.
+
+- [ ] With the patched client, load a small supervised coffee recipe and start it once.
+- [ ] Confirm telemetry goes `awaiting_confirm -> starting` without command `40518` when commit
+  auto-proceeds.
+- [ ] Cancel after the minimum useful observation unless a normal cup is intentionally planned;
+  record emitted commands, states, and cleanup.
+
+Pass when a transient `awaiting_confirm` never causes `40518`, while the simulated persistent-
+awaiting branch remains covered by a fresh status recheck before its single fallback write.
+
 ### H01 — FreeSolo natural completion and volume telemetry
 
 - [ ] Put an empty heat-safe vessel of at least 250 ml on the platform before starting.
