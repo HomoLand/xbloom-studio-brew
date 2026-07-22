@@ -15,6 +15,7 @@ import struct
 import pytest
 
 from xbloom_ble.client import CHAR_STATUS, XBloomClient, XBloomError, scan
+from xbloom_ble.protocol import build_status_query
 from xbloom_ble.protocol import crc16_kermit, frame_command
 from xbloom_ble.recipe import Recipe
 from xbloom_ble.tea import TeaRecipe
@@ -90,13 +91,14 @@ class FakeBleak:
     scripted ``ffe2`` frames for that command byte back through the notify callback.
     """
 
-    def __init__(self, address="AA:BB:CC:DD:EE:FF", **_):
+    def __init__(self, address="AA:BB:CC:DD:EE:FF", disconnected_callback=None, **_):
         self.address = address
         self.is_connected = False
         self.writes: list[bytes] = []
         self._cb = None
         self._aux_cb = None
         self._slot_writes = 0
+        self._disconnected_callback = disconnected_callback
         # command byte (offset 3) -> frames to push after that write
         self.script: dict[int, list[str]] = {
             0x41: [ARMED],            # pours frame -> machine arms
@@ -111,6 +113,13 @@ class FakeBleak:
 
     async def disconnect(self):
         self.is_connected = False
+        if self._disconnected_callback is not None:
+            self._disconnected_callback(self)
+
+    def simulate_unexpected_drop(self):
+        self.is_connected = False
+        if self._disconnected_callback is not None:
+            self._disconnected_callback(self)
 
     async def start_notify(self, char, cb):
         if char == CHAR_STATUS:
@@ -152,6 +161,10 @@ def _client(fake: FakeBleak) -> XBloomClient:
     c = XBloomClient("AA:BB:CC:DD:EE:FF")
     c._client = fake
     fake.is_connected = True
+    # Injected fakes skip connect(); open a live link session for waiters and
+    # wire Bleak's disconnect callback the same way connect() would.
+    fake._disconnected_callback = c._on_bleak_disconnected
+    c._begin_link_session()
     return c
 
 
@@ -182,13 +195,231 @@ def test_scan_matches_by_name(monkeypatch):
 def test_connect_and_context_manager(monkeypatch):
     import bleak
 
-    fake = FakeBleak()
-    monkeypatch.setattr(bleak, "BleakClient", lambda addr: fake)
+    held: list[FakeBleak] = []
+
+    def factory(addr, **kwargs):
+        client = FakeBleak(addr, **kwargs)
+        held.append(client)
+        return client
+
+    monkeypatch.setattr(bleak, "BleakClient", factory)
 
     async def go():
         async with XBloomClient("AA:BB:CC:DD:EE:FF") as c:
             assert c._client.is_connected
-        assert not fake.is_connected  # __aexit__ disconnected
+        assert held and not held[0].is_connected  # __aexit__ disconnected
+
+    run(go())
+
+
+def test_disconnect_listener_expected_vs_unexpected(monkeypatch):
+    import bleak
+
+    held: list[FakeBleak] = []
+
+    def factory(addr, **kwargs):
+        client = FakeBleak(addr, **kwargs)
+        held.append(client)
+        return client
+
+    monkeypatch.setattr(bleak, "BleakClient", factory)
+    seen: list[bool] = []
+
+    async def go():
+        c = XBloomClient("AA:BB:CC:DD:EE:FF")
+        c.add_disconnect_listener(lambda expected: seen.append(expected))
+        await c.connect()
+        assert held and held[0]._disconnected_callback is not None
+        # Unexpected drop (Bleak callback without mark_disconnect_expected).
+        held[0].simulate_unexpected_drop()
+        assert seen == [False]
+        # Reconnect and expected disconnect.
+        await c.connect()
+        await c.disconnect()
+        assert seen == [False, True]
+
+    run(go())
+
+
+def test_ack_waiter_fails_promptly_with_xbloom_error_not_cancel(monkeypatch):
+    """Transport loss must set_exception(XBloomError) on ACK futures, not cancel()."""
+
+    import bleak
+
+    held: list[FakeBleak] = []
+
+    def factory(addr, **kwargs):
+        client = FakeBleak(addr, **kwargs)
+        # Status query / pause-like command writes: no auto ACK frames.
+        client.script = {}
+        client.script_full = {}
+        held.append(client)
+        return client
+
+    monkeypatch.setattr(bleak, "BleakClient", factory)
+
+    async def go():
+        c = XBloomClient("AA:BB:CC:DD:EE:FF", ack_timeout=30.0)
+        await c.connect()
+        assert held
+        fake = held[0]
+
+        async def drop_soon():
+            await asyncio.sleep(0.02)
+            fake.simulate_unexpected_drop()
+
+        dropper = asyncio.create_task(drop_soon())
+        t0 = asyncio.get_event_loop().time()
+        with pytest.raises(XBloomError, match="BLE|disconnect|link lost"):
+            # expect_command that never arrives — must fail on drop, not 30s timeout.
+            await c.send_command(build_status_query(), expect_command=0x9999, timeout=30.0)
+        elapsed = asyncio.get_event_loop().time() - t0
+        await dropper
+        assert elapsed < 2.0, f"ACK wait hung too long after link loss: {elapsed:.2f}s"
+        # Must not surface as CancelledError (checked by raises XBloomError above).
+
+    run(go())
+
+
+def test_connect_partial_failure_disconnects_underlying_handle(monkeypatch):
+    """Partial connect (is_connected=True then raise) must best-effort disconnect.
+
+    Clearing ownership before disconnect strands the OS/GATT handle so bridge
+    outer cleanup cannot release the radio for the phone.
+    """
+
+    import bleak
+
+    held: list[FakeBleak] = []
+
+    class PartialConnectBleak(FakeBleak):
+        def __init__(self, address="AA:BB:CC:DD:EE:FF", disconnected_callback=None, **_):
+            super().__init__(
+                address, disconnected_callback=disconnected_callback, **_
+            )
+            self.disconnect_calls = 0
+
+        async def connect(self):
+            # Simulate OS/GATT handle partially established then failure.
+            self.is_connected = True
+            raise RuntimeError("partial GATT connect failure")
+
+        async def disconnect(self):
+            self.disconnect_calls += 1
+            self.is_connected = False
+            if self._disconnected_callback is not None:
+                self._disconnected_callback(self)
+
+    def factory(addr, **kwargs):
+        client = PartialConnectBleak(addr, **kwargs)
+        held.append(client)
+        return client
+
+    monkeypatch.setattr(bleak, "BleakClient", factory)
+
+    async def go():
+        c = XBloomClient("AA:BB:CC:DD:EE:FF")
+        with pytest.raises(RuntimeError, match="partial GATT"):
+            await c.connect()
+        assert held
+        fake = held[0]
+        assert fake.disconnect_calls >= 1, "underlying client must be disconnected"
+        assert fake.is_connected is False, "no OS/GATT handle may remain"
+        assert c._client is None, "ownership must be cleared after abandon"
+        # Bridge-style outer cleanup still safe (no-op, no resurrected handle).
+        await c.disconnect()
+        assert fake.is_connected is False
+        assert c._client is None
+
+    run(go())
+
+
+def test_send_command_link_loss_while_waiting_write_lock_retrieves_future(monkeypatch):
+    """Link loss set_exception during write-lock wait must not leave unretrieved futures."""
+
+    import bleak
+
+    held: list[FakeBleak] = []
+
+    def factory(addr, **kwargs):
+        client = FakeBleak(addr, **kwargs)
+        client.script = {}
+        client.script_full = {}
+        held.append(client)
+        return client
+
+    monkeypatch.setattr(bleak, "BleakClient", factory)
+
+    async def go():
+        c = XBloomClient("AA:BB:CC:DD:EE:FF", ack_timeout=30.0)
+        await c.connect()
+        fake = held[0]
+        loop = asyncio.get_running_loop()
+        contexts: list[dict] = []
+
+        def handler(_loop, context):
+            contexts.append(dict(context))
+
+        loop.set_exception_handler(handler)
+        # Hold the write lock so send_command blocks after registering the ACK future.
+        await c._write_lock.acquire()
+        try:
+            send_task = asyncio.create_task(
+                c.send_command(
+                    build_status_query(), expect_command=0x9999, timeout=30.0
+                )
+            )
+            # Let send_command register the waiter and block on the lock.
+            for _ in range(50):
+                if any(c._command_waiters.values()):
+                    break
+                await asyncio.sleep(0.01)
+            assert any(c._command_waiters.values()), "ACK future was not registered"
+            fake.simulate_unexpected_drop()
+        finally:
+            c._write_lock.release()
+
+        with pytest.raises(XBloomError, match="BLE|disconnect|link lost|not connected"):
+            await send_task
+
+        # Flush any deferred "Future exception was never retrieved" callbacks.
+        await asyncio.sleep(0)
+        messages = " ".join(
+            str(ctx.get("message", "")) + " " + str(ctx.get("exception", ""))
+            for ctx in contexts
+        )
+        assert "never retrieved" not in messages.lower(), messages
+        assert "Future exception" not in messages, messages
+
+    run(go())
+
+
+def test_queue_waiter_fails_promptly_with_xbloom_error_not_cancel():
+    """Queue drains (_drain_until_state) must wake on link loss with XBloomError."""
+
+    fake = FakeBleak()
+    # No ARMED frames — drain would otherwise hang until ack_timeout.
+    fake.script = {}
+    c = _client(fake)
+    c.ack_timeout = 30.0
+
+    async def go():
+        await c._start_notify()
+        try:
+
+            async def drop_soon():
+                await asyncio.sleep(0.02)
+                fake.simulate_unexpected_drop()
+
+            dropper = asyncio.create_task(drop_soon())
+            t0 = asyncio.get_event_loop().time()
+            with pytest.raises(XBloomError, match="BLE|disconnect|link lost"):
+                await c._drain_until_state(0x1F, timeout=30.0)
+            elapsed = asyncio.get_event_loop().time() - t0
+            await dropper
+            assert elapsed < 2.0, f"queue wait hung too long after link loss: {elapsed:.2f}s"
+        finally:
+            await c._stop_notify()
 
     run(go())
 

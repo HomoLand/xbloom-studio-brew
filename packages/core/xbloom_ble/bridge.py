@@ -150,7 +150,16 @@ GRINDER_REST_SECONDS = 60
 
 
 class BridgeError(RuntimeError):
-    """Safe, user-facing bridge failure."""
+    """Safe, user-facing bridge failure.
+
+    Optional ``category`` is a stable client-facing class (for example
+    ``device_busy_external``) without claiming more certainty than the
+    underlying transport error supports.
+    """
+
+    def __init__(self, message: str, *, category: str | None = None) -> None:
+        super().__init__(message)
+        self.category = category
 
 
 class BridgeCompatibilityError(BridgeError):
@@ -159,6 +168,38 @@ class BridgeCompatibilityError(BridgeError):
 
 class BridgeLockError(BridgeError):
     """Another bridge instance holds the lifecycle lock."""
+
+
+# Connect failures that often mean the phone/app or another client owns the
+# radio. Unavailable vs already-connected vs GATT busy cannot always be
+# distinguished from Bleak text alone — surface one stable category.
+_DEVICE_BUSY_EXTERNAL_MARKERS = (
+    "already connected",
+    "already in use",
+    "device in use",
+    "in use",
+    "busy",
+    "gatt",
+    "not available",
+    "unavailable",
+    "connection failed",
+    "failed to connect",
+    "peer removed pairing",
+    "disconnected",
+    "access denied",
+    "permission",
+    "resource temporarily unavailable",
+    "os error",
+    "winerror",
+    "bluetooth",
+)
+
+# Fresh machine states that positively prove a non-terminal coffee workflow.
+_RECONCILE_ACTIVE_STATES = frozenset(
+    {"starting", "brewing", "awaiting_confirm"}
+)
+_RECONCILE_TERMINAL_STATES = frozenset({"ready", "complete", "idle"})
+_RECONCILE_LOADED_COFFEE_STATES = frozenset({"armed"})
 
 
 class BridgeLock:
@@ -578,6 +619,10 @@ class BridgeCore:
         self._idle_orphan_since: float | None = None
         self._idle_orphan_deadline: float | None = None
         self._idle_orphan_task: asyncio.Task[Any] | None = None
+        # Client identity for disconnect callbacks: ignore stale expected drops
+        # after terminal release so they cannot rewrite terminal → recovery.
+        self._client_generation: int = 0
+        self._bound_client_generation: int = 0
         # Reconstruct durable workflow identity without auto-connect / start.
         self._reconstruct_from_store()
 
@@ -1085,6 +1130,324 @@ class BridgeCore:
         self._loaded_needs_reconcile = False
         self._recovery_required = False
         self._recovery_detail = None
+
+    async def _recovery_reconcile(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        """Explicit recovery RPC: connect + query only; never load/start/control.
+
+        Requires matching active ``workflow_id``. Uses the fresh state-generation
+        gate (not stale ``machine_state``). Clears recovery only after durable
+        reconciliation succeeds. No automatic periodic reconnect.
+        """
+
+        workflow_id, _ = self._require_active_workflow(params)
+        if self.activity is None and self.active_workflow_id is None:
+            raise BridgeError("recovery.reconcile requires an active durable workflow")
+
+        # One connect attempt if needed; never retry within this operation.
+        connect_established = False
+        if not self.connected:
+            try:
+                await self._connect_unlocked(params, scope="workflow")
+                connect_established = True
+            except BridgeError as exc:
+                # External busy / connect failure: retain durable ownership.
+                self._recovery_required = True
+                category = getattr(exc, "category", None) or self._classify_connect_failure(
+                    exc
+                )
+                self._recovery_detail = {
+                    "reason": "recovery_reconcile_connect_failed",
+                    "workflow_id": workflow_id,
+                    "category": category,
+                    "error": str(exc),
+                    "message": (
+                        "recovery.reconcile connect failed; durable ownership retained; "
+                        "one attempt only; do not auto-retry"
+                    ),
+                }
+                self.last_error = self._recovery_detail["message"]
+                # Persist fail-closed.
+                try:
+                    self.store.transition_workflow(
+                        workflow_id,
+                        recovery=dict(self._recovery_detail),
+                        event_type="recovery_reconcile_failed",
+                        event_payload=dict(self._recovery_detail),
+                    )
+                except StorageError as persist_exc:
+                    self._recovery_detail["persist_error"] = str(persist_exc)
+                    self.last_error = (
+                        f"{self.last_error}; persist also failed: {persist_exc}"
+                    )
+                if category:
+                    raise BridgeError(
+                        f"{category}: {exc}",
+                        category=category,
+                    ) from exc
+                raise BridgeError(
+                    f"recovery_required: {exc}; durable ownership retained"
+                ) from exc
+            except Exception as exc:
+                self._recovery_required = True
+                category = self._classify_connect_failure(exc)
+                self._recovery_detail = {
+                    "reason": "recovery_reconcile_connect_failed",
+                    "workflow_id": workflow_id,
+                    "category": category,
+                    "error": str(exc),
+                }
+                self.last_error = f"recovery.reconcile connect failed: {exc}"
+                try:
+                    self.store.transition_workflow(
+                        workflow_id,
+                        recovery=dict(self._recovery_detail),
+                        event_type="recovery_reconcile_failed",
+                        event_payload=dict(self._recovery_detail),
+                    )
+                except StorageError as persist_exc:
+                    self._recovery_detail["persist_error"] = str(persist_exc)
+                if category:
+                    raise BridgeError(
+                        f"{category}: {exc}",
+                        category=category,
+                    ) from exc
+                raise BridgeError(
+                    f"recovery_required: connect failed: {exc}; ownership retained"
+                ) from exc
+
+        if self.client is None or not self.connected:
+            self._recovery_required = True
+            raise BridgeError(
+                "recovery_required: no BLE link after connect attempt; "
+                "do not load/start; ownership retained"
+            )
+
+        # Query fresh state only — no load, start, or control writes.
+        timeout = self.machine_info_timeout
+        generation_before = self._state_notify_generation
+        self._state_notify_event.clear()
+        try:
+            await self.client.request_status()
+            await self._await_fresh_state_notification(
+                generation_before=generation_before, timeout=timeout
+            )
+        except Exception as exc:
+            self._recovery_required = True
+            self._recovery_detail = {
+                "reason": "recovery_reconcile_query_failed",
+                "workflow_id": workflow_id,
+                "error": str(exc),
+                "machine_state": self.machine_state,
+                "link_kept": True,
+                "message": (
+                    "fresh state query failed; keep BLE for telemetry/cancel; "
+                    "recovery_required; never re-load/start"
+                ),
+            }
+            self.last_error = self._recovery_detail["message"]
+            try:
+                self.store.transition_workflow(
+                    workflow_id,
+                    recovery=dict(self._recovery_detail),
+                    event_type="recovery_reconcile_failed",
+                    event_payload=dict(self._recovery_detail),
+                )
+            except StorageError as persist_exc:
+                self._recovery_detail["persist_error"] = str(persist_exc)
+                self.last_error = (
+                    f"{self.last_error}; persist also failed: {persist_exc}"
+                )
+            raise BridgeError(
+                f"recovery_required: no fresh state after query ({exc}); "
+                "link kept; do not load/start"
+            ) from exc
+
+        fresh = self.machine_state
+        activity = self.activity
+
+        # Loaded tea: no positive protocol marker → remain recovery_required.
+        # Must run before terminal matching: idle/ready is not proof the tea
+        # recipe finished (it may never have started).
+        if activity == "tea" and self.phase == "loaded":
+            self._recovery_required = True
+            self._loaded_needs_reconcile = True
+            self._recovery_detail = {
+                "reason": "recovery_reconcile_tea_no_positive_marker",
+                "workflow_id": workflow_id,
+                "machine_state": fresh,
+                "link_kept": True,
+                "message": (
+                    "tea loaded has no positive protocol marker; "
+                    "recovery_required; do not start; never re-load"
+                ),
+            }
+            self.last_error = self._recovery_detail["message"]
+            try:
+                self.store.transition_workflow(
+                    workflow_id,
+                    state="loaded",
+                    machine_phase="loaded",
+                    recovery=dict(self._recovery_detail),
+                    event_type="recovery_reconcile_tea_fail_closed",
+                    event_payload=dict(self._recovery_detail),
+                )
+            except StorageError as persist_exc:
+                self._recovery_detail["persist_error"] = str(persist_exc)
+                self.last_error = (
+                    f"{self.last_error}; persist also failed: {persist_exc}"
+                )
+            raise BridgeError(
+                "recovery_required: tea loaded cannot confirm recipe still loaded "
+                f"(machine_state={fresh!r}; no positive protocol marker); "
+                "link kept; do not start; never re-load"
+            )
+
+        # Loaded coffee: fresh armed → reattach monitoring, clear recovery after durable.
+        if activity == "coffee" and fresh in _RECONCILE_LOADED_COFFEE_STATES:
+            try:
+                self.store.transition_workflow(
+                    workflow_id,
+                    state="loaded",
+                    machine_phase="loaded",
+                    recovery=CLEAR_RECOVERY,
+                    event_type="recovery_reconciled",
+                    event_payload={
+                        "outcome": "loaded_armed",
+                        "machine_state": fresh,
+                        "connect_established": connect_established,
+                    },
+                )
+            except StorageError as exc:
+                self._recovery_required = True
+                self._loaded_needs_reconcile = True
+                self._recovery_detail = {
+                    "reason": "recovery_reconcile_persist_failed",
+                    "workflow_id": workflow_id,
+                    "machine_state": fresh,
+                    "error": str(exc),
+                }
+                self.last_error = (
+                    f"fresh armed observed but durable reconcile failed: {exc}; "
+                    "recovery_required (fail-closed)"
+                )
+                raise BridgeError(self.last_error) from exc
+            self.phase = "loaded"
+            self._loaded_needs_reconcile = False
+            self._recovery_required = False
+            self._recovery_detail = None
+            self.last_error = None
+            if self.connection_scope != "explicit":
+                self.connection_scope = "workflow"
+            result = self.status()
+            result["reconciled"] = True
+            result["reconcile_outcome"] = "loaded_armed"
+            result["fresh_machine_state"] = fresh
+            return result
+
+        # Positive active / paused proof: reattach monitoring, do not reissue start.
+        paused_report = str(self.telemetry.get("last_report") or "") in {
+            "tea_paused",
+            "brewer_paused",
+            "grinder_paused",
+        }
+        if fresh in _RECONCILE_ACTIVE_STATES or (
+            self.phase == "paused" and fresh in _RECONCILE_ACTIVE_STATES
+        ) or (paused_report and fresh not in _RECONCILE_TERMINAL_STATES):
+            if paused_report and fresh not in _RECONCILE_ACTIVE_STATES:
+                new_phase = "paused"
+            elif fresh == "starting":
+                new_phase = "starting"
+            else:
+                new_phase = "running"
+            try:
+                self.store.transition_workflow(
+                    workflow_id,
+                    state=new_phase,
+                    machine_phase=new_phase,
+                    recovery=CLEAR_RECOVERY,
+                    event_type="recovery_reconciled",
+                    event_payload={
+                        "outcome": new_phase,
+                        "machine_state": fresh,
+                        "connect_established": connect_established,
+                    },
+                )
+            except StorageError as exc:
+                self._recovery_required = True
+                self._recovery_detail = {
+                    "reason": "recovery_reconcile_persist_failed",
+                    "workflow_id": workflow_id,
+                    "machine_state": fresh,
+                    "error": str(exc),
+                }
+                self.last_error = (
+                    f"fresh active state observed but durable reconcile failed: {exc}; "
+                    "recovery_required (fail-closed)"
+                )
+                raise BridgeError(self.last_error) from exc
+            self.phase = new_phase
+            self._saw_active = True
+            self._recovery_required = False
+            self._recovery_detail = None
+            self._loaded_needs_reconcile = False
+            self.last_error = None
+            if self.connection_scope != "explicit":
+                self.connection_scope = "workflow"
+            result = self.status()
+            result["reconciled"] = True
+            result["reconcile_outcome"] = new_phase
+            result["fresh_machine_state"] = fresh
+            return result
+
+        # Fresh confirmed terminal of an in-progress / unconfirmed workflow.
+        # Loaded awaiting start is excluded: idle/ready is not proof a brew ended.
+        past_loaded = self.phase not in {
+            "loaded",
+            "loading",
+            "created",
+        }
+        if fresh in _RECONCILE_TERMINAL_STATES and past_loaded:
+            self._finish_activity(
+                str(fresh),
+                release_reason="recovery_reconcile_terminal",
+            )
+            status = self.status()
+            status["reconciled"] = True
+            status["reconcile_outcome"] = "terminal"
+            status["fresh_machine_state"] = fresh
+            return status
+
+        # Unknown / no positive proof: remain recovery_required; keep link.
+        self._recovery_required = True
+        self._recovery_detail = {
+            "reason": "recovery_reconcile_unknown_state",
+            "workflow_id": workflow_id,
+            "machine_state": fresh,
+            "activity": activity,
+            "phase": self.phase,
+            "link_kept": True,
+            "message": (
+                "fresh state does not positively prove loaded/active/terminal; "
+                "recovery_required; link kept; never re-load/start"
+            ),
+        }
+        self.last_error = self._recovery_detail["message"]
+        try:
+            self.store.transition_workflow(
+                workflow_id,
+                recovery=dict(self._recovery_detail),
+                event_type="recovery_reconcile_unknown",
+                event_payload=dict(self._recovery_detail),
+            )
+        except StorageError as persist_exc:
+            self._recovery_detail["persist_error"] = str(persist_exc)
+            self.last_error = (
+                f"{self.last_error}; persist also failed: {persist_exc}"
+            )
+        raise BridgeError(
+            f"recovery_required: fresh machine_state={fresh!r} is not a positive "
+            "loaded/active/terminal proof; link kept; do not load/start"
+        )
 
     def _persist_event(
         self,
@@ -2035,6 +2398,215 @@ class BridgeCore:
             if asyncio.current_task() is self._release_task:
                 self._release_task = None
 
+    @staticmethod
+    def _classify_connect_failure(exc: BaseException) -> str | None:
+        """Map transport errors to a stable external-busy category when applicable.
+
+        Bleak/OS text often cannot distinguish unavailable vs already-connected
+        vs GATT busy. When any of those signals appear, return
+        ``device_busy_external`` without claiming a more specific root cause.
+        """
+
+        text = str(exc).casefold()
+        if not text:
+            return None
+        for marker in _DEVICE_BUSY_EXTERNAL_MARKERS:
+            if marker in text:
+                return "device_busy_external"
+        # Common exception type names from Bleak / OS stacks.
+        name = type(exc).__name__.casefold()
+        if any(
+            token in name
+            for token in ("bleak", "bluetooth", "gatt", "busy", "timeout")
+        ):
+            return "device_busy_external"
+        return None
+
+    def _bind_client_listeners(self, client: Any) -> None:
+        """Register event + disconnect observers for a newly owned client."""
+
+        self._client_generation += 1
+        self._bound_client_generation = self._client_generation
+        client.add_event_listener(self._on_event)
+        add_disc = getattr(client, "add_disconnect_listener", None)
+        if callable(add_disc):
+            add_disc(self._on_client_disconnected)
+
+    def _unbind_client_listeners(self, client: Any, *, expected: bool = True) -> None:
+        """Detach observers; mark disconnect expected before bridge-initiated close."""
+
+        # Invalidate in-flight unexpected callbacks for this generation.
+        self._bound_client_generation = 0
+        try:
+            client.remove_event_listener(self._on_event)
+        except Exception:
+            pass
+        remove_disc = getattr(client, "remove_disconnect_listener", None)
+        if callable(remove_disc):
+            try:
+                remove_disc(self._on_client_disconnected)
+            except Exception:
+                pass
+        if expected:
+            mark = getattr(client, "mark_disconnect_expected", None)
+            if callable(mark):
+                try:
+                    mark()
+                except Exception:
+                    pass
+
+    def _on_client_disconnected(self, expected: bool = False) -> None:
+        """Client disconnect listener entrypoint (expected vs unexpected)."""
+
+        if expected:
+            # Bridge-initiated close/disconnect must never create recovery.
+            return
+        # Stale callback after intentional unbind / terminal release.
+        if self._bound_client_generation == 0:
+            return
+        self._handle_unexpected_ble_disconnect()
+
+    def _handle_unexpected_ble_disconnect(self) -> None:
+        """Detach ownership on an unexpected BLE drop; never auto-reconnect.
+
+        With an active durable workflow, retain activity and workflow identity,
+        persist ``ble_disconnected`` recovery, and surface recovery_required.
+        With no activity/workflow, settle to disconnected without inventing recovery.
+        Recovery may only reconnect/query/reconcile later via explicit RPC —
+        never load, start, or other uncertain machine actions here.
+        """
+
+        client = self.client
+        # Preserve address for explicit recovery reconnect.
+        preserved_address = self.address or self.default_address
+        generation = self._bound_client_generation
+        self._bound_client_generation = 0
+        if client is not None:
+            try:
+                client.remove_event_listener(self._on_event)
+            except Exception:
+                pass
+            remove_disc = getattr(client, "remove_disconnect_listener", None)
+            if callable(remove_disc):
+                try:
+                    remove_disc(self._on_client_disconnected)
+                except Exception:
+                    pass
+        # Drop stale client ownership; do not clear workflow activity.
+        self.client = None
+        self.connection_scope = None
+        self.release_pending = False
+        self._pending_release_reason = None
+        self._cancel_pending_release()
+        self._idle_orphan_since = None
+        self._idle_orphan_deadline = None
+        self._cancel_idle_orphan_task()
+        if preserved_address:
+            self.address = preserved_address
+            if not self.default_address:
+                self.default_address = preserved_address
+        self.machine_name = None
+        self.last_disconnect_reason = "ble_disconnected"
+        self.last_disconnect_time = round(time.time(), 3)
+        self.last_disconnect_error = None
+
+        has_workflow = self.active_workflow_id is not None or self.activity is not None
+        if not has_workflow:
+            # Idle / no durable ownership: settle without inventing recovery.
+            if self.phase not in {"disconnected", "idle"}:
+                self.phase = "disconnected"
+            elif self.phase == "idle":
+                self.phase = "disconnected"
+            return
+
+        # Active durable workflow / activity: recovery_required, no auto-reconnect.
+        prior_phase = self.phase
+        self._recovery_required = True
+        recovery_payload: dict[str, Any] = {
+            "reason": "ble_disconnected",
+            "workflow_id": self.active_workflow_id,
+            "activity": self.activity,
+            "phase": prior_phase,
+            "address": preserved_address,
+            "client_generation": generation,
+            "message": (
+                "unexpected BLE disconnect; recovery may reconnect and query only; "
+                "do not repeat load/start or other uncertain machine actions"
+            ),
+        }
+        # Loaded coffee remains a loaded recovery candidate needing fresh armed.
+        if prior_phase == "loaded" and self.activity == "coffee":
+            self._loaded_needs_reconcile = True
+            self.phase = "loaded"
+            recovery_payload["loaded_needs_reconcile"] = True
+        elif prior_phase == "loaded" and self.activity == "tea":
+            # Tea has no positive loaded marker — fail-closed.
+            self._loaded_needs_reconcile = True
+            self.phase = "loaded"
+            recovery_payload["tea_fail_closed"] = True
+        elif prior_phase in {
+            "running",
+            "paused",
+            "soaking",
+            "starting",
+            "control_unconfirmed",
+            "stop_unconfirmed",
+            "stopping",
+            "writing",
+            "load_unconfirmed",
+            "write_unconfirmed",
+        }:
+            # Become recovery_required without rewriting phase back to running.
+            # Keep the prior phase for observability; recovery flag is authoritative.
+            self.phase = prior_phase
+        else:
+            # created/loading/recovery_required/etc.: keep phase, require recovery.
+            self.phase = prior_phase if prior_phase else "recovery_required"
+
+        self._recovery_detail = recovery_payload
+        self.last_error = recovery_payload["message"]
+
+        # Persist ble_disconnected event + recovery state; fail closed in memory.
+        wid = self.active_workflow_id
+        if wid:
+            try:
+                self.store.transition_workflow(
+                    wid,
+                    # Do not force durable state to recovery_required for
+                    # running/paused — keep prior non-terminal state when active.
+                    state=(
+                        prior_phase
+                        if prior_phase
+                        in {
+                            "loaded",
+                            "running",
+                            "paused",
+                            "soaking",
+                            "starting",
+                            "control_unconfirmed",
+                            "stop_unconfirmed",
+                            "created",
+                            "loading",
+                        }
+                        else "recovery_required"
+                    ),
+                    machine_phase=prior_phase,
+                    recovery=recovery_payload,
+                    event_type="ble_disconnected",
+                    event_payload=dict(recovery_payload),
+                )
+            except StorageError as exc:
+                self._recovery_required = True
+                self._recovery_detail = {
+                    **recovery_payload,
+                    "persist_error": str(exc),
+                    "reason": "ble_disconnected_persist_failed",
+                }
+                self.last_error = (
+                    f"unexpected BLE disconnect and recovery persist failed: {exc}; "
+                    "recovery_required (fail-closed in memory)"
+                )
+
     async def _connect_unlocked(
         self,
         params: Mapping[str, Any],
@@ -2056,23 +2628,52 @@ class BridgeCore:
                 self._cancel_idle_orphan_task()
             return self.status()
         self._cancel_pending_release()
-        self.phase = "connecting"
+        # Preserve workflow phase during recovery reconnect; only show connecting
+        # when there is no durable activity to keep.
+        prior_phase = self.phase
+        if self.activity is None and self.active_workflow_id is None:
+            self.phase = "connecting"
         self.last_error = None
         self._machine_info_ready.clear()
-        address, name = await self._resolve_address(
-            str(requested) if requested else None,
-            float(params.get("scan_timeout", 8.0)),
-        )
-        client = self.client_factory(address)
-        client.add_event_listener(self._on_event)
         try:
+            address, name = await self._resolve_address(
+                str(requested) if requested else None,
+                float(params.get("scan_timeout", 8.0)),
+            )
+        except Exception as exc:
+            if self.activity is None and self.active_workflow_id is None:
+                self.phase = "disconnected"
+            category = self._classify_connect_failure(exc)
+            if category:
+                raise BridgeError(
+                    f"{category}: {exc}",
+                    category=category,
+                ) from exc
+            raise
+        client = self.client_factory(address)
+        try:
+            # One connect attempt only — no retry / preemption / background reconnect.
+            # Bind disconnect listeners only after the link is up so a connect-time
+            # failure cannot race as unexpected recovery against a half-owned client.
             await client.connect()
-            await client.open_session()
+            if not bool(getattr(client, "is_connected", False)):
+                raise BridgeError(f"failed to connect to {address}")
+            # Ownership + listeners are established together before any further await.
             self.client = client
             self.address = address
             self.machine_name = name
             self.connection_scope = scope
-            self.phase = "idle"
+            self._bind_client_listeners(client)
+            await client.open_session()
+            if self.activity is None and self.active_workflow_id is None:
+                self.phase = "idle"
+            # else: keep prior recovery/workflow phase; event listener reattached.
+            if not self.connected:
+                # Unexpected drop between bind and open_session completion.
+                raise BridgeError(
+                    self.last_error
+                    or "BLE link lost during session open; recovery_required"
+                )
             await client.request_status()
             try:
                 await asyncio.wait_for(
@@ -2080,17 +2681,46 @@ class BridgeCore:
                 )
             except asyncio.TimeoutError:
                 self.last_error = "machine-info report not observed; writes remain gated"
-        except Exception:
-            client.remove_event_listener(self._on_event)
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-            self.client = None
+        except Exception as exc:
+            # Unexpected drop may already have unbound and cleared self.client.
+            if self.client is client:
+                self._unbind_client_listeners(client, expected=True)
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                self.client = None
+            elif client is not None:
+                # Never owned / already detached by disconnect callback: best-effort
+                # close without inventing a second recovery transition.
+                mark = getattr(client, "mark_disconnect_expected", None)
+                if callable(mark):
+                    try:
+                        mark()
+                    except Exception:
+                        pass
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
             self.connection_scope = None
-            self.phase = "disconnected"
+            if self.activity is None and self.active_workflow_id is None:
+                self.phase = "disconnected"
+            else:
+                # Preserve recovery phase if drop handler already recorded it.
+                if not self._recovery_required:
+                    self.phase = prior_phase
             self._arm_or_clear_idle_orphan_watch()
-            raise
+            category = self._classify_connect_failure(exc)
+            if category:
+                self.last_error = f"{category}: {exc}"
+                raise BridgeError(
+                    f"{category}: connect failed ({exc}); one attempt only, no retry",
+                    category=category,
+                ) from exc
+            if isinstance(exc, BridgeError):
+                raise
+            raise BridgeError(str(exc)) from exc
         # Lifecycle transition only (not status/events): arm if already orphan.
         self._arm_or_clear_idle_orphan_watch()
         return self.status()
@@ -2101,6 +2731,7 @@ class BridgeCore:
         reason: str = "explicit",
         require_idle_activity: bool = True,
         record_failure: bool = True,
+        clear_address: bool = True,
     ) -> dict[str, Any]:
         if require_idle_activity and self.activity is not None:
             raise BridgeError("an activity is loaded or running; stop/cancel it first")
@@ -2114,7 +2745,9 @@ class BridgeCore:
             self._idle_orphan_deadline = None
             self._cancel_idle_orphan_task()
             return self.status()
-        client.remove_event_listener(self._on_event)
+        # Unbind listeners and mark expected *before* close so Bleak callbacks
+        # cannot race after terminal release and invent recovery.
+        self._unbind_client_listeners(client, expected=True)
         disconnect_error: str | None = None
         try:
             try:
@@ -2133,7 +2766,8 @@ class BridgeCore:
             # can reconnect. Physical retry of machine actions is never done here.
             # Release never auto-reconnects.
             self.client = None
-            self.address = None
+            if clear_address:
+                self.address = None
             self.machine_name = None
             self.connection_scope = None
             self.phase = "disconnected"
@@ -4669,6 +5303,8 @@ class BridgeCore:
                 return await self._set_water_temperature(params)
             if method == "water.set_pattern":
                 return await self._set_water_pattern(params)
+            if method in {"recovery.reconcile", "reconcile"}:
+                return await self._recovery_reconcile(params)
         raise BridgeError(f"unknown bridge method {method}")
 
     async def shutdown(self, *, force: bool = False) -> None:
