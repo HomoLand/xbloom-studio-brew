@@ -258,11 +258,87 @@ separates what is available directly or through the bundled bridge, what remains
 what is deliberately excluded, and
 what is not a Studio device feature.
 
+## Project layout
+
+```
+packages/core/                          # xbloom-studio-core: shared library
+  xbloom_paths.py, xbloom_safety.py,    # BLE protocol, recipe validation, catalog,
+  xbloom_catalog.py, xbloom_history.py  # history, paths, knowledge validation
+  xbloom_knowledge.py                   #   knowledge bundle manifest/hash checks
+  xbloom_ble/                           #   (bridge.py is the BLE owner state machine)
+  pyproject.toml                        #   console entry: xbloom-bridge
+skills/xbloom-studio-brew/              # the Agent Skill (CLI client of core)
+  scripts/xbloom.py                     #   CLI entry point
+  scripts/bootstrap.py                  #   runtime venv setup (stdlib-only until install)
+  assets/, references/, agents/, tests/
+tools/build_release.py                  # GitHub Release artifacts (not PyPI)
+```
+
+`packages/core` is the shared foundation imported by both the Skill CLI and the
+Web UI backend. The Skill stays at `skills/xbloom-studio-brew/` and depends on
+core via its `requirements.txt` (`-e ../../packages/core` in development). The
+Web UI lives in a sibling repo (`xbloom-studio-web`) and its backend depends on
+core the same way. The BLE bridge daemon (`xbloom_ble.bridge`) is a
+single-instance loopback process shared by all clients; installable as
+`xbloom-bridge` from the core wheel.
+
 ## Development
 
 ```text
 cd skills/xbloom-studio-brew
 python scripts/bootstrap.py --dev
+```
+
+Repository checkouts install core in editable mode from `../../packages/core`.
+Release Skill bundles instead vendor the exact core wheel under `vendor/wheels/`
+and bootstrap installs that path with `pip install --no-deps --no-index <wheel>` after
+checking `vendor/release.json` (`core_wheel` + `core_wheel_sha256`, fail-closed).
+
+## Build / release artifacts
+
+Artifacts are published via **GitHub Releases** (not PyPI). From the repository root:
+
+```text
+python tools/build_release.py
+# or: python tools/build_release.py --out dist
+```
+
+Builds set a stable `SOURCE_DATE_EPOCH`, pin setuptools to an exact build requirement, and
+write ZIPs with normalized timestamps/modes so consecutive builds produce matching SHA-256 for
+the wheel and both ZIPs. A `release-manifest.json` records name/version/size/SHA-256 for each
+publishable artifact and is verified before the build finishes.
+
+**Deferred (Phase 0.1 incomplete):** non-core per-platform `--hash` lockfiles for bleak/PyYAML
+transitive wheels remain a follow-up; only the core wheel is hash-locked in the Skill bundle today.
+
+This writes to `dist/` (gitignored):
+
+| Artifact | Contents |
+| --- | --- |
+| `xbloom_studio_core-<ver>-*.whl` | Installable core library + `xbloom-bridge` |
+| `knowledge-<ver>/` + `.zip` | `SKILL.md` + `references/` + `assets/` with `manifest.json` (per-file SHA-256 + aggregate content hash) |
+| `skill-xbloom-studio-brew-<ver>/` + `.zip` | Self-contained Skill including `vendor/wheels/` core wheel + `vendor/release.json` |
+| `release-manifest.json` | Deterministic name/version/size/SHA-256 for every publishable wheel/ZIP |
+
+Verify a built wheel:
+
+```text
+python -m venv .venv-wheel
+.venv-wheel/Scripts/python -m pip install dist/xbloom_studio_core-*.whl   # Windows
+# .venv-wheel/bin/python -m pip install dist/xbloom_studio_core-*.whl    # Unix
+.venv-wheel/Scripts/xbloom-bridge --help
+```
+
+Verify an extracted Skill **ZIP** in a fresh directory outside the checkout (do not use the
+`dist/skill-.../` tree as a substitute for the published archive):
+
+```text
+# Unix example; on Windows extract to %TEMP%\xbloom-skill-clean similarly
+python -c "import zipfile; zipfile.ZipFile('dist/skill-xbloom-studio-brew-<ver>.zip').extractall('/tmp/xbloom-skill-clean')"
+cd /tmp/xbloom-skill-clean
+python scripts/bootstrap.py
+python scripts/xbloom.py doctor
+python scripts/xbloom.py validate assets/hot-template.yaml
 ```
 
 Release tests use scripted BLE and never activate the grinder or dispense water. The scale

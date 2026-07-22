@@ -2,6 +2,11 @@
 
 Common flow: doctor -> scan -> probe -> validate -> load -> monitor/cancel.
 Physical actions and experimental live adjustment use independent owner gates.
+
+This module stays standard-library-only until ``reexec_in_local_runtime`` hands
+off to the external runtime (where ``xbloom-studio-core`` is installed). Path
+and re-exec helpers below mirror ``xbloom_paths`` semantics without importing
+core, so a clean system Python can still load ``--help`` and re-exec.
 """
 
 from __future__ import annotations
@@ -11,6 +16,8 @@ import asyncio
 from dataclasses import dataclass
 import importlib.util
 import json
+import os
+from collections.abc import Mapping
 from pathlib import Path
 import platform
 import re
@@ -19,15 +26,100 @@ import sys
 import time
 from typing import Any
 
-from xbloom_paths import (
-    environment_copy,
-    environment_value,
-    legacy_runtime_python,
-    preferred_runtime_python,
-    runtime_python_path,
-    skill_runtime_dir,
-    skill_state_dir,
-)
+
+# ---------------------------------------------------------------------------
+# Launcher path helpers (stdlib-only; match packages/core/xbloom_paths.py)
+# ---------------------------------------------------------------------------
+
+# Mirrors packages/core/xbloom_paths.py (canonical + legacy state env).
+STATE_DIR_ENV = "XBLOOM_STATE_DIR"
+LEGACY_STATE_DIR_ENV = "XBLOOM_SKILL_STATE_DIR"
+RUNTIME_DIR_ENV = "XBLOOM_SKILL_RUNTIME_DIR"
+DEFAULT_STATE_DIRNAME = ".xbloom-studio-brew"
+
+
+def _environment(environ: Mapping[str, str] | None) -> Mapping[str, str]:
+    return os.environ if environ is None else environ
+
+
+def environment_value(
+    name: str,
+    default: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> str | None:
+    """Read one explicitly named configuration value from the process environment."""
+
+    return _environment(environ).get(name, default)
+
+
+def environment_copy(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Copy the environment so a child-process overlay cannot mutate its source."""
+
+    return dict(_environment(environ))
+
+
+def normalize_state_root(path: Path | str) -> Path:
+    """Match packages/core/xbloom_paths.normalize_state_root exactly.
+
+    Relative XBLOOM_STATE_DIR values must resolve against cwd so bootstrap,
+    re-exec, and core share one absolute state root for a single invocation.
+    """
+
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    try:
+        return candidate.resolve(strict=False)
+    except OSError:
+        return candidate.absolute()
+
+
+def skill_state_dir(environ: Mapping[str, str] | None = None) -> Path:
+    """Return the user-writable state root, without creating it.
+
+    Precedence: XBLOOM_STATE_DIR > XBLOOM_SKILL_STATE_DIR > default home dir.
+    Result is always absolute/normalised (same as core ``normalize_state_root``).
+    """
+
+    env = _environment(environ)
+    configured = env.get(STATE_DIR_ENV) or env.get(LEGACY_STATE_DIR_ENV)
+    if configured:
+        return normalize_state_root(configured)
+    return normalize_state_root(Path.home() / DEFAULT_STATE_DIRNAME)
+
+
+def skill_runtime_dir(environ: Mapping[str, str] | None = None) -> Path:
+    """Return the external virtual-environment directory."""
+
+    env = _environment(environ)
+    configured = env.get(RUNTIME_DIR_ENV)
+    if configured:
+        return normalize_state_root(configured)
+    return skill_state_dir(env) / "runtime"
+
+
+def runtime_python_path(runtime_dir: Path) -> Path:
+    if os.name == "nt":
+        return Path(runtime_dir) / "Scripts" / "python.exe"
+    return Path(runtime_dir) / "bin" / "python"
+
+
+def legacy_runtime_python(skill_root: Path) -> Path:
+    """Path used by releases before the runtime moved outside the Skill."""
+
+    return runtime_python_path(Path(skill_root) / ".venv")
+
+
+def preferred_runtime_python(
+    skill_root: Path, environ: Mapping[str, str] | None = None
+) -> Path:
+    """Prefer the external runtime, with a temporary legacy-install fallback."""
+
+    external = runtime_python_path(skill_runtime_dir(environ))
+    if external.exists():
+        return external
+    legacy = legacy_runtime_python(skill_root)
+    return legacy if legacy.exists() else external
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,7 +148,6 @@ READY_SENTINEL = "cup-filter-water-beans"
 WATER_READY_SENTINEL = "vessel-water-clear"
 GRINDER_READY_SENTINEL = "beans-cup-clear"
 TEA_READY_SENTINEL = "tea-brewer-water-cup-clear"
-ARM_MAX_AGE_SECONDS = 300
 GRINDER_REST_SECONDS = 60
 FIRMWARE_RE = re.compile(rb"V\d+(?:\.\d+[A-Za-z]?)+")
 SUPPORTED_FIRMWARE = frozenset({"V12.0D.500"})
@@ -447,12 +538,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "legacy_runtime_exists": legacy_runtime.exists(),
         "bleak": importlib.util.find_spec("bleak") is not None,
         "pyyaml": importlib.util.find_spec("yaml") is not None,
-        "vendored_protocol": (ROOT / "scripts" / "xbloom_ble" / "protocol.py").exists(),
+        "vendored_protocol": importlib.util.find_spec("xbloom_ble.protocol") is not None,
         "capabilities": {
             "coffee_recipe": True,
             "coffee_bypass": True,
             "coffee_temperature_modes": ["RT", "40-95 C", "BP"],
-            "tea_recipe": (ROOT / "scripts" / "xbloom_ble" / "tea.py").exists(),
+            "tea_recipe": importlib.util.find_spec("xbloom_ble.tea") is not None,
             "tea_volume_semantics": {
                 "stage_ml": "programmed_chamber_fill",
                 "approx_120ml_per_steep": "firmware_managed_siphon_finish",
@@ -465,9 +556,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "water_sources": ["tank", "tap"],
             "water_source_semantics": {"tank": "reservoir", "tap": "direct_feed"},
             "machine_info": True,
-            "persistent_bridge": (
-                ROOT / "scripts" / "xbloom_ble" / "bridge.py"
-            ).exists(),
+            "persistent_bridge": importlib.util.find_spec("xbloom_ble.bridge") is not None,
             "interactive_pause_resume": True,
             "persistent_bridge_operations": [
                 "coffee",
@@ -480,9 +569,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 "advanced_tuning",
             ],
             "easy_mode_scope": "atomic_abc_only",
-            "private_recipe_catalog": (
-                ROOT / "scripts" / "xbloom_catalog.py"
-            ).exists(),
+            "private_recipe_catalog": importlib.util.find_spec("xbloom_catalog") is not None,
             "catalog_scope": "own-account-region-visible",
             "catalog_cloud_sync": "ephemeral_login_or_explicit_authorized_app_form",
             "catalog_account_targets": [
@@ -1667,9 +1754,6 @@ async def async_tea_start(args: argparse.Namespace) -> int:
         raise RuntimeError("tea-start --progress-interval must be 0.1-60 seconds")
     path, _recipe, summary = load_tea_recipe(args.recipe)
     state = state_read(TEA_STATE_FILE)
-    age = time.time() - float(state.get("loaded_at", 0))
-    if age < 0 or age > ARM_MAX_AGE_SECONDS:
-        raise RuntimeError("loaded tea state is older than 5 minutes; load the recipe again")
     if state.get("recipe_sha256") != recipe_sha256(path):
         raise RuntimeError("tea recipe changed since it was loaded")
     if state.get("status") != "tea_loaded":
@@ -1884,9 +1968,6 @@ async def async_start(args: argparse.Namespace) -> int:
         )
     if state_status != "armed":
         raise RuntimeError("armed-state record is not armed; load the recipe again")
-    age = time.time() - float(state.get("loaded_at", 0))
-    if age < 0 or age > ARM_MAX_AGE_SECONDS:
-        raise RuntimeError("armed state is older than 5 minutes; load the recipe again")
     if state.get("recipe_sha256") != recipe_sha256(path):
         raise RuntimeError("recipe changed since it was loaded")
     address = str(state.get("address") or "")
@@ -2021,22 +2102,64 @@ def ensure_bridge_not_running(command: str) -> None:
         )
 
 
+def cmd_state(args: argparse.Namespace) -> int:
+    """Explicit state.db migration/status/backup — never auto-migrates on daemon start."""
+
+    import xbloom_storage as storage
+
+    action = args.state_action
+    if action == "status":
+        result = storage.migration_status(STATE_DIR)
+    elif action == "migrate":
+        result = storage.migrate_legacy_state(
+            STATE_DIR,
+            backup_root=Path(args.backup_root) if getattr(args, "backup_root", None) else None,
+            force=bool(getattr(args, "force", False)),
+        )
+    elif action == "backup":
+        store = storage.StateStore(STATE_DIR)
+        store.ensure_schema()
+        dest = store.backup(
+            Path(args.destination) if getattr(args, "destination", None) else None
+        )
+        result = {
+            "command": "state",
+            "action": "backup",
+            "status": "backed_up",
+            "destination": str(dest),
+            "state_root": str(store.state_root),
+            "runtime_source_of_truth": "json_legacy",
+            "message": (
+                "online SQLite backup only; catalog/history runtime writers remain JSON-backed"
+            ),
+        }
+        store.close()
+    else:
+        raise RuntimeError(f"unknown state action {action}")
+    emit({"command": "state", "action": action, **result})
+    return 0
+
+
 def cmd_bridge(args: argparse.Namespace) -> int:
     from xbloom_ble.bridge import (
         BridgeError,
         bridge_call,
         bridge_is_running,
         bridge_record_path,
+        ensure_bridge_daemon,
+        restart_bridge_daemon_if_idle,
         serve_bridge,
-        start_bridge_daemon,
+        stop_bridge_daemon,
     )
 
     action = args.bridge_action
     if action == "serve":
+        # Core-owned serve path (lifecycle lock + bridge.json identity).
         asyncio.run(serve_bridge(address=args.address))
         return 0
     if action == "start":
-        result = start_bridge_daemon(Path(__file__), address=args.address)
+        # Core lifecycle API - no Skill script path for the daemon child.
+        result = ensure_bridge_daemon(address=args.address)
     elif action == "status":
         if not bridge_is_running():
             result = {
@@ -2045,12 +2168,11 @@ def cmd_bridge(args: argparse.Namespace) -> int:
                 "record": str(bridge_record_path()),
             }
         else:
-            result = bridge_call("status")
+            result = bridge_call("status", require_hello=False)
     elif action == "stop":
-        if not bridge_is_running():
-            result = {"running": False, "status": "already_stopped"}
-        else:
-            result = bridge_call("shutdown", {"force": bool(args.force)})
+        result = stop_bridge_daemon(force=bool(args.force))
+    elif action == "restart-if-idle":
+        result = restart_bridge_daemon_if_idle(address=args.address)
     elif action == "connect":
         result = bridge_call(
             "connect",
@@ -2532,6 +2654,10 @@ def build_parser() -> argparse.ArgumentParser:
     bridge_sub.add_parser("start", help="start the local daemon; does not connect or actuate")
     bridge_sub.add_parser("status", help="read connection, activity, and telemetry snapshot")
     bridge_stop = bridge_sub.add_parser("stop", help="stop an idle daemon")
+    bridge_sub.add_parser(
+        "restart-if-idle",
+        help="restart only when idle with no recovery records; otherwise report pending",
+    )
     bridge_stop.add_argument(
         "--force",
         action="store_true",
@@ -2641,6 +2767,41 @@ def build_parser() -> argparse.ArgumentParser:
         "--pattern", choices=("center", "spiral", "circular", "ring"), required=True
     )
     bridge_pattern.add_argument("--confirm-live-adjust", default="")
+    state = sub.add_parser(
+        "state",
+        help=(
+            "explicit state.db migration/status/backup; does not auto-migrate on "
+            "daemon start; SQLite is not yet the runtime source of truth for catalog/history"
+        ),
+    )
+    state_sub = state.add_subparsers(dest="state_action", required=True)
+    state_sub.add_parser(
+        "status",
+        help="migration receipt + runtime source-of-truth contract (JSON still active)",
+    )
+    state_migrate = state_sub.add_parser(
+        "migrate",
+        help="idempotent backup+import of legacy JSON/JSONL into state.db",
+    )
+    state_migrate.add_argument(
+        "--force",
+        action="store_true",
+        help="re-run import even if a migration receipt exists",
+    )
+    state_migrate.add_argument(
+        "--backup-root",
+        default=None,
+        help="directory for the pre-migration backup tree",
+    )
+    state_backup = state_sub.add_parser(
+        "backup",
+        help="online SQLite backup of state.db (does not migrate or cut over runtime)",
+    )
+    state_backup.add_argument(
+        "--destination",
+        default=None,
+        help="optional destination .db path (must not already exist)",
+    )
     return parser
 
 
@@ -2655,6 +2816,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "history":
             return cmd_history(args)
         require_runtime()
+        if args.command == "state":
+            return cmd_state(args)
         if args.command == "bridge":
             return cmd_bridge(args)
         ensure_bridge_not_running(args.command)

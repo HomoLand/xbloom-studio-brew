@@ -11,7 +11,9 @@ permissions:
 jobs:
   test:
     env:
-      XBLOOM_SKILL_STATE_DIR: ${{ github.workspace }}/.xbloom-studio-brew-state
+      XBLOOM_STATE_DIR: ${{ github.workspace }}/.xbloom-studio-brew-state
+      # Legacy alias still accepted; canonical XBLOOM_STATE_DIR wins when both set.
+      XBLOOM_SKILL_STATE_DIR: ${{ github.workspace }}/.xbloom-studio-brew-state-legacy-unused
     strategy:
       fail-fast: false
       matrix:
@@ -23,8 +25,13 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: skills/xbloom-studio-brew/requirements-dev.txt
-      - run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
+          cache-dependency-path: |
+            skills/xbloom-studio-brew/requirements-dev.txt
+            packages/core/pyproject.toml
+      - name: Install core (editable) and skill dev dependencies
+        run: |
+          python -m pip install --disable-pip-version-check -e ../../packages/core
+          python -m pip install --disable-pip-version-check -r requirements-dev.txt
         working-directory: skills/xbloom-studio-brew
       - run: python -m pytest -q
         working-directory: skills/xbloom-studio-brew
@@ -46,3 +53,105 @@ jobs:
         working-directory: skills/xbloom-studio-brew
       - run: python scripts/xbloom.py tea-validate assets/tea-oolong-official.yaml
         working-directory: skills/xbloom-studio-brew
+
+  release-artifacts:
+    name: release build and clean install
+    env:
+      XBLOOM_STATE_DIR: ${{ github.workspace }}/.xbloom-studio-brew-state-release
+      XBLOOM_SKILL_RUNTIME_DIR: ${{ github.workspace }}/.xbloom-studio-brew-runtime-release
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: packages/core/pyproject.toml
+      - name: Build release artifacts
+        run: python tools/build_release.py --out dist
+      - name: Fresh wheel install and xbloom-bridge entry
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv .venv-wheel
+          # Windows venv puts the interpreter at Scripts/python.exe; also accept
+          # Scripts/python (some bash environments) before Unix bin/python.
+          if [ -x .venv-wheel/Scripts/python.exe ]; then
+            PY=.venv-wheel/Scripts/python.exe
+          elif [ -x .venv-wheel/Scripts/python ]; then
+            PY=.venv-wheel/Scripts/python
+          else
+            PY=.venv-wheel/bin/python
+          fi
+          "$PY" -m pip install --disable-pip-version-check --upgrade pip
+          WHEEL=$(ls dist/xbloom_studio_core-*.whl | head -n 1)
+          "$PY" -m pip install --disable-pip-version-check "$WHEEL"
+          "$PY" -c "from importlib.metadata import entry_points; eps=entry_points(); group=eps.select(group='console_scripts') if hasattr(eps,'select') else eps.get('console_scripts', []); names=[e.name for e in group]; assert 'xbloom-bridge' in names, names"
+          "$PY" -c "from xbloom_ble.bridge import main, serve_bridge; assert callable(main) and callable(serve_bridge)"
+          "$PY" -c "import xbloom_knowledge; print(xbloom_knowledge.DEFAULT_KNOWLEDGE_NAME)"
+          # Console script --help must exit 0 without starting the BLE server.
+          if [ -x .venv-wheel/Scripts/xbloom-bridge.exe ]; then
+            .venv-wheel/Scripts/xbloom-bridge.exe --help
+          elif [ -x .venv-wheel/Scripts/xbloom-bridge ]; then
+            .venv-wheel/Scripts/xbloom-bridge --help
+          else
+            .venv-wheel/bin/xbloom-bridge --help
+          fi
+      - name: Verify release-manifest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f dist/release-manifest.json
+          python -c "
+          import importlib.util, pathlib, sys
+          path = pathlib.Path('tools/build_release.py')
+          spec = importlib.util.spec_from_file_location('build_release', path)
+          mod = importlib.util.module_from_spec(spec)
+          assert spec and spec.loader
+          spec.loader.exec_module(mod)
+          mod.verify_release_manifest(pathlib.Path('dist'))
+          print('release-manifest.json verified')
+          "
+      - name: Extracted Skill ZIP bootstrap / doctor / validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(python -c "import re,pathlib; t=pathlib.Path('packages/core/pyproject.toml').read_text(); print(re.search(r'^version\s*=\s*\"([^\"]+)\"', t, re.M).group(1))")
+          SKILL_ZIP="dist/skill-xbloom-studio-brew-${VERSION}.zip"
+          test -f "$SKILL_ZIP"
+          # Extract into a fresh directory outside the checkout (not dist/ as a stand-in).
+          if [ -n "${RUNNER_TEMP:-}" ]; then
+            EXTRACT_ROOT="${RUNNER_TEMP}/xbloom-skill-clean-install"
+          else
+            EXTRACT_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/xbloom-skill-clean-XXXXXX")"
+          fi
+          rm -rf "$EXTRACT_ROOT"
+          mkdir -p "$EXTRACT_ROOT"
+          python -c "
+          import sys, zipfile
+          from pathlib import Path
+          zpath, dest = Path(sys.argv[1]), Path(sys.argv[2])
+          with zipfile.ZipFile(zpath) as zf:
+              for info in zf.infolist():
+                  name = info.filename.replace('\\\\', '/')
+                  if name.startswith('/') or '..' in Path(name).parts:
+                      raise SystemExit(f'unsafe zip member: {info.filename!r}')
+              zf.extractall(dest)
+          print(f'extracted {zpath} -> {dest}')
+          " "$SKILL_ZIP" "$EXTRACT_ROOT"
+          cd "$EXTRACT_ROOT"
+          # Confirm no sibling packages/core dependency remains.
+          grep -v '^\s*#' requirements.txt | grep -q 'xbloom-studio-core=='
+          ! grep -q '^\s*-e ' requirements.txt
+          test -d vendor/wheels
+          ls vendor/wheels/xbloom_studio_core-*.whl
+          test -f vendor/release.json
+          python -c "import json; m=json.load(open('vendor/release.json',encoding='utf-8')); assert m.get('layout')=='release'; assert m.get('core_wheel_sha256')"
+          python scripts/bootstrap.py
+          python scripts/xbloom.py doctor
+          python scripts/xbloom.py validate assets/hot-template.yaml
+          python scripts/xbloom.py tea-validate assets/tea-green-official.yaml

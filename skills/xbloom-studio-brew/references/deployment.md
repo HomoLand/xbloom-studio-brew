@@ -73,6 +73,85 @@ main CLI automatically re-executes inside this runtime, so Agents can consistent
 run bootstrap once to migrate, then remove that legacy directory only after `doctor` reports
 `"runtime_location": "external"`.
 
+Bootstrap uses only the Python standard library until dependencies are installed, so it can run
+before `xbloom-studio-core` is present. It then chooses one of two layouts:
+
+| Layout | How detected | Core install |
+| --- | --- | --- |
+| Development (repo checkout) | `requirements.txt` contains `-e ../../packages/core` and no release evidence | editable install of sibling `packages/core` |
+| Release (GitHub Skill bundle) | `vendor/release.json` present, **or** a vendored `vendor/wheels/xbloom_studio_core-*.whl` | install the exact hashed wheel from `vendor/release.json` / `vendor/wheels/` with `pip install --no-deps --no-index <wheel>`, then pinned non-core deps |
+
+Do not rely on a sibling monorepo checkout for release installs. The published Skill bundle carries
+the exact core wheel it needs under `vendor/wheels/`. Bootstrap reads `vendor/release.json` for
+`core_version`, `core_wheel`, and `core_wheel_sha256`. When that file is present it is parsed
+strictly and fail-closed: malformed JSON, wrong types, `layout` other than `release`, version
+mismatch, unsafe `core_wheel` (must be basename-only matching
+`xbloom_studio_core-<version>-*.whl`, resolve as a direct child of `vendor/wheels/`, no `..` /
+absolute paths / slash ambiguity), or a bad hash all abort before `pip` runs. There is no soft
+fallback when metadata exists but is invalid.
+
+**Damaged-bundle fail-closed:** if a vendored `xbloom_studio_core-*.whl` remains but
+`vendor/release.json` is missing (or unreadable), layout detection still classifies the Skill as
+**release** so bootstrap never falls through to development editable install or PyPI core install.
+Install then **requires** valid `vendor/release.json` and aborts **before any `pip` invocation**
+when that metadata is missing — it will not install an unhashed fallback wheel.
+
+**Air-gapped hosts:** only **core** is installed offline from the bundle. `bleak` and `PyYAML` still
+need network (or a pre-populated pip cache) unless you mirror those wheels yourself. Universal
+`--hash` lockfiles for non-core deps are deferred because transitive wheels differ by platform
+(winrt-*, dbus-fast, etc.). **Phase 0.1 is not fully complete** until per-platform non-core hash
+lockfiles are generated in CI; core integrity is already bound by the vendored wheel plus
+`core_wheel_sha256`.
+
+## Build and release artifacts
+
+Release artifacts are built for **GitHub Releases**, not PyPI. From the repository root (not the
+Skill directory):
+
+```text
+python tools/build_release.py
+python tools/build_release.py --out dist
+```
+
+`tools/build_release.py` aims for byte-for-byte reproducible wheel and ZIP digests by fixing
+`SOURCE_DATE_EPOCH` (default `1704067200` unless already set), pinning the setuptools build
+requirement to an exact version, and writing ZIPs with explicit `ZipInfo` (normalized timestamp,
+Unix file mode, sorted members, `ZIP_DEFLATED` at a fixed compression level). A
+`release-manifest.json` lists `name`, `version`, `size`, and SHA-256 for every publishable
+wheel/ZIP and is verified before the build reports success (the manifest does not list itself).
+
+Outputs under `dist/`:
+
+- `xbloom_studio_core-<version>-*.whl` - core library with console entry `xbloom-bridge`
+- `knowledge-<version>/` and `knowledge-<version>.zip` - versioned knowledge from the Skill's
+  single source (`SKILL.md`, `references/`, `assets/`) plus `manifest.json` (per-file SHA-256 and
+  aggregate content hash). Validate with `xbloom_knowledge.validate_bundle(...)` (rejects path
+  traversal, missing/tampered files, and extra on-disk knowledge files).
+- `skill-xbloom-studio-brew-<version>/` and `.zip` - self-contained Skill with
+  `vendor/wheels/` holding that same core wheel, `vendor/release.json` (includes
+  `core_wheel_sha256`), and a non-editable `requirements.txt` (exact `==` pins for non-core deps;
+  full hash locks deferred per platform — Phase 0.1 incomplete for non-core locks)
+- `release-manifest.json` - deterministic per-artifact name/version/size/SHA-256 for the wheel and
+  both ZIPs (excludes the manifest itself)
+
+Clean-install check for a release Skill ZIP (extract outside the checkout; do not use the
+`dist/skill-.../` tree as a substitute for the published ZIP):
+
+```text
+python -c "import zipfile; zipfile.ZipFile('dist/skill-xbloom-studio-brew-<version>.zip').extractall('/tmp/xbloom-skill-clean')"
+cd /tmp/xbloom-skill-clean
+python scripts/bootstrap.py
+python scripts/xbloom.py doctor
+python scripts/xbloom.py validate assets/hot-template.yaml
+```
+
+Core-only install:
+
+```text
+pip install dist/xbloom_studio_core-*.whl
+xbloom-bridge --help
+```
+
 ## Agent installation
 
 Keep the directory name `xbloom-studio-brew`; it must match the `name` in `SKILL.md`.
@@ -122,7 +201,8 @@ All variables are optional; do not declare owner-gate overrides as automatically
 | Variable | Purpose |
 | --- | --- |
 | `XBLOOM_ADDRESS` | Select one machine without scanning; useful when more than one is nearby. |
-| `XBLOOM_SKILL_STATE_DIR` | Relocate runtime records, bridge endpoint/log, and the default external runtime root. |
+| `XBLOOM_STATE_DIR` | Canonical state root for `state.db`, bridge discovery/lock, history, catalog, and the default external runtime root. |
+| `XBLOOM_SKILL_STATE_DIR` | Legacy alias for the state root; used only when `XBLOOM_STATE_DIR` is unset (supported for v1). |
 | `XBLOOM_SKILL_RUNTIME_DIR` | Override only the external Python virtual-environment directory. |
 | `XBLOOM_CATALOG_PATH` | Override the private normalized catalog path; default is below the Skill state directory. |
 | `XBLOOM_ACCOUNT_EMAIL` | Own-account email for ephemeral `catalog login-sync` or an approved `catalog push --apply`; never commit it. |
@@ -148,11 +228,45 @@ and Shared records. `catalog push` is offline preview by default. Remote add req
 and the exact `--confirm-write own-account-cloud-recipe` sentinel; never use the apply path as a
 deployment smoke test.
 
-The bridge reads its environment once at launch. Restart an **idle** daemon after changing an
-owner gate or address. Runtime endpoint, random token, and log live under
-`~/.xbloom-studio-brew/` (or `XBLOOM_SKILL_STATE_DIR`); never publish them. The server binds to
-loopback, requires the token on every JSON-line request, serializes BLE writes, and holds at most
-one Studio connection. This is local process isolation, not remote authentication.
+The bridge reads its environment once at launch and records a **config fingerprint** in
+`bridge.json`. Client environment changes never silently mutate a running daemon; a fingerprint
+mismatch is reported via `hello` / `status` and applies only after an idle restart. Use
+`bridge restart-if-idle` (or `xbloom-bridge restart-if-idle`): when the daemon is busy or has
+recovery records it returns `upgrade_pending` and does not terminate.
+
+State layout under `~/.xbloom-studio-brew/` (or `XBLOOM_STATE_DIR` / legacy
+`XBLOOM_SKILL_STATE_DIR`):
+
+| Path | Role |
+| --- | --- |
+| `state.db` | SQLite/WAL schema for recipes/workflows/events/idempotency + optional legacy import; **not** yet the active runtime source of truth for catalog/history |
+| `bridge.json` | Discovery only: instance id, pid, loopback host/port, token, core/protocol/record-format versions, config fingerprint |
+| `bridge.lock` | Lifecycle OS lock (one daemon per state root); not discovery |
+| `bridge.log` | Daemon stdout/stderr |
+| legacy `catalog/`, `brew-history.jsonl`, `*-state.json` | Still written by runtime; optional explicit import via `state migrate` / `xbloom-state migrate` (originals kept) |
+
+### Explicit state migration (no auto-migrate on daemon start)
+
+```text
+python scripts/xbloom.py state status
+python scripts/xbloom.py state migrate
+python scripts/xbloom.py state backup
+# core: xbloom-state status|migrate|backup
+```
+
+Migration is idempotent and observable. While catalog/history remain JSON-backed, status
+always reports `runtime_source_of_truth: json_legacy` and `sqlite_active_runtime: false`.
+Do not treat a completed migration receipt as cutover. Bridge wire protocol is **v2**
+(required hello + envelope); config fingerprint includes the effective BLE address.
+
+Never publish tokens or private state. The server binds to loopback, requires the token on every
+JSON-line request, rejects incompatible clients before BLE writes (`hello` + protocol range),
+serializes BLE writes, and holds at most one Studio connection. This is local process isolation,
+not remote authentication.
+
+Daemon lifecycle is core-owned (`python -m xbloom_ble.bridge` / `xbloom-bridge`); Skill
+`bridge start|serve|stop` call the same APIs and do not require a Skill script path to spawn the
+child.
 
 ## Publication layout
 
@@ -169,31 +283,41 @@ cloud tokens, or recipes containing private purchase/account data.
 ## Release checklist
 
 1. Run `python scripts/bootstrap.py --dev` on a clean checkout.
-2. Run the Agent Skills structural validator.
-3. Inspect `git diff` for addresses, serials, tokens, and packet captures.
-4. Import scripted coffee, tea, Easy, xPod, and J20 JSON fixtures; mock all five own-account recipe
+2. Run `python tools/build_release.py` from the repository root; confirm `dist/` contains the core
+   wheel, knowledge bundle (valid `manifest.json`), Skill bundle with `vendor/wheels/`, and a
+   verified `release-manifest.json`. Confirm two consecutive builds with the same
+   `SOURCE_DATE_EPOCH` produce matching SHA-256 for the wheel and both ZIPs.
+3. In a clean venv, install the built core wheel and invoke `xbloom-bridge --help`.
+4. Extract `dist/skill-xbloom-studio-brew-<version>.zip` into a fresh temporary directory **outside**
+   the checkout (not the `dist/skill-.../` tree), run `python scripts/bootstrap.py`, then `doctor`
+   and `validate` without a sibling `packages/core` checkout. Confirm `vendor/release.json`
+   `core_wheel_sha256` matches the vendored wheel.
+5. Run the Agent Skills structural validator.
+6. Inspect `git diff` for addresses, serials, tokens, and packet captures.
+7. Import scripted coffee, tea, Easy, xPod, and J20 JSON fixtures; mock all five own-account recipe
    categories and the add endpoint; confirm secrets/raw responses are absent from the saved catalog,
    push is preview-only by default, and exported YAML passes the guarded validator. Never mutate a
    live account as part of release tests.
-5. Confirm coffee and tea load frames exclude their execute/start commands.
-6. Test `doctor`, `scan`, and `probe` on each supported OS when available.
-7. Test `scale` with the platform empty; confirm `entering → ready → exited`, then place a known
+8. Confirm coffee and tea load frames exclude their execute/start commands.
+9. Test `doctor`, `scan`, and `probe` on each supported OS when available.
+10. Test `scale` with the platform empty; confirm `entering → ready → exited`, then place a known
    object only after `ready` and verify its reading. Treat `--tare` as an additional re-tare.
-8. For a supported firmware, load a conservative recipe and then cancel without starting.
-9. Pin RT's offline frame encoding to the app's 20 C sentinel, but keep grinder, water, coffee
+11. For a supported firmware, load a conservative recipe and then cancel without starting.
+12. Pin RT's offline frame encoding to the app's 20 C sentinel, but keep grinder, water, coffee
    start, and tea start out of unattended release tests.
-10. Run `bridge start`, `bridge status`, and idle `bridge stop` with no hardware connection. Confirm
+13. Run `bridge start`, `bridge status`, and idle `bridge stop` with no hardware connection. Confirm
    every one-shot BLE command refuses while the bridge owns the local control endpoint.
-11. Test bridge state transitions for coffee, tea, scale, grinder, water, presets, settings, and
+14. Test bridge state transitions for coffee, tea, scale, grinder, water, presets, settings, and
     advanced tuning against scripted BLE only. Keep grinder/water/coffee/tea actuation and FreeSolo
     live-target commands out of unattended tests; record supervised hardware evidence separately.
-12. Pin persistent settings and advanced-tuning command frames/readbacks in fake-BLE tests. Do not
+15. Pin persistent settings and advanced-tuning command frames/readbacks in fake-BLE tests. Do not
     run those writes as an unattended release check; record supervised results separately.
-13. Verify telemetry labels recipe target, cumulative machine output, and cup-scale delta
+16. Verify telemetry labels recipe target, cumulative machine output, and cup-scale delta
     independently, without claiming water-supply inventory.
-14. Verify `validate --slot` and every slot-writing layer reject bypass before BLE resolution.
-15. Never add firmware to the allowlist based only on a successful scan.
-16. Tag the release and record the vendored upstream commit in `THIRD_PARTY_NOTICES.md`.
+17. Verify `validate --slot` and every slot-writing layer reject bypass before BLE resolution.
+18. Never add firmware to the allowlist based only on a successful scan.
+19. Tag the release, attach `dist/` artifacts to the GitHub Release, and record the vendored
+    upstream commit in `THIRD_PARTY_NOTICES.md`.
 
 ## Architecture boundary
 

@@ -247,9 +247,10 @@ must be treated as an action, not process cleanup. If the bridge process crashes
 its persisted `in_progress` rest record intentionally blocks another run until the operator has
 confirmed the machine stopped and the conservative cooldown has elapsed.
 
-Coffee, tea, grinder-rest, bridge endpoint/token, bridge log, and the external Python runtime live under
-`~/.xbloom-studio-brew/` by default. Override the directory with `XBLOOM_SKILL_STATE_DIR` for tests
-or managed deployments; `XBLOOM_SKILL_RUNTIME_DIR` can override only the virtual environment. The
-bridge binds only to loopback and authenticates each JSON-line request
-with its random local token; this is local process isolation, not a remotely exposed security
-boundary.
+Coffee, tea, grinder-rest, bridge endpoint/token, bridge log, SQLite `state.db`, and the external
+Python runtime live under `~/.xbloom-studio-brew/` by default. Override the directory with
+`XBLOOM_STATE_DIR` (canonical) or legacy `XBLOOM_SKILL_STATE_DIR` for tests or managed deployments;
+`XBLOOM_SKILL_RUNTIME_DIR` can override only the virtual environment. The bridge binds only to
+loopback, holds a lifecycle `bridge.lock`, and authenticates each JSON-line request with its random
+local token (never exposed via `status`/`hello`); this is local process isolation, not a remotely
+exposed security boundary.

@@ -7,8 +7,13 @@ from collections.abc import Mapping
 from os import environ as _process_environment
 from pathlib import Path
 
-STATE_DIR_ENV = "XBLOOM_SKILL_STATE_DIR"
+# Canonical state-root env (Phase 0). Takes precedence over the legacy alias.
+STATE_DIR_ENV = "XBLOOM_STATE_DIR"
+# Legacy alias retained for v1; still honoured when STATE_DIR_ENV is unset.
+LEGACY_STATE_DIR_ENV = "XBLOOM_SKILL_STATE_DIR"
 RUNTIME_DIR_ENV = "XBLOOM_SKILL_RUNTIME_DIR"
+
+DEFAULT_STATE_DIRNAME = ".xbloom-studio-brew"
 
 
 def _environment(environ: Mapping[str, str] | None) -> Mapping[str, str]:
@@ -31,12 +36,41 @@ def environment_copy(environ: Mapping[str, str] | None = None) -> dict[str, str]
     return dict(_environment(environ))
 
 
-def skill_state_dir(environ: Mapping[str, str] | None = None) -> Path:
-    """Return the user-writable state root, without creating it."""
+def normalize_state_root(path: Path | str) -> Path:
+    """Return an absolute, expanded, normalised state-root path.
+
+    Symlinks are resolved when the path exists; missing roots keep a stable
+    absolute form so lock/record paths stay consistent across callers.
+    """
+
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    try:
+        return candidate.resolve(strict=False)
+    except OSError:
+        # resolve() can fail on some Windows edge cases; fall back to absolute.
+        return candidate.absolute()
+
+
+def state_dir(environ: Mapping[str, str] | None = None) -> Path:
+    """Return the user-writable state root, without creating it.
+
+    Precedence: ``XBLOOM_STATE_DIR`` > ``XBLOOM_SKILL_STATE_DIR`` > default
+    ``~/.xbloom-studio-brew``. The result is always normalised.
+    """
 
     env = _environment(environ)
-    configured = env.get(STATE_DIR_ENV)
-    return Path(configured).expanduser() if configured else Path.home() / ".xbloom-studio-brew"
+    configured = env.get(STATE_DIR_ENV) or env.get(LEGACY_STATE_DIR_ENV)
+    if configured:
+        return normalize_state_root(configured)
+    return normalize_state_root(Path.home() / DEFAULT_STATE_DIRNAME)
+
+
+def skill_state_dir(environ: Mapping[str, str] | None = None) -> Path:
+    """Compatibility alias for :func:`state_dir` (existing callers)."""
+
+    return state_dir(environ)
 
 
 def skill_runtime_dir(environ: Mapping[str, str] | None = None) -> Path:
@@ -50,8 +84,8 @@ def skill_runtime_dir(environ: Mapping[str, str] | None = None) -> Path:
     env = _environment(environ)
     configured = env.get(RUNTIME_DIR_ENV)
     if configured:
-        return Path(configured).expanduser()
-    return skill_state_dir(env) / "runtime"
+        return normalize_state_root(configured)
+    return state_dir(env) / "runtime"
 
 
 def runtime_python_path(runtime_dir: Path) -> Path:

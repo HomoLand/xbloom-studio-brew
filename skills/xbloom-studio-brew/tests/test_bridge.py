@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 
 import pytest
 
+from xbloom_ble import bridge as bridge_mod
 from xbloom_ble.bridge import (
     ADVANCED_CONFIRM_SENTINEL,
     BridgeCore,
@@ -845,3 +847,385 @@ def test_bridge_client_rejects_non_loopback_record(tmp_path):
     )
     with pytest.raises(BridgeError, match="required loopback host"):
         bridge_call("status", record_path=record, timeout=0.1)
+
+
+async def _drain_release(core: BridgeCore, *, timeout: float = 1.0) -> None:
+    """Wait for a scheduled prompt BLE release to finish."""
+
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        task = core._release_task
+        if not core.release_pending and (task is None or task.done()):
+            return
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=0.05)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+            continue
+        await asyncio.sleep(0)
+    task = core._release_task
+    if task is not None and not task.done():
+        await asyncio.wait_for(task, timeout=0.2)
+
+
+def test_daemon_construction_and_status_do_not_connect(tmp_path):
+    core, fake = _core(tmp_path)
+    status = core.status()
+    assert status["running"] is True
+    assert status["connected"] is False
+    assert status["connection_scope"] is None
+    assert status["release_pending"] is False
+    assert status["last_disconnect_reason"] is None
+    assert fake.calls == []
+
+    async def go():
+        polled = await core.rpc("status")
+        assert polled["connected"] is False
+        events = await core.rpc("events", {"since": 0})
+        assert events["events"] == []
+        await core.shutdown()
+
+    asyncio.run(go())
+    assert fake.calls == []
+
+
+def test_coffee_workflow_connects_once_and_releases_on_natural_terminal(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        loaded = await core.rpc("coffee.load", {"recipe": str(recipe)})
+        assert loaded["status"] == "armed"
+        assert core.status()["connection_scope"] == "workflow"
+        assert fake.calls.count("connect") == 1
+        assert fake.calls.count("open_session") == 1
+
+        await core.rpc("coffee.start", {"confirmation": READY_SENTINEL})
+        await core.rpc("pause")
+        assert core.status()["phase"] == "paused"
+        await core.rpc("resume")
+        assert core.status()["phase"] == "running"
+        # status/events must not reconnect or extend the link
+        await core.rpc("status")
+        await core.rpc("events", {"since": 0})
+        assert fake.calls.count("connect") == 1
+
+        fake.emit(_event(state=0x24, name="ready"))
+        await _drain_release(core)
+        status = core.status()
+        assert status["activity"] is None
+        assert status["connected"] is False
+        assert status["connection_scope"] is None
+        assert status["running"] is True
+        assert status["last_operation"]["result"] == "ready"
+        assert status["last_disconnect_reason"] == "natural_terminal"
+        assert status["last_disconnect_error"] is None
+        assert not core.coffee_state_file.exists()
+
+        # Next workflow can reconnect once the daemon remains up.
+        await core.rpc("coffee.load", {"recipe": str(recipe)})
+        assert core.status()["connected"] is True
+        assert fake.calls.count("connect") == 2
+        await core.rpc("cancel")
+        await _drain_release(core)
+        await core.shutdown()
+
+    asyncio.run(go())
+    assert fake.calls.count("connect") == 2
+    assert fake.calls.count("open_session") == 2
+    assert fake.calls.count("close_session") == 2
+    assert fake.calls.count("disconnect") == 2
+    assert "coffee_pause" in fake.calls and "coffee_resume" in fake.calls
+
+
+def test_tea_workflow_releases_once_on_natural_terminal(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _tea_recipe(tmp_path / "tea.yaml")
+
+    async def go():
+        await core.rpc("tea.load", {"recipe": str(recipe)})
+        await core.rpc("tea.start", {"confirmation": TEA_READY_SENTINEL})
+        await core.rpc("status")
+        fake.emit(_event(state=0x01, name="idle"))
+        await _drain_release(core)
+        status = core.status()
+        assert status["connected"] is False
+        assert status["last_operation"]["activity"] == "tea"
+        assert status["last_disconnect_reason"] == "natural_terminal"
+        assert status["running"] is True
+        await core.shutdown()
+
+    asyncio.run(go())
+    assert fake.calls.count("connect") == 1
+    assert fake.calls.count("open_session") == 1
+    assert fake.calls.count("close_session") == 1
+    assert fake.calls.count("disconnect") == 1
+
+
+def test_explicit_cancel_stop_releases_once_for_each_activity(tmp_path):
+    recipe = _recipe(tmp_path / "recipe.yaml")
+    tea = _tea_recipe(tmp_path / "tea.yaml")
+
+    async def coffee_cancel():
+        core, fake = _core(tmp_path / "coffee")
+        await core.rpc("coffee.load", {"recipe": str(recipe)})
+        await core.rpc("coffee.start", {"confirmation": READY_SENTINEL})
+        await core.rpc("cancel")
+        await _drain_release(core)
+        assert core.status()["connected"] is False
+        assert core.status()["last_disconnect_reason"] == "cancel"
+        assert fake.calls.count("disconnect") == 1
+        await core.shutdown()
+        return fake
+
+    async def tea_cancel():
+        core, fake = _core(tmp_path / "tea")
+        await core.rpc("tea.load", {"recipe": str(tea)})
+        await core.rpc("cancel")
+        await _drain_release(core)
+        assert core.status()["connected"] is False
+        assert core.status()["last_disconnect_reason"] == "cancel"
+        assert fake.calls.count("disconnect") == 1
+        await core.shutdown()
+        return fake
+
+    async def grinder_stop():
+        core, fake = _core(tmp_path / "grinder")
+        await core.rpc(
+            "grinder.start",
+            {
+                "size": 60,
+                "rpm": 100,
+                "seconds": 10,
+                "confirmation": GRINDER_READY_SENTINEL,
+            },
+        )
+        await core.rpc("cancel")
+        await _drain_release(core)
+        assert core.status()["connected"] is False
+        assert core.status()["last_disconnect_reason"] == "grinder_confirmed_stop"
+        assert fake.calls.count("disconnect") == 1
+        await core.shutdown()
+        return fake
+
+    async def water_stop():
+        core, fake = _core(tmp_path / "water")
+        await core.rpc(
+            "water.start",
+            {
+                "volume_ml": 100,
+                "temp_c": 85,
+                "pattern": "center",
+                "water_source": "tank",
+                "confirmation": WATER_READY_SENTINEL,
+            },
+        )
+        await core.rpc("cancel")
+        await _drain_release(core)
+        assert core.status()["connected"] is False
+        assert core.status()["last_disconnect_reason"] == "water_confirmed_stop"
+        assert fake.calls.count("disconnect") == 1
+        await core.shutdown()
+        return fake
+
+    async def scale_stop():
+        core, fake = _core(tmp_path / "scale")
+        await core.rpc("scale.start", {"duration_s": 10, "tare": False})
+        await core.rpc("cancel")
+        await _drain_release(core)
+        assert core.status()["connected"] is False
+        assert core.status()["last_disconnect_reason"] in {
+            "scale_stopped",
+            "scale_complete",
+        }
+        assert fake.calls.count("disconnect") == 1
+        await core.shutdown()
+        return fake
+
+    asyncio.run(coffee_cancel())
+    asyncio.run(tea_cancel())
+    asyncio.run(grinder_stop())
+    asyncio.run(water_stop())
+    asyncio.run(scale_stop())
+
+
+def test_explicit_connect_does_not_auto_release(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        await core.rpc("connect")
+        assert core.status()["connection_scope"] == "explicit"
+        await core.rpc("coffee.load", {"recipe": str(recipe)})
+        assert core.status()["connection_scope"] == "explicit"
+        await core.rpc("coffee.start", {"confirmation": READY_SENTINEL})
+        await core.rpc("cancel")
+        await _drain_release(core)
+        status = core.status()
+        assert status["connected"] is True
+        assert status["connection_scope"] == "explicit"
+        assert status["last_disconnect_reason"] is None
+        assert fake.calls.count("disconnect") == 0
+        await core.rpc("disconnect")
+        assert core.status()["connected"] is False
+        assert core.status()["last_disconnect_reason"] == "explicit"
+        await core.shutdown()
+
+    asyncio.run(go())
+    assert fake.calls.count("connect") == 1
+    assert fake.calls.count("disconnect") == 1
+
+
+def test_loaded_recipe_holds_without_timeout_then_start_reuses_connection(tmp_path):
+    """Loaded coffee waits for start; no time-driven unload; one link until terminal."""
+
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        await core.rpc("coffee.load", {"recipe": str(recipe)})
+        assert core.status()["phase"] == "loaded"
+        assert core.status()["connected"] is True
+        assert core.status()["connection_scope"] == "workflow"
+        # No arm-expiry / loaded-timeout machinery.
+        assert not hasattr(core, "_arm_expiry_task")
+        assert not hasattr(core, "_arm_expiry_key")
+        assert not hasattr(bridge_mod, "ARM_MAX_AGE_SECONDS")
+
+        # Even a very old loaded_at must not auto-cancel or block start.
+        state = json.loads(core.coffee_state_file.read_text(encoding="utf-8"))
+        state["loaded_at"] = time.time() - 400
+        core.coffee_state_file.write_text(json.dumps(state), encoding="utf-8")
+
+        await asyncio.sleep(0.1)
+        status = core.status()
+        assert status["phase"] == "loaded"
+        assert status["activity"] == "coffee"
+        assert status["connected"] is True
+        assert status["running"] is True
+        assert fake.calls.count("connect") == 1
+        assert fake.calls.count("disconnect") == 0
+        assert "coffee_cancel" not in fake.calls
+
+        await core.rpc("coffee.start", {"confirmation": READY_SENTINEL})
+        assert core.status()["phase"] == "running"
+        assert fake.calls.count("connect") == 1
+
+        await core.rpc("pause")
+        await core.rpc("resume")
+        await core.rpc("status")
+        await core.rpc("events", {"since": 0})
+        assert fake.calls.count("connect") == 1
+
+        fake.emit(_event(state=0x24, name="ready"))
+        await _drain_release(core)
+        status = core.status()
+        assert status["activity"] is None
+        assert status["connected"] is False
+        assert status["connection_scope"] is None
+        assert status["running"] is True
+        assert status["last_operation"]["result"] == "ready"
+        assert status["last_disconnect_reason"] == "natural_terminal"
+        assert not core.coffee_state_file.exists()
+        assert fake.calls.count("connect") == 1
+        assert fake.calls.count("open_session") == 1
+        assert fake.calls.count("close_session") == 1
+        assert fake.calls.count("disconnect") == 1
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_preflight_failure_releases_auto_connect_keeps_explicit(tmp_path):
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def auto_connect_cleanup():
+        core, fake = _core(tmp_path / "auto")
+        fake.machine_info["firmware"] = "UNSUPPORTED.1"
+        with pytest.raises(BridgeError, match="not in the tested set"):
+            await core.rpc("coffee.load", {"recipe": str(recipe)})
+        await _drain_release(core)
+        assert core.status()["connected"] is False
+        assert core.status()["last_disconnect_reason"] == "preflight_or_load_failed"
+        assert fake.calls.count("connect") == 1
+        assert fake.calls.count("disconnect") == 1
+        await core.shutdown()
+
+    async def explicit_kept():
+        core, fake = _core(tmp_path / "explicit")
+        await core.rpc("connect")
+        fake.machine_info["firmware"] = "UNSUPPORTED.1"
+        # machine_info already cached from connect; force untested firmware gate
+        core.machine_info["firmware"] = "UNSUPPORTED.1"
+        with pytest.raises(BridgeError, match="not in the tested set"):
+            await core.rpc("coffee.load", {"recipe": str(recipe)})
+        await _drain_release(core)
+        assert core.status()["connected"] is True
+        assert core.status()["connection_scope"] == "explicit"
+        assert fake.calls.count("disconnect") == 0
+        await core.rpc("disconnect")
+        await core.shutdown()
+
+    asyncio.run(auto_connect_cleanup())
+    asyncio.run(explicit_kept())
+
+
+def test_terminal_during_control_does_not_deadlock_and_releases(tmp_path):
+    core, fake = _core(tmp_path)
+    fake.coffee_terminal_on_pause = True
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        await core.rpc("coffee.load", {"recipe": str(recipe)})
+        await core.rpc("coffee.start", {"confirmation": READY_SENTINEL})
+        result = await core.rpc("pause")
+        assert result["terminal_during_control"] is True
+        assert result["activity"] is None
+        # Terminal result is visible before/without waiting on disconnect.
+        assert core.status()["last_operation"]["result"] == "ready"
+        await _drain_release(core)
+        status = core.status()
+        assert status["connected"] is False
+        assert status["last_operation"]["result"] == "ready"
+        assert status["last_disconnect_reason"] == "natural_terminal"
+        assert status["running"] is True
+        await core.shutdown()
+
+    asyncio.run(go())
+    assert fake.calls.count("close_session") == 1
+    assert fake.calls.count("disconnect") == 1
+
+
+def test_disconnect_failure_preserves_terminal_result(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        await core.rpc("coffee.load", {"recipe": str(recipe)})
+        await core.rpc("coffee.start", {"confirmation": READY_SENTINEL})
+
+        async def boom_close():
+            fake.calls.append("close_session")
+            raise RuntimeError("close_session blew up")
+
+        async def boom_disconnect():
+            fake.is_connected = False
+            fake.calls.append("disconnect")
+            raise RuntimeError("disconnect blew up")
+
+        fake.close_session = boom_close  # type: ignore[method-assign]
+        fake.disconnect = boom_disconnect  # type: ignore[method-assign]
+        await core.rpc("cancel")
+        await _drain_release(core)
+        status = core.status()
+        assert status["last_operation"]["result"] == "cancel_sent"
+        assert status["connected"] is False
+        assert status["last_disconnect_reason"] == "cancel"
+        assert status["last_disconnect_error"] is not None
+        assert "close_session" in status["last_disconnect_error"]
+        # Must not retry physical cancel.
+        assert fake.calls.count("coffee_cancel") == 1
+        await core.shutdown()
+
+    asyncio.run(go())

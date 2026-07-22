@@ -38,10 +38,6 @@ def test_skill_references_and_assets_exist():
         "assets/tea-oolong-official.yaml",
         "scripts/xbloom.py",
         "scripts/bootstrap.py",
-        "scripts/xbloom_paths.py",
-        "scripts/xbloom_catalog.py",
-        "scripts/xbloom_history.py",
-        "scripts/xbloom_ble/bridge.py",
         "agents/openai.yaml",
         "LICENSE",
         "THIRD_PARTY_NOTICES.md",
@@ -65,12 +61,31 @@ def test_runtime_requirements_are_pinned():
         if line.strip() and not line.startswith("#")
     ]
     assert lines
-    assert all("==" in line for line in lines)
+    # Each line is either a pinned dependency (==) or an editable local install (-e).
+    assert all("==" in line or line.startswith("-e ") for line in lines)
 
 
 def test_bootstrap_uses_external_runtime_not_installed_skill():
     bootstrap = (ROOT / "scripts" / "bootstrap.py").read_text(encoding="utf-8")
-    paths = (ROOT / "scripts" / "xbloom_paths.py").read_text(encoding="utf-8")
-    assert 'skill_runtime_dir()' in bootstrap
+    import xbloom_paths
+
+    # Bootstrap inlines path helpers so it can run before core is installed.
+    assert 'RUNTIME_DIR_ENV = "XBLOOM_SKILL_RUNTIME_DIR"' in bootstrap
+    assert "_skill_runtime_dir" in bootstrap
     assert 'Path(skill_root) / ".venv"' not in bootstrap
-    assert 'RUNTIME_DIR_ENV = "XBLOOM_SKILL_RUNTIME_DIR"' in paths
+    assert 'from xbloom_paths' not in bootstrap
+    assert getattr(xbloom_paths, "RUNTIME_DIR_ENV", None) == "XBLOOM_SKILL_RUNTIME_DIR"
+
+
+def test_xbloom_cli_inlines_path_helpers_for_clean_launch():
+    """CLI must not import core at module load (clean CI / no-site-packages)."""
+
+    source = (ROOT / "scripts" / "xbloom.py").read_text(encoding="utf-8")
+    import xbloom_paths
+
+    assert 'RUNTIME_DIR_ENV = "XBLOOM_SKILL_RUNTIME_DIR"' in source
+    assert "def reexec_in_local_runtime" in source
+    assert "def preferred_runtime_python" in source
+    assert "from xbloom_paths" not in source
+    assert "import xbloom_paths" not in source
+    assert getattr(xbloom_paths, "RUNTIME_DIR_ENV", None) == "XBLOOM_SKILL_RUNTIME_DIR"
