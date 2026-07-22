@@ -170,12 +170,11 @@ python <skill-dir>/scripts/xbloom.py bridge connect
 python <skill-dir>/scripts/xbloom.py bridge events --since 0
 ```
 
-The bridge is the sole BLE owner while it runs. Direct one-shot BLE commands deliberately refuse
-to race it; use the matching `bridge` workflow or stop the idle daemon first. `bridge stop` refuses
-during an activity; `bridge stop --force` first sends that activity's guarded stop/cancel path.
-Bridge operations cover coffee, tea, scale, grinder, water, presets, persistent settings, advanced
-tuning, and continuous events. Read `references/deployment.md` for daemon state, external runtime,
-and deployment details.
+The bridge is the sole BLE owner. All active connection/machine commands (probe, load, start, tea,
+scale, grind, water, settings, cancel, save-slots, …) use typed bridge RPC through the daemon.
+Only passive `scan` / `doctor --scan` may call BLE discovery directly. `bridge stop` refuses during
+an activity; `bridge stop --force` first sends that activity's guarded stop/cancel path. Read
+`references/deployment.md` for daemon state, external runtime, and deployment details.
 
 ## Load without starting
 
@@ -211,12 +210,11 @@ owner has enabled remote start, run:
 python <skill-dir>/scripts/xbloom.py start <same-recipe.yaml> --confirm-ready cup-filter-water-beans
 ```
 
-The recipe must be unchanged, armed on the same machine, and loaded less than five minutes ago.
-The command aggregates weight progress to at most one update per second and emits a final summary.
-Claim successful completion only when that summary reports `"completion_confirmed": true`.
-`"terminal_confirmed": true` means the workflow ended and allows the wrapper to clear its record;
-an `idle` terminal without `ready`/`complete` does not prove a successful cup. For listen-only
-telemetry, use:
+The recipe must be unchanged and bound to the durable `workflow_id` returned by `load` on the same
+machine. Loaded recipes wait indefinitely for explicit start or cancel — there is **no** five-minute
+loaded expiry. Hardware commands go through the local bridge daemon (sole BLE owner); `monitor`
+only observes status/events and never connects or cancels. Client exit does not release the brew.
+For listen-only observation of a running daemon workflow, use:
 
 ```text
 python <skill-dir>/scripts/xbloom.py monitor --duration 300
@@ -466,9 +464,9 @@ instead of silently omitting it. Read `references/catalog.md` for the full repre
   and cancel automatically reuse the recorded machine instead of scanning.
 - Tea-loaded-state record exists: execute the unchanged recipe while currently ready, or cancel.
 - Grinder cooldown active: wait for the reported remainder; never bypass the rest record.
-- Bridge running: do not start a direct BLE command. Use `bridge status`/`bridge events`, use the
-  matching bridge operation, or stop the idle daemon. If an activity is uncertain, keep the vessel
-  in place and use `bridge cancel` or the machine's physical control before `bridge stop --force`.
+- Bridge activity uncertain: keep the vessel in place and use `cancel` / `bridge cancel` or the
+  machine's physical control before `bridge stop --force`. Top-level hardware commands already use
+  the daemon; they do not open a second direct BLE connection.
 - Bridge environment changed: restart the idle bridge; owner gates are captured by the daemon when
   it starts. Never force-stop an activity merely to reload configuration.
 - `WAIT` or slow drawdown: follow the physical checks in `references/recipe-design.md`, then change

@@ -24,6 +24,7 @@ import re
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 from typing import Any
 
 
@@ -357,56 +358,12 @@ def reserve_grinder_rest(seconds: float) -> None:
     )
 
 
-async def resolve_address(explicit: str | None, timeout: float) -> tuple[str, str]:
-    from xbloom_ble.client import scan
-
-    address = explicit or environment_value("XBLOOM_ADDRESS")
-    if address:
-        return address, "configured"
-    devices = await scan(timeout=timeout)
-    if len(devices) != 1:
-        raise RuntimeError(f"expected exactly one nearby xBloom; found {len(devices)}")
-    device = devices[0]
-    return device.address, getattr(device, "name", None) or "xBloom"
-
-
 def loaded_workflow_records() -> list[tuple[Path, dict[str, Any]]]:
     return [
         (path, state_read(path))
         for path in (STATE_FILE, TEA_STATE_FILE)
         if path.exists()
     ]
-
-
-async def resolve_control_address(explicit: str | None, timeout: float) -> tuple[str, str]:
-    """Resolve monitor/cancel against a loaded workflow before scanning.
-
-    A state record is the authoritative machine binding after load/start. Reusing it
-    avoids scanning during an armed or running operation and makes recovery reliable
-    when several xBloom machines are nearby.
-    """
-    records = loaded_workflow_records()
-    if not records:
-        return await resolve_address(explicit, timeout)
-
-    addresses = {str(record.get("address") or "") for _path, record in records}
-    if "" in addresses:
-        raise RuntimeError("loaded workflow state has no machine address; inspect before recovery")
-    if len(addresses) != 1:
-        raise RuntimeError("loaded workflow records refer to different machines; inspect before recovery")
-    recorded_address = next(iter(addresses))
-    configured_address = explicit or environment_value("XBLOOM_ADDRESS")
-    if configured_address and configured_address.casefold() != recorded_address.casefold():
-        raise RuntimeError("requested machine differs from the loaded workflow machine")
-    machine = next(
-        (
-            str(record.get("machine"))
-            for _path, record in records
-            if record.get("machine")
-        ),
-        "xBloom",
-    )
-    return recorded_address, machine
 
 
 def redact_machine_info(machine_info: dict[str, object]) -> dict[str, object]:
@@ -416,63 +373,22 @@ def redact_machine_info(machine_info: dict[str, object]) -> dict[str, object]:
     }
 
 
-async def inspect_machine(address: str, *, duration: float = 4.0) -> dict[str, Any]:
-    """Read the vendor service, firmware, and state without sending brew control."""
-    from bleak import BleakClient
-    from xbloom_ble.client import CHAR_COMMAND, CHAR_STATUS, SERVICE_UUID
-    from xbloom_ble.protocol import build_session_start, build_status_query
-    from xbloom_ble.telemetry import parse_notification
+def make_bridge_client(args: argparse.Namespace | None = None) -> Any:
+    """Construct the typed Skill CLI bridge client (ensures daemon on first hardware use)."""
 
-    seen_types: set[int] = set()
-    states: list[str] = []
-    firmware: set[str] = set()
-    machine_info: dict[str, object] = {}
+    from xbloom_ble.bridge_client import TypedBridgeClient
 
-    def on_status(_sender: object, data: bytearray) -> None:
-        raw = bytes(data)
-        if len(raw) > 3:
-            seen_types.add(raw[3])
-        firmware.update(x.decode("ascii", errors="replace") for x in FIRMWARE_RE.findall(raw))
-        event = parse_notification(raw)
-        if event is not None:
-            if event.state is not None:
-                states.append(event.state_name)
-            if event.machine_info:
-                machine_info.update(event.machine_info)
-                value = event.machine_info.get("firmware")
-                if isinstance(value, str) and value:
-                    firmware.add(value)
-
-    session = build_session_start()
-    status = build_status_query()
-    if {session[3], status[3]} != {0xA4, 0x56}:
-        raise RuntimeError("probe opcode invariant failed")
-
-    async with BleakClient(address) as client:
-        if SERVICE_UUID.lower() not in {service.uuid.lower() for service in client.services}:
-            raise RuntimeError("xBloom vendor service is missing")
-        await client.start_notify(CHAR_STATUS, on_status)
-        await client.write_gatt_char(CHAR_COMMAND, session, response=False)
-        await asyncio.sleep(0.5)
-        await client.write_gatt_char(CHAR_COMMAND, status, response=False)
-        await asyncio.sleep(duration)
-        await client.stop_notify(CHAR_STATUS)
-
-    # A serial number is useful internally for app account/device binding, but
-    # probe output is routinely copied into Agent transcripts and bug reports.
-    # Keep the useful read-only settings while deliberately redacting identity.
-    public_machine_info = redact_machine_info(machine_info)
-    return {
-        "vendor_service": True,
-        "firmware": sorted(firmware),
-        "states": list(dict.fromkeys(states)),
-        "notification_types": [f"0x{x:02x}" for x in sorted(seen_types)],
-        "machine_info": public_machine_info or None,
-        "brew_control_sent": False,
-    }
+    address = None
+    if args is not None:
+        address = getattr(args, "address", None) or environment_value("XBLOOM_ADDRESS")
+    else:
+        address = environment_value("XBLOOM_ADDRESS")
+    return TypedBridgeClient(address=address, state_root=STATE_DIR)
 
 
 def require_write_preflight(report: dict[str, Any]) -> str:
+    """Legacy helper retained for tests; bridge core enforces firmware gates on write."""
+
     active = ACTIVE_STATES & set(report.get("states", []))
     if active:
         raise RuntimeError(f"machine is not idle ({', '.join(sorted(active))}); cancel first")
@@ -651,11 +567,16 @@ async def async_scan(args: argparse.Namespace) -> int:
 
 
 async def async_probe(args: argparse.Namespace) -> int:
+    """Safe one-shot probe via the daemon (never direct Bleak)."""
+
     if STATE_FILE.exists() or TEA_STATE_FILE.exists():
         raise RuntimeError("a loaded-recipe record exists; use monitor or cancel, not probe")
-    address, name = await resolve_address(args.address, args.scan_timeout)
-    report = await inspect_machine(address)
-    emit({"command": "probe", "machine": name, **report})
+    client = make_bridge_client(args)
+    result = client.probe(
+        address=args.address,
+        scan_timeout=float(args.scan_timeout),
+    )
+    emit({"command": "probe", **result})
     return 0
 
 
@@ -669,27 +590,15 @@ def require_settings_write_gate(confirmation: str, expected: str) -> None:
         raise RuntimeError(f"--confirm-write must equal {expected}")
 
 
-async def _ephemeral_bridge_rpc(
-    address: str, method: str, params: dict[str, Any] | None = None
-) -> dict[str, Any]:
-    """Use the same state machine as the daemon for a one-shot connection."""
-
-    from xbloom_ble.bridge import BridgeCore
-
-    core = BridgeCore(default_address=address, state_dir=STATE_DIR)
-    try:
-        return await core.rpc(method, params)
-    finally:
-        await core.shutdown()
-
-
 async def async_settings(args: argparse.Namespace) -> int:
     """Read persistent user settings without changing the machine."""
 
     ensure_no_loaded_workflow()
-    address, name = await resolve_address(args.address, args.scan_timeout)
-    result = await _ephemeral_bridge_rpc(address, "settings.read")
-    emit({"command": "settings", "machine": name, **result})
+    client = make_bridge_client(args)
+    result = client.settings_read(
+        address=args.address, scan_timeout=float(args.scan_timeout)
+    )
+    emit({"command": "settings", **result})
     return 0
 
 
@@ -710,19 +619,14 @@ async def async_set_settings(args: argparse.Namespace) -> int:
     if not requested:
         raise RuntimeError("set-settings needs at least one setting option")
     ensure_no_loaded_workflow()
-    address, name = await resolve_address(args.address, args.scan_timeout)
-    result = await _ephemeral_bridge_rpc(
-        address,
-        "settings.write",
-        {**requested, "confirmation": args.confirm_write},
+    client = make_bridge_client(args)
+    result = client.settings_write(
+        confirmation=args.confirm_write,
+        address=args.address,
+        scan_timeout=float(args.scan_timeout),
+        **requested,
     )
-    emit(
-        {
-            "command": "set-settings",
-            "machine": name,
-            **result,
-        }
-    )
+    emit({"command": "set-settings", **result})
     return 0
 
 
@@ -730,9 +634,11 @@ async def async_advanced(args: argparse.Namespace) -> int:
     """Read APK-defined mechanical tuning values."""
 
     ensure_no_loaded_workflow()
-    address, name = await resolve_address(args.address, args.scan_timeout)
-    result = await _ephemeral_bridge_rpc(address, "advanced.read")
-    emit({"command": "advanced", "machine": name, **result})
+    client = make_bridge_client(args)
+    result = client.advanced_read(
+        address=args.address, scan_timeout=float(args.scan_timeout)
+    )
+    emit({"command": "advanced", **result})
     return 0
 
 
@@ -743,23 +649,15 @@ async def async_set_advanced(args: argparse.Namespace) -> int:
     if args.pour_radius_level is None and args.vibration_level is None:
         raise RuntimeError("set-advanced needs at least one level option")
     ensure_no_loaded_workflow()
-    address, name = await resolve_address(args.address, args.scan_timeout)
-    result = await _ephemeral_bridge_rpc(
-        address,
-        "advanced.write",
-        {
-            "pour_radius_level": args.pour_radius_level,
-            "vibration_level": args.vibration_level,
-            "confirmation": args.confirm_write,
-        },
+    client = make_bridge_client(args)
+    result = client.advanced_write(
+        confirmation=args.confirm_write,
+        pour_radius_level=args.pour_radius_level,
+        vibration_level=args.vibration_level,
+        address=args.address,
+        scan_timeout=float(args.scan_timeout),
     )
-    emit(
-        {
-            "command": "set-advanced",
-            "machine": name,
-            **result,
-        }
-    )
+    emit({"command": "set-advanced", **result})
     return 0
 
 
@@ -1123,29 +1021,36 @@ def cmd_history(args: argparse.Namespace) -> int:
 
 
 async def async_load(args: argparse.Namespace) -> int:
-    from xbloom_ble.client import XBloomClient
+    """Load/arm via daemon-owned BLE; returns durable workflow_id."""
 
-    path, recipe, summary = load_recipe(args.recipe)
+    path, _recipe, summary = load_recipe(args.recipe)
     ensure_no_loaded_workflow()
-    address, name = await resolve_address(args.address, args.scan_timeout)
-    preflight = await inspect_machine(address)
-    firmware = require_write_preflight(preflight)
-    async with XBloomClient(address) as client:
-        armed = await client.load_recipe(recipe)
-    if armed.state_name != "armed":
-        raise RuntimeError(f"machine did not arm; state={armed.state_name}")
+    client = make_bridge_client(args)
+    result = client.coffee_load(
+        recipe=str(path),
+        address=args.address,
+        scan_timeout=float(args.scan_timeout),
+    )
+    workflow_id = result.get("workflow_id")
+    if workflow_id is None or not str(workflow_id).strip():
+        raise RuntimeError(
+            "coffee.load returned no workflow_id; refuse success and do not "
+            "write compatibility state (do not retry uncertain load)"
+        )
+    workflow_id = str(workflow_id).strip()
     state = {
-        "address": address,
-        "machine": name,
+        "address": result.get("address") or args.address or environment_value("XBLOOM_ADDRESS"),
+        "machine": result.get("machine"),
         "recipe_path": str(path),
         "recipe_sha256": summary["recipe_sha256"],
         "loaded_at": time.time(),
         "status": "armed",
-        "firmware": firmware,
+        "firmware": result.get("firmware"),
         "target_dispensed_water_ml": summary["target_dispensed_water_ml"],
         "serving_kind": summary["kind"],
         "machine_program": summary["machine_program"],
         "manual_preload_ice_g": summary["manual_preload_ice_g"],
+        "workflow_id": workflow_id,
     }
     state_write(state)
     history_event = record_history_event(
@@ -1156,11 +1061,12 @@ async def async_load(args: argparse.Namespace) -> int:
     )
     payload = {
         "command": "load",
-        "status": "armed",
-        "machine": name,
-        "firmware": firmware,
+        "status": result.get("status") or "armed",
+        "workflow_id": workflow_id,
+        "request_id": result.get("request_id"),
         "remote_start_sent": False,
         **summary,
+        **{k: v for k, v in result.items() if k not in {"status"}},
     }
     if history_event:
         payload["history_event_id"] = history_event["event_id"]
@@ -1423,143 +1329,236 @@ async def monitor_client(
     )
 
 
+def _monitor_event_state(event: Mapping[str, Any]) -> str | None:
+    """Extract a machine/phase state name from live or durable event shapes."""
+
+    if event.get("state"):
+        return str(event["state"])
+    payload = event.get("payload")
+    if isinstance(payload, Mapping):
+        for key in ("state", "result", "state_name"):
+            if payload.get(key):
+                return str(payload[key])
+    return None
+
+
+def _monitor_is_terminal_state(name: str | None) -> bool:
+    return name in {"ready", "complete", "idle", "cancelled", "stopped"}
+
+
+def _monitor_status_matches_workflow(
+    status: Mapping[str, Any], workflow_id: str
+) -> bool:
+    """True only when status/global telemetry can be attributed to workflow_id.
+
+    ``active_workflow_id is None`` is *not* proof of ownership. Use global
+    phase/activity/connected/machine_state/telemetry only when:
+    - active_workflow_id equals the observed ID, or
+    - active is empty AND last_operation.workflow_id equals the observed ID
+      (just-terminal provenance).
+    """
+
+    active = status.get("active_workflow_id")
+    if active is not None and str(active).strip():
+        return str(active) == str(workflow_id)
+    last_op = status.get("last_operation")
+    if isinstance(last_op, Mapping):
+        op_wid = last_op.get("workflow_id")
+        if op_wid is not None and str(op_wid).strip():
+            return str(op_wid) == str(workflow_id)
+    return False
+
+
 async def async_monitor(args: argparse.Namespace) -> int:
-    from xbloom_ble.client import XBloomClient
+    """Observe bridge status/events only — never connect, start, cancel, or release BLE.
+
+    Requires an explicit ``--workflow-id`` or the current active durable workflow
+    (no unfiltered all-history mode). ``--duration`` is an observation bound only
+    (not recipe expiry). Client exit / Ctrl-C does not alter daemon or BLE ownership.
+    """
 
     if not 0.1 <= float(args.duration) <= 3600:
         raise RuntimeError("monitor --duration must be 0.1-3600 seconds")
     if not 0.1 <= float(args.progress_interval) <= 60:
         raise RuntimeError("monitor --progress-interval must be 0.1-60 seconds")
-    workflow_records = loaded_workflow_records()
-    if len(workflow_records) > 1:
-        raise RuntimeError("multiple loaded workflow records exist; run cancel before monitoring")
-    active_already = any(
-        record.get("status")
-        in {"start_pending", "start_unconfirmed", "running", "completion_unconfirmed"}
-        for _path, record in workflow_records
-    )
-    address, name = await resolve_control_address(args.address, args.scan_timeout)
+    client = make_bridge_client(args)
+    # Read-only: never ensure/start a daemon or connect BLE.
+    workflow_id = getattr(args, "workflow_id", None)
+    if workflow_id is not None:
+        workflow_id = str(workflow_id).strip() or None
+    try:
+        status0 = client.status(require_hello=False)
+    except Exception as exc:
+        raise RuntimeError(
+            f"monitor requires a running bridge daemon: {exc}"
+        ) from exc
+    active_id = status0.get("active_workflow_id")
+    if not workflow_id:
+        if not active_id:
+            raise RuntimeError(
+                "monitor requires --workflow-id or an active durable workflow"
+            )
+        workflow_id = str(active_id)
+    else:
+        # Reject unknown/stale ID when another workflow is active.
+        if active_id and str(active_id) != str(workflow_id):
+            raise RuntimeError(
+                f"workflow_id {workflow_id!r} is not the active workflow "
+                f"{active_id!r}; refuse unfiltered observation"
+            )
+
     emit(
         {
             "command": "monitor",
             "status": "listening",
-            "machine": name,
+            "workflow_id": workflow_id,
             "progress_interval_s": args.progress_interval,
+            "observation_only": True,
+            "bridge_owned": True,
+            "daemon_untouched": True,
         }
     )
-    async with XBloomClient(address) as client:
-        result = await monitor_client(
-            client,
-            args.duration,
-            progress_interval=args.progress_interval,
-            active_already=active_already,
-        )
-    state_records_cleared = 0
-    history_event = None
-    if result.terminal_confirmed:
-        if len(workflow_records) == 1:
-            state = workflow_records[0][1]
-            history_event = record_history_event(
-                command="monitor",
-                outcome="completed",
-                state=state,
-                monitor={**result.summary(), **volume_comparison(state, result)},
+    deadline = time.monotonic() + float(args.duration)
+    since = 0
+    last_progress = 0.0
+    terminal_state: str | None = None
+    last_status = status0
+    # Independent consecutive-failure counters: success on one channel must not
+    # reset failures on the other (avoids swallowing a permanently failing status).
+    events_failures = 0
+    status_failures = 0
+    fail_threshold = 3
+    while time.monotonic() < deadline:
+        try:
+            page = client.events(since=since, workflow_id=workflow_id)
+            events_failures = 0
+        except Exception as exc:
+            events_failures += 1
+            if events_failures >= fail_threshold:
+                raise RuntimeError(
+                    f"monitor events failed repeatedly: {exc}"
+                ) from exc
+            await asyncio.sleep(min(0.5, float(args.progress_interval)))
+            continue
+        if page.get("gap_detected"):
+            raise RuntimeError(
+                f"monitor event gap for workflow {workflow_id!r}: "
+                f"{page.get('gap_reason') or 'gap_detected'}"
             )
-        for path, _record in workflow_records:
-            state_clear(path)
-            state_records_cleared += 1
-    elif len(workflow_records) == 1 and result.saw_active:
-        state = workflow_records[0][1]
-        history_event = record_history_event(
-            command="monitor",
-            outcome="completion_unconfirmed",
-            state=state,
-            monitor={**result.summary(), **volume_comparison(state, result)},
-        )
-    payload = {
+        events = list(page.get("events") or [])
+        since = int(page.get("next_since") or since)
+        for event in events:
+            # Durable rows use event_type + payload; live rows use state.
+            event_type = event.get("event_type")
+            state_name = _monitor_event_state(event)
+            if event_type == "terminal" or _monitor_is_terminal_state(state_name):
+                terminal_state = state_name or (
+                    str((event.get("payload") or {}).get("result"))
+                    if isinstance(event.get("payload"), Mapping)
+                    else None
+                ) or "terminal"
+        try:
+            last_status = client.status(require_hello=False)
+            status_failures = 0
+        except Exception as exc:
+            status_failures += 1
+            if status_failures >= fail_threshold:
+                raise RuntimeError(
+                    f"monitor status failed repeatedly: {exc}"
+                ) from exc
+            await asyncio.sleep(min(0.5, float(args.progress_interval)))
+            continue
+        # Provenance-safe attachment of global status fields.
+        same_workflow = _monitor_status_matches_workflow(last_status, str(workflow_id))
+        now = time.monotonic()
+        if now - last_progress >= float(args.progress_interval):
+            progress: dict[str, Any] = {
+                "command": "monitor-progress",
+                "workflow_id": workflow_id,
+                "time": round(time.time(), 3),
+            }
+            if same_workflow:
+                progress["phase"] = last_status.get("phase")
+                progress["activity"] = last_status.get("activity")
+                progress["connected"] = last_status.get("connected")
+                progress["machine_state"] = last_status.get("machine_state")
+                if last_status.get("telemetry") is not None:
+                    progress["telemetry"] = last_status.get("telemetry")
+                if last_status.get("liquid_progress") is not None:
+                    progress["liquid_progress"] = last_status.get("liquid_progress")
+            emit(progress)
+            last_progress = now
+        if same_workflow:
+            phase = last_status.get("phase")
+            if phase in {"idle", "disconnected"} and last_status.get("activity") is None:
+                last_op = last_status.get("last_operation")
+                if isinstance(last_op, Mapping) and str(
+                    last_op.get("workflow_id") or ""
+                ) == str(workflow_id):
+                    terminal_state = terminal_state or str(
+                        last_op.get("result") or phase
+                    )
+                    break
+                if last_status.get("active_workflow_id") is None and last_op is None:
+                    # No competing identity and no last_op; durable events decide.
+                    pass
+        if terminal_state:
+            break
+        await asyncio.sleep(min(0.5, float(args.progress_interval)))
+    payload: dict[str, Any] = {
         "command": "monitor",
-        "status": (
-            result.terminal_state if result.terminal_confirmed else "duration_elapsed"
-        ),
-        "state_records_cleared": state_records_cleared,
-        **result.summary(),
-        **(
-            volume_comparison(workflow_records[0][1], result)
-            if len(workflow_records) == 1
-            else {}
-        ),
+        "status": terminal_state or "duration_elapsed",
+        "workflow_id": workflow_id,
+        "observation_only": True,
+        "daemon_untouched": True,
     }
-    if history_event:
-        payload["history_event_id"] = history_event["event_id"]
+    if _monitor_status_matches_workflow(last_status, str(workflow_id)):
+        payload["phase"] = last_status.get("phase")
+        payload["activity"] = last_status.get("activity")
+        payload["connected"] = last_status.get("connected")
+        payload["machine_state"] = last_status.get("machine_state")
+        payload["telemetry"] = last_status.get("telemetry")
+        payload["liquid_progress"] = last_status.get("liquid_progress")
     emit(payload)
     return 0
 
 
 async def async_scale(args: argparse.Namespace) -> int:
-    """Use the Studio as a standalone electronic scale; no motor or water."""
-    from xbloom_ble.client import XBloomClient
+    """Standalone scale via bridge one-shot workflow."""
 
     if not 0.05 <= float(args.interval) <= 10.0:
         raise RuntimeError("scale --interval must be 0.05-10 seconds")
     if not 0.1 <= float(args.duration) <= 3600:
         raise RuntimeError("scale --duration must be 0.1-3600 seconds")
     ensure_no_loaded_workflow()
-    address, name = await resolve_address(args.address, args.scan_timeout)
-    preflight = await inspect_machine(address)
-    firmware = require_write_preflight(preflight)
+    client = make_bridge_client(args)
     emit(
         {
             "command": "scale",
             "status": "entering",
-            "machine": name,
-            "firmware": firmware,
             "entry_auto_zero": True,
             "extra_tare_requested": bool(args.tare),
         }
     )
-    last_emit = 0.0
-
-    def on_weight(event: Any) -> None:
-        nonlocal last_emit
-        now = time.monotonic()
-        if now - last_emit < args.interval:
-            return
-        last_emit = now
-        emit(
-            {
-                "command": "scale-reading",
-                "time": round(time.time(), 3),
-                "grams": event.scale_g,
-            }
-        )
-
-    def on_ready() -> None:
-        emit(
-            {
-                "command": "scale",
-                "status": "ready",
-                "baseline_zeroed": True,
-                "extra_tare_sent": bool(args.tare),
-                "instruction": (
-                    "place-object-now-for-absolute-weight-or-add-contents-now-for-net-weight"
-                ),
-            }
-        )
-
-    async with XBloomClient(address) as client:
-        await client.stream_scale(
-            on_weight,
-            duration=args.duration,
-            tare=args.tare,
-            on_ready=on_ready,
-        )
-    emit({"command": "scale", "status": "exited", "machine": name})
+    result = client.scale_start(
+        duration_s=float(args.duration),
+        tare=bool(args.tare),
+        address=args.address,
+        scan_timeout=float(args.scan_timeout),
+    )
+    emit({"command": "scale", "status": "started", **result})
+    # Observation bound only: poll status until activity ends or duration elapses.
+    deadline = time.monotonic() + float(args.duration) + 2.0
+    while time.monotonic() < deadline:
+        st = client.status(require_hello=False)
+        if st.get("activity") != "scale":
+            break
+        await asyncio.sleep(max(0.2, float(args.interval)))
+    emit({"command": "scale", "status": "exited", **result})
     return 0
 
 
 async def async_grind(args: argparse.Namespace) -> int:
-    from xbloom_ble.client import XBloomClient
-
     if environment_value(REMOTE_GRINDER_ENV) != REMOTE_GRINDER_SENTINEL:
         raise RuntimeError(
             f"remote grinder disabled; administrator must set "
@@ -1575,35 +1574,32 @@ async def async_grind(args: argparse.Namespace) -> int:
         raise RuntimeError("grind --seconds must be 0.1-30")
     ensure_no_loaded_workflow()
     require_grinder_rest()
-    address, name = await resolve_address(args.address, args.scan_timeout)
-    preflight = await inspect_machine(address)
-    firmware = require_write_preflight(preflight)
     reserve_grinder_rest(args.seconds)
-    async with XBloomClient(address) as client:
-        stop_ack = await client.grind(args.size, args.rpm, seconds=args.seconds)
+    client = make_bridge_client(args)
+    result = client.grinder_start(
+        size=int(args.size),
+        rpm=int(args.rpm),
+        seconds=float(args.seconds),
+        confirmation=args.confirm_ready,
+        address=args.address,
+        scan_timeout=float(args.scan_timeout),
+    )
     emit(
         {
             "command": "grind",
-            "status": "stopped",
-            "machine": name,
-            "firmware": firmware,
+            "status": result.get("status") or "stopped",
             "size": args.size,
             "rpm": args.rpm,
             "seconds": args.seconds,
             "rest_seconds": GRINDER_REST_SECONDS,
-            "verified_stop_command": (
-                f"0x{stop_ack.command_code:04x}"
-                if stop_ack.command_code is not None
-                else None
-            ),
+            "workflow_id": result.get("workflow_id"),
+            **result,
         }
     )
     return 0
 
 
 async def async_water(args: argparse.Namespace) -> int:
-    from xbloom_ble.client import XBloomClient
-
     if environment_value(REMOTE_START_ENV) != REMOTE_START_SENTINEL:
         raise RuntimeError(
             f"hot-water actions disabled; administrator must set "
@@ -1621,56 +1617,59 @@ async def async_water(args: argparse.Namespace) -> int:
     if args.timeout is not None and not 5 <= float(args.timeout) <= 600:
         raise RuntimeError("water --timeout must be 5-600 seconds")
     ensure_no_loaded_workflow()
-    address, name = await resolve_address(args.address, args.scan_timeout)
-    preflight = await inspect_machine(address)
-    firmware = require_write_preflight(preflight)
-    water_source = args.water_source
-    if water_source == "auto":
-        info = preflight.get("machine_info") or {}
-        water_source = info.get("water_source")
-        if water_source not in {"tank", "tap"}:
-            raise RuntimeError(
-                "could not read the machine water source; pass --water-source tank or tap"
-            )
-    water_feed = {"tank": 0, "tap": 1}[water_source]
-    async with XBloomClient(address) as client:
-        event = await client.dispense_water(
-            args.volume,
-            args.temp,
-            flow_ml_s=args.flow,
-            pattern=args.pattern,
-            water_feed=water_feed,
-            timeout=args.timeout,
+    client = make_bridge_client(args)
+    result = client.water_start(
+        volume_ml=float(args.volume),
+        temp_c=int(args.temp),
+        flow_ml_s=float(args.flow),
+        pattern=args.pattern,
+        water_source=args.water_source,
+        confirmation=args.confirm_ready,
+        address=args.address,
+        scan_timeout=float(args.scan_timeout),
+    )
+    workflow_id = result.get("workflow_id")
+    if workflow_id is None or not str(workflow_id).strip():
+        raise RuntimeError(
+            "water.start returned no workflow_id; refuse observation and do not "
+            "claim completion (do not retry uncertain start)"
         )
+    workflow_id = str(workflow_id).strip()
+    # --timeout is an observation bound only (never cancel/release the daemon).
+    if args.timeout is not None:
+        observe_s = float(args.timeout)
+    else:
+        safety = result.get("safety_timeout_s")
+        try:
+            observe_s = float(safety) + 30.0 if safety is not None else 300.0
+        except (TypeError, ValueError):
+            observe_s = 300.0
+        observe_s = max(5.0, min(600.0, observe_s))
     emit(
         {
             "command": "water",
-            "status": "complete",
-            "verified_by_command": (
-                f"0x{event.command_code:04x}" if event.command_code is not None else None
-            ),
-            "machine": name,
-            "firmware": firmware,
+            "status": result.get("status") or "running",
             "target_dispensed_water_ml": args.volume,
-            "dispensed_water_ml": event.dispensed_water_ml,
-            "dispensed_vs_target_ml": round(
-                float(event.dispensed_water_ml or 0.0) - float(args.volume), 2
-            ),
-            "cup_delta_g": (event.report_values or {}).get("cup_delta_g"),
             "temp_c": args.temp,
             "temp_setting": (
                 "RT" if args.temp == ROOM_TEMPERATURE_C else f"{args.temp} C"
             ),
-            "heating_mode": (
-                "room-temperature-pass-through"
-                if args.temp == ROOM_TEMPERATURE_C
-                else "heated-target"
-            ),
             "flow_ml_s": args.flow,
             "pattern": args.pattern,
-            "water_source": water_source,
+            "workflow_id": workflow_id,
+            "observation_bound_s": observe_s,
+            **result,
         }
     )
+    # Observe the exact workflow until terminal or bound; never cancel on exit.
+    observe_args = SimpleNamespace(
+        duration=observe_s,
+        progress_interval=min(1.0, max(0.1, observe_s / 10.0)),
+        workflow_id=workflow_id,
+        address=args.address,
+        scan_timeout=args.scan_timeout,
+    )
+    await async_monitor(observe_args)
     return 0
 
 
@@ -1692,26 +1691,32 @@ def cmd_tea_validate(args: argparse.Namespace) -> int:
 
 
 async def async_tea_load(args: argparse.Namespace) -> int:
-    from xbloom_ble.client import XBloomClient
-
-    path, recipe, summary = load_tea_recipe(args.recipe)
+    path, _recipe, summary = load_tea_recipe(args.recipe)
     ensure_no_loaded_workflow()
-    address, name = await resolve_address(args.address, args.scan_timeout)
-    preflight = await inspect_machine(address)
-    firmware = require_write_preflight(preflight)
-    async with XBloomClient(address) as client:
-        ack = await client.load_tea_recipe(recipe)
+    client = make_bridge_client(args)
+    result = client.tea_load(
+        recipe=str(path),
+        address=args.address,
+        scan_timeout=float(args.scan_timeout),
+    )
+    workflow_id = result.get("workflow_id")
+    if workflow_id is None or not str(workflow_id).strip():
+        raise RuntimeError(
+            "tea.load returned no workflow_id; refuse success and do not "
+            "write compatibility state (do not retry uncertain load)"
+        )
+    workflow_id = str(workflow_id).strip()
     state = {
-        "address": address,
-        "machine": name,
+        "address": result.get("address") or args.address or environment_value("XBLOOM_ADDRESS"),
         "recipe_path": str(path),
         "recipe_sha256": summary["recipe_sha256"],
         "loaded_at": time.time(),
         "status": "tea_loaded",
-        "firmware": firmware,
+        "firmware": result.get("firmware"),
         "target_dispensed_water_ml": summary["programmed_water_ml"],
         "serving_kind": "tea",
         "machine_program": "omni-tea-brewer",
+        "workflow_id": workflow_id,
     }
     state_write(state, TEA_STATE_FILE)
     history_event = record_history_event(
@@ -1722,14 +1727,11 @@ async def async_tea_load(args: argparse.Namespace) -> int:
     )
     payload = {
         "command": "tea-load",
-        "status": "tea_loaded",
-        "machine": name,
-        "firmware": firmware,
-        "verified_by_command": (
-            f"0x{ack.command_code:04x}" if ack.command_code is not None else None
-        ),
+        "status": result.get("status") or "tea_loaded",
+        "workflow_id": workflow_id,
         "remote_start_sent": False,
         **summary,
+        **result,
     }
     if history_event:
         payload["history_event_id"] = history_event["event_id"]
@@ -1738,7 +1740,6 @@ async def async_tea_load(args: argparse.Namespace) -> int:
 
 
 async def async_tea_start(args: argparse.Namespace) -> int:
-    from xbloom_ble.client import XBloomClient
     from xbloom_safety import recipe_sha256
 
     if environment_value(REMOTE_START_ENV) != REMOTE_START_SENTINEL:
@@ -1750,69 +1751,40 @@ async def async_tea_start(args: argparse.Namespace) -> int:
         raise RuntimeError(f"--confirm-ready must equal {TEA_READY_SENTINEL}")
     if not 1 <= float(args.duration) <= 3600:
         raise RuntimeError("tea-start --duration must be 1-3600 seconds")
-    if not 0.1 <= float(args.progress_interval) <= 60:
-        raise RuntimeError("tea-start --progress-interval must be 0.1-60 seconds")
     path, _recipe, summary = load_tea_recipe(args.recipe)
-    state = state_read(TEA_STATE_FILE)
-    if state.get("recipe_sha256") != recipe_sha256(path):
+    state = state_read(TEA_STATE_FILE) if TEA_STATE_FILE.exists() else {}
+    if state and state.get("recipe_sha256") not in (None, recipe_sha256(path)):
         raise RuntimeError("tea recipe changed since it was loaded")
-    if state.get("status") != "tea_loaded":
-        raise RuntimeError("tea state record is not loaded; load the recipe again")
-    address = str(state.get("address") or "")
-    if not address:
-        raise RuntimeError("loaded tea state has no machine address")
-    if args.address and args.address.casefold() != address.casefold():
-        raise RuntimeError("requested machine differs from the loaded tea machine")
-
-    async with XBloomClient(address) as client:
-        ack = await client.start_tea()
-        state = mark_workflow_started(state, TEA_STATE_FILE, "start_accepted")
-        emit(
-            {
-                "command": "tea-start",
-                "status": "start_accepted",
-                "verified_by_command": (
-                    f"0x{ack.command_code:04x}" if ack.command_code is not None else None
-                ),
-                "recipe_sha256": summary["recipe_sha256"],
-            }
+    client = make_bridge_client(args)
+    workflow_id = getattr(args, "workflow_id", None) or state.get("workflow_id")
+    if not workflow_id:
+        workflow_id = client.resolve_active_workflow_id(
+            kind="tea",
+            allowed_phases={"loaded", "tea_loaded"},
         )
-        result = await monitor_client(
-            client,
-            args.duration,
-            progress_interval=args.progress_interval,
-            active_already=True,
-        )
-    state_record_cleared = finalize_workflow_state(state, TEA_STATE_FILE, result)
-    history_event = record_history_event(
-        command="tea-start",
-        outcome=(
-            "completed" if result.terminal_confirmed else "completion_unconfirmed"
-        ),
-        state=state,
-        summary=summary,
-        monitor={**result.summary(), **volume_comparison(state, result)},
+    result = client.tea_start(
+        workflow_id=str(workflow_id),
+        confirmation=args.confirm_ready,
     )
-    output = {
-        "command": "tea-start",
-        "status": (
-            result.terminal_state if result.terminal_confirmed else "completion_unconfirmed"
-        ),
-        "state_record_cleared": state_record_cleared,
-        **result.summary(),
-        **volume_comparison(state, result),
-    }
-    if history_event:
-        output["history_event_id"] = history_event["event_id"]
-    if not result.terminal_confirmed:
-        output["next_action"] = "run monitor or cancel; do not assume tea completed"
-    emit(output)
-    return 0 if result.terminal_confirmed else UNCONFIRMED_COMPLETION_EXIT
+    if state:
+        state = mark_workflow_started(state, TEA_STATE_FILE, "start_accepted")
+    emit(
+        {
+            "command": "tea-start",
+            "status": result.get("status") or "start_accepted",
+            "workflow_id": workflow_id,
+            "recipe_sha256": summary["recipe_sha256"],
+            **result,
+        }
+    )
+    # Observation-only poll; does not connect or cancel the daemon workflow.
+    args.workflow_id = workflow_id
+    await async_monitor(args)
+    return 0
 
 
 async def async_tea_brew(args: argparse.Namespace) -> int:
-    """Load then explicitly execute tea in one connected, recoverable workflow."""
-    from xbloom_ble.client import XBloomClient
+    """Load then start tea over the same daemon-owned BLE link."""
 
     if environment_value(REMOTE_START_ENV) != REMOTE_START_SENTINEL:
         raise RuntimeError(
@@ -1823,121 +1795,105 @@ async def async_tea_brew(args: argparse.Namespace) -> int:
         raise RuntimeError(f"--confirm-ready must equal {TEA_READY_SENTINEL}")
     if not 1 <= float(args.duration) <= 3600:
         raise RuntimeError("tea-brew --duration must be 1-3600 seconds")
-    if not 0.1 <= float(args.progress_interval) <= 60:
-        raise RuntimeError("tea-brew --progress-interval must be 0.1-60 seconds")
 
-    path, recipe, summary = load_tea_recipe(args.recipe)
+    path, _recipe, summary = load_tea_recipe(args.recipe)
     ensure_no_loaded_workflow()
-    address, name = await resolve_address(args.address, args.scan_timeout)
-    preflight = await inspect_machine(address)
-    firmware = require_write_preflight(preflight)
+    client = make_bridge_client(args)
+    loaded = client.tea_load(
+        recipe=str(path),
+        address=args.address,
+        scan_timeout=float(args.scan_timeout),
+    )
+    workflow_id = loaded.get("workflow_id")
+    if not workflow_id:
+        raise RuntimeError("tea.load did not return workflow_id")
     state = {
-        "address": address,
-        "machine": name,
+        "address": args.address or environment_value("XBLOOM_ADDRESS"),
         "recipe_path": str(path),
         "recipe_sha256": summary["recipe_sha256"],
         "loaded_at": time.time(),
         "status": "tea_loaded",
-        "firmware": firmware,
+        "firmware": loaded.get("firmware"),
         "target_dispensed_water_ml": summary["programmed_water_ml"],
+        "workflow_id": workflow_id,
     }
-
-    async with XBloomClient(address) as client:
-        load_ack = await client.load_tea_recipe(recipe)
-        state_write(state, TEA_STATE_FILE)
-        emit(
-            {
-                "command": "tea-brew",
-                "status": "tea_loaded",
-                "machine": name,
-                "firmware": firmware,
-                "verified_by_command": (
-                    f"0x{load_ack.command_code:04x}"
-                    if load_ack.command_code is not None
-                    else None
-                ),
-                **summary,
-            }
-        )
-        start_ack = await client.start_tea()
-        state = mark_workflow_started(state, TEA_STATE_FILE, "start_accepted")
-        emit(
-            {
-                "command": "tea-brew",
-                "status": "start_accepted",
-                "verified_by_command": (
-                    f"0x{start_ack.command_code:04x}"
-                    if start_ack.command_code is not None
-                    else None
-                ),
-            }
-        )
-        result = await monitor_client(
-            client,
-            args.duration,
-            progress_interval=args.progress_interval,
-            active_already=True,
-        )
-
-    state_record_cleared = finalize_workflow_state(state, TEA_STATE_FILE, result)
-    history_event = record_history_event(
-        command="tea-brew",
-        outcome=(
-            "completed" if result.terminal_confirmed else "completion_unconfirmed"
-        ),
-        state=state,
-        summary=summary,
-        monitor={**result.summary(), **volume_comparison(state, result)},
+    state_write(state, TEA_STATE_FILE)
+    emit(
+        {
+            "command": "tea-brew",
+            "status": "tea_loaded",
+            "workflow_id": workflow_id,
+            **summary,
+            **loaded,
+        }
     )
-    output = {
-        "command": "tea-brew",
-        "status": (
-            result.terminal_state if result.terminal_confirmed else "completion_unconfirmed"
-        ),
-        "state_record_cleared": state_record_cleared,
-        **result.summary(),
-        **volume_comparison(state, result),
-    }
-    if history_event:
-        output["history_event_id"] = history_event["event_id"]
-    if not result.terminal_confirmed:
-        output["next_action"] = "run monitor or cancel; do not assume tea completed"
-    emit(output)
-    return 0 if result.terminal_confirmed else UNCONFIRMED_COMPLETION_EXIT
+    started = client.tea_start(
+        workflow_id=str(workflow_id),
+        confirmation=args.confirm_ready,
+    )
+    mark_workflow_started(state, TEA_STATE_FILE, "start_accepted")
+    emit(
+        {
+            "command": "tea-brew",
+            "status": started.get("status") or "start_accepted",
+            "workflow_id": workflow_id,
+            **started,
+        }
+    )
+    args.workflow_id = workflow_id
+    await async_monitor(args)
+    return 0
 
 
 async def async_cancel(args: argparse.Namespace) -> int:
-    from xbloom_ble.client import XBloomClient
+    """Cancel a durable workflow. Emergency requires explicit ``--emergency``."""
 
-    address, name = await resolve_control_address(args.address, args.scan_timeout)
+    client = make_bridge_client(args)
     prior_state = None
+    workflow_id = getattr(args, "workflow_id", None)
+    emergency = bool(getattr(args, "emergency", False))
     for path in (STATE_FILE, TEA_STATE_FILE):
         if path.exists():
             try:
                 prior_state = state_read(path)
+                if not workflow_id:
+                    workflow_id = prior_state.get("workflow_id")
                 break
             except RuntimeError:
                 pass
-    async with XBloomClient(address) as client:
-        await client.cancel_brew()
-        if TEA_STATE_FILE.exists():
-            await asyncio.sleep(0.2)
-            await client.unload_tea_recipe()
-        await asyncio.sleep(0.5)
+    if not workflow_id and not emergency:
+        try:
+            workflow_id = client.resolve_active_workflow_id()
+        except Exception as exc:
+            raise RuntimeError(
+                "cancel requires --workflow-id or an active durable workflow "
+                "(pass --emergency only for explicit emergency stop)"
+            ) from exc
+    if not workflow_id and not emergency:
+        raise RuntimeError(
+            "cancel requires --workflow-id or an active durable workflow "
+            "(pass --emergency only for explicit emergency stop)"
+        )
+    result = client.cancel(
+        workflow_id=str(workflow_id) if workflow_id else None,
+        emergency=emergency,
+    )
     state_clear()
     state_clear(TEA_STATE_FILE)
     history_event = record_history_event(
         command="cancel",
         outcome="cancelled",
-        state=prior_state or {"machine": name, "address": address},
-        extra={"machine": name},
+        state=prior_state or {},
+        extra={"workflow_id": workflow_id, "emergency": emergency},
     )
     payload = {
         "command": "cancel",
-        "status": "cancel_sent",
-        "machine": name,
+        "status": result.get("status") or "cancel_sent",
+        "workflow_id": workflow_id,
+        "emergency": emergency,
         "coffee_state_cleared": True,
         "tea_state_cleared": True,
+        **result,
     }
     if history_event:
         payload["history_event_id"] = history_event["event_id"]
@@ -1946,7 +1902,6 @@ async def async_cancel(args: argparse.Namespace) -> int:
 
 
 async def async_start(args: argparse.Namespace) -> int:
-    from xbloom_ble.client import XBloomClient
     from xbloom_safety import recipe_sha256
 
     if environment_value(REMOTE_START_ENV) != REMOTE_START_SENTINEL:
@@ -1957,149 +1912,84 @@ async def async_start(args: argparse.Namespace) -> int:
         raise RuntimeError(f"--confirm-ready must equal {READY_SENTINEL}")
     if not 1 <= float(args.duration) <= 3600:
         raise RuntimeError("start --duration must be 1-3600 seconds")
-    if not 0.1 <= float(args.progress_interval) <= 60:
-        raise RuntimeError("start --progress-interval must be 0.1-60 seconds")
     path, _recipe, summary = load_recipe(args.recipe)
-    state = state_read()
+    state = state_read() if STATE_FILE.exists() else {}
     state_status = state.get("status")
     if state_status in {"start_pending", "start_unconfirmed"}:
         raise RuntimeError(
             "previous start outcome is unconfirmed; run monitor or cancel; do not retry"
         )
-    if state_status != "armed":
-        raise RuntimeError("armed-state record is not armed; load the recipe again")
-    if state.get("recipe_sha256") != recipe_sha256(path):
+    if state and state.get("recipe_sha256") not in (None, recipe_sha256(path)):
         raise RuntimeError("recipe changed since it was loaded")
-    address = str(state.get("address") or "")
-    if not address:
-        raise RuntimeError("armed state has no machine address")
-    if args.address and args.address.casefold() != address.casefold():
-        raise RuntimeError("requested machine differs from the armed machine")
-
-    async with XBloomClient(address) as client:
+    client = make_bridge_client(args)
+    workflow_id = getattr(args, "workflow_id", None) or state.get("workflow_id")
+    if not workflow_id:
+        workflow_id = client.resolve_active_workflow_id(
+            kind="coffee",
+            allowed_phases={"loaded", "armed"},
+        )
+    if state:
         state = dict(state)
-        state.update(status="start_pending", start_requested_at=time.time())
+        state.update(
+            status="start_pending",
+            start_requested_at=time.time(),
+            workflow_id=workflow_id,
+        )
         state_write(state, STATE_FILE)
-        try:
-            event = await client.start()
-        except BaseException:
-            state.update(
-                status="start_unconfirmed",
-                start_unconfirmed_at=time.time(),
-                last_state=state.get("last_state"),
-            )
-            state_write(state, STATE_FILE)
-            raise
-        state = mark_workflow_started(state, STATE_FILE, event.state_name)
-        emit(
-            {
-                "command": "start",
-                "status": event.state_name,
-                "verified_by_notification": bool(event.raw),
-                "recipe_sha256": summary["recipe_sha256"],
-                "machine_program": summary.get("machine_program", "coffee-pour-over"),
-                "machine_dispenses_ice": bool(
-                    summary.get("machine_dispenses_ice", False)
-                ),
-                "manual_preload_ice_g": int(
-                    summary.get("manual_preload_ice_g", 0) or 0
-                ),
-            }
-        )
-        result = await monitor_client(
-            client,
-            args.duration,
-            progress_interval=args.progress_interval,
-            active_already=(bool(event.raw) and event.state_name in ACTIVE_STATES),
-        )
-    state_record_cleared = finalize_workflow_state(state, STATE_FILE, result)
-    history_event = record_history_event(
-        command="start",
-        outcome=(
-            "completed" if result.terminal_confirmed else "completion_unconfirmed"
-        ),
-        state=state,
-        summary=summary,
-        monitor={**result.summary(), **volume_comparison(state, result)},
+    result = client.coffee_start(
+        workflow_id=str(workflow_id),
+        confirmation=args.confirm_ready,
     )
-    output = {
-        "command": "start",
-        "status": (
-            result.terminal_state if result.terminal_confirmed else "completion_unconfirmed"
-        ),
-        "state_record_cleared": state_record_cleared,
-        **result.summary(),
-        **volume_comparison(state, result),
-    }
-    if history_event:
-        output["history_event_id"] = history_event["event_id"]
-    if not result.terminal_confirmed:
-        output["next_action"] = "run monitor or cancel; do not assume brew completed"
-    emit(output)
-    return 0 if result.terminal_confirmed else UNCONFIRMED_COMPLETION_EXIT
+    if state:
+        mark_workflow_started(state, STATE_FILE, str(result.get("status") or "running"))
+    emit(
+        {
+            "command": "start",
+            "status": result.get("status") or "running",
+            "workflow_id": workflow_id,
+            "recipe_sha256": summary["recipe_sha256"],
+            "machine_program": summary.get("machine_program", "coffee-pour-over"),
+            "machine_dispenses_ice": bool(
+                summary.get("machine_dispenses_ice", False)
+            ),
+            "manual_preload_ice_g": int(
+                summary.get("manual_preload_ice_g", 0) or 0
+            ),
+            **result,
+        }
+    )
+    # Observation bound only — does not release BLE or shut down the daemon.
+    args.workflow_id = workflow_id
+    await async_monitor(args)
+    return 0
 
 
 async def async_save_slots(args: argparse.Namespace) -> int:
-    from xbloom_ble.client import XBloomClient
     from xbloom_safety import validate_slot_compatible
 
     loaded = [load_recipe(path) for path in args.recipes]
     for _path, recipe, _summary in loaded:
         validate_slot_compatible(recipe)
     ensure_no_loaded_workflow()
-    address, name = await resolve_address(args.address, args.scan_timeout)
-    preflight = await inspect_machine(address)
-    firmware = require_write_preflight(preflight)
+    client = make_bridge_client(args)
     scale = [value == "on" for value in args.scale]
-    async with XBloomClient(address) as client:
-        await client.save_slots([item[1] for item in loaded], scale=scale)
+    result = client.presets_save(
+        recipes=[str(item[0]) for item in loaded],
+        scale=scale,
+        address=args.address,
+        scan_timeout=float(args.scan_timeout),
+    )
     emit(
         {
             "command": "save-slots",
-            "status": "saved",
-            "machine": name,
-            "firmware": firmware,
+            "status": result.get("status") or "saved",
             "slots": [item[2]["name"] for item in loaded],
             "scale": dict(zip(("A", "B", "C"), scale)),
             "brew_started": False,
+            **result,
         }
     )
     return 0
-
-
-DIRECT_BLE_COMMANDS = frozenset(
-    {
-        "probe",
-        "settings",
-        "set-settings",
-        "advanced",
-        "set-advanced",
-        "load",
-        "monitor",
-        "scale",
-        "grind",
-        "water",
-        "tea-load",
-        "tea-start",
-        "tea-brew",
-        "cancel",
-        "start",
-        "save-slots",
-    }
-)
-
-
-def ensure_bridge_not_running(command: str) -> None:
-    """Prevent a one-shot client from racing the long-lived BLE owner."""
-    if command not in DIRECT_BLE_COMMANDS:
-        return
-    from xbloom_ble.bridge import bridge_is_running
-
-    if bridge_is_running():
-        raise RuntimeError(
-            "the local BLE bridge is running and owns Studio access; use `bridge ...` "
-            "commands or stop the bridge before using one-shot BLE commands"
-        )
 
 
 def cmd_state(args: argparse.Namespace) -> int:
@@ -2143,7 +2033,6 @@ def cmd_state(args: argparse.Namespace) -> int:
 def cmd_bridge(args: argparse.Namespace) -> int:
     from xbloom_ble.bridge import (
         BridgeError,
-        bridge_call,
         bridge_is_running,
         bridge_record_path,
         ensure_bridge_daemon,
@@ -2154,13 +2043,23 @@ def cmd_bridge(args: argparse.Namespace) -> int:
 
     action = args.bridge_action
     if action == "serve":
-        # Core-owned serve path (lifecycle lock + bridge.json identity).
         asyncio.run(serve_bridge(address=args.address))
         return 0
     if action == "start":
-        # Core lifecycle API - no Skill script path for the daemon child.
         result = ensure_bridge_daemon(address=args.address)
-    elif action == "status":
+        emit({"command": "bridge", "action": action, **result})
+        return 0
+    if action == "stop":
+        result = stop_bridge_daemon(force=bool(args.force))
+        emit({"command": "bridge", "action": action, **result})
+        return 0
+    if action == "restart-if-idle":
+        result = restart_bridge_daemon_if_idle(address=args.address)
+        emit({"command": "bridge", "action": action, **result})
+        return 0
+
+    client = make_bridge_client(args)
+    if action == "status":
         if not bridge_is_running():
             result = {
                 "running": False,
@@ -2168,136 +2067,158 @@ def cmd_bridge(args: argparse.Namespace) -> int:
                 "record": str(bridge_record_path()),
             }
         else:
-            result = bridge_call("status", require_hello=False)
-    elif action == "stop":
-        result = stop_bridge_daemon(force=bool(args.force))
-    elif action == "restart-if-idle":
-        result = restart_bridge_daemon_if_idle(address=args.address)
+            result = client.status(require_hello=False)
     elif action == "connect":
-        result = bridge_call(
-            "connect",
-            {"address": args.address, "scan_timeout": args.scan_timeout},
+        result = client.connect(
+            address=args.address, scan_timeout=float(args.scan_timeout)
         )
     elif action == "disconnect":
-        result = bridge_call("disconnect")
+        result = client.disconnect()
     elif action == "events":
-        result = bridge_call("events", {"since": args.since})
+        result = client.events(since=int(args.since))
     elif action == "settings":
-        result = bridge_call(
-            "settings.read",
-            {"address": args.address, "scan_timeout": args.scan_timeout},
+        result = client.settings_read(
+            address=args.address, scan_timeout=float(args.scan_timeout)
         )
     elif action == "set-settings":
-        result = bridge_call(
-            "settings.write",
-            {
-                "weight_unit": args.weight_unit,
-                "temperature_unit": args.temperature_unit,
-                "water_source": args.water_source,
-                "display": args.display,
-                "confirmation": args.confirm_write,
-                "address": args.address,
-                "scan_timeout": args.scan_timeout,
-            },
+        result = client.settings_write(
+            confirmation=args.confirm_write,
+            weight_unit=args.weight_unit,
+            temperature_unit=args.temperature_unit,
+            water_source=args.water_source,
+            display=args.display,
+            address=args.address,
+            scan_timeout=float(args.scan_timeout),
         )
     elif action == "advanced":
-        result = bridge_call(
-            "advanced.read",
-            {"address": args.address, "scan_timeout": args.scan_timeout},
+        result = client.advanced_read(
+            address=args.address, scan_timeout=float(args.scan_timeout)
         )
     elif action == "set-advanced":
-        result = bridge_call(
-            "advanced.write",
-            {
-                "pour_radius_level": args.pour_radius_level,
-                "vibration_level": args.vibration_level,
-                "confirmation": args.confirm_write,
-                "address": args.address,
-                "scan_timeout": args.scan_timeout,
-            },
+        result = client.advanced_write(
+            confirmation=args.confirm_write,
+            pour_radius_level=args.pour_radius_level,
+            vibration_level=args.vibration_level,
+            address=args.address,
+            scan_timeout=float(args.scan_timeout),
         )
     elif action == "coffee-load":
         recipe = str(Path(args.recipe).expanduser().resolve(strict=True))
-        result = bridge_call(
-            "coffee.load",
-            {"recipe": recipe, "address": args.address, "scan_timeout": args.scan_timeout},
+        result = client.coffee_load(
+            recipe=recipe,
+            address=args.address,
+            scan_timeout=float(args.scan_timeout),
         )
     elif action == "coffee-start":
-        result = bridge_call(
-            "coffee.start", {"confirmation": args.confirm_ready}, timeout=args.timeout
+        wid = getattr(args, "workflow_id", None) or client.resolve_active_workflow_id(
+            kind="coffee", allowed_phases={"loaded", "armed"}
+        )
+        result = client.coffee_start(
+            workflow_id=str(wid),
+            confirmation=args.confirm_ready,
+            timeout=float(getattr(args, "timeout", 60.0) or 60.0),
         )
     elif action == "tea-load":
         recipe = str(Path(args.recipe).expanduser().resolve(strict=True))
-        result = bridge_call(
-            "tea.load",
-            {"recipe": recipe, "address": args.address, "scan_timeout": args.scan_timeout},
+        result = client.tea_load(
+            recipe=recipe,
+            address=args.address,
+            scan_timeout=float(args.scan_timeout),
         )
     elif action == "tea-start":
-        result = bridge_call(
-            "tea.start", {"confirmation": args.confirm_ready}, timeout=args.timeout
+        wid = getattr(args, "workflow_id", None) or client.resolve_active_workflow_id(
+            kind="tea", allowed_phases={"loaded", "tea_loaded"}
+        )
+        result = client.tea_start(
+            workflow_id=str(wid),
+            confirmation=args.confirm_ready,
+            timeout=float(getattr(args, "timeout", 60.0) or 60.0),
         )
     elif action == "scale-start":
-        result = bridge_call(
-            "scale.start",
-            {
-                "duration_s": args.duration,
-                "tare": bool(args.tare),
-                "address": args.address,
-                "scan_timeout": args.scan_timeout,
-            },
+        result = client.scale_start(
+            duration_s=float(args.duration),
+            tare=bool(args.tare),
+            address=args.address,
+            scan_timeout=float(args.scan_timeout),
         )
     elif action == "scale-tare":
-        result = bridge_call("scale.tare")
+        wid = getattr(args, "workflow_id", None) or client.resolve_active_workflow_id(
+            kind="scale"
+        )
+        result = client.scale_tare(workflow_id=str(wid))
     elif action == "save-slots":
         recipes = [
             str(Path(path).expanduser().resolve(strict=True)) for path in args.recipes
         ]
-        result = bridge_call(
-            "presets.save",
-            {
-                "recipes": recipes,
-                "scale": [value == "on" for value in args.scale],
-                "address": args.address,
-                "scan_timeout": args.scan_timeout,
-            },
+        result = client.presets_save(
+            recipes=recipes,
+            scale=[value == "on" for value in args.scale],
+            address=args.address,
+            scan_timeout=float(args.scan_timeout),
         )
     elif action == "grinder-start":
-        result = bridge_call(
-            "grinder.start",
-            {
-                "size": args.size,
-                "rpm": args.rpm,
-                "seconds": args.seconds,
-                "confirmation": args.confirm_ready,
-                "address": args.address,
-                "scan_timeout": args.scan_timeout,
-            },
+        result = client.grinder_start(
+            size=int(args.size),
+            rpm=int(args.rpm),
+            seconds=float(args.seconds),
+            confirmation=args.confirm_ready,
+            address=args.address,
+            scan_timeout=float(args.scan_timeout),
         )
     elif action == "water-start":
-        result = bridge_call(
-            "water.start",
-            {
-                "volume_ml": args.volume,
-                "temp_c": args.temp,
-                "flow_ml_s": args.flow,
-                "pattern": args.pattern,
-                "water_source": args.water_source,
-                "confirmation": args.confirm_ready,
-                "address": args.address,
-                "scan_timeout": args.scan_timeout,
-            },
+        result = client.water_start(
+            volume_ml=float(args.volume),
+            temp_c=int(args.temp),
+            flow_ml_s=float(args.flow),
+            pattern=args.pattern,
+            water_source=args.water_source,
+            confirmation=args.confirm_ready,
+            address=args.address,
+            scan_timeout=float(args.scan_timeout),
         )
-    elif action in {"pause", "resume", "cancel"}:
-        result = bridge_call(action)
+    elif action == "pause":
+        wid = getattr(args, "workflow_id", None) or client.resolve_active_workflow_id()
+        result = client.pause(workflow_id=str(wid))
+    elif action == "resume":
+        wid = getattr(args, "workflow_id", None) or client.resolve_active_workflow_id()
+        result = client.resume(workflow_id=str(wid))
+    elif action == "cancel":
+        wid = getattr(args, "workflow_id", None)
+        emergency = bool(getattr(args, "emergency", False))
+        if not wid and not emergency:
+            try:
+                wid = client.resolve_active_workflow_id()
+            except Exception as exc:
+                raise BridgeError(
+                    "cancel requires --workflow-id or an active durable workflow "
+                    "(pass --emergency only for explicit emergency stop)"
+                ) from exc
+        if not wid and not emergency:
+            raise BridgeError(
+                "cancel requires --workflow-id or an active durable workflow "
+                "(pass --emergency only for explicit emergency stop)"
+            )
+        result = client.cancel(
+            workflow_id=str(wid) if wid else None,
+            emergency=emergency,
+        )
     elif action == "water-temperature":
-        result = bridge_call(
-            "water.set_temperature",
-            {"temp_c": args.temp, "confirmation": args.confirm_live_adjust},
+        wid = getattr(args, "workflow_id", None) or client.resolve_active_workflow_id(
+            kind="water"
+        )
+        result = client.water_set_temperature(
+            workflow_id=str(wid),
+            temp_c=int(args.temp),
+            confirmation=args.confirm_live_adjust,
         )
     elif action == "water-pattern":
-        result = bridge_call(
-            "water.set_pattern",
-            {"pattern": args.pattern, "confirmation": args.confirm_live_adjust},
+        wid = getattr(args, "workflow_id", None) or client.resolve_active_workflow_id(
+            kind="water"
+        )
+        result = client.water_set_pattern(
+            workflow_id=str(wid),
+            pattern=args.pattern,
+            confirmation=args.confirm_live_adjust,
         )
     else:  # pragma: no cover - argparse guarantees the action
         raise BridgeError(f"unknown bridge action {action}")
@@ -2558,13 +2479,21 @@ def build_parser() -> argparse.ArgumentParser:
     history_note.add_argument("note")
     load = sub.add_parser("load", help="load and arm a recipe; never starts brewing")
     load.add_argument("recipe")
-    monitor = sub.add_parser("monitor", help="stream status/weights without starting")
+    monitor = sub.add_parser(
+        "monitor",
+        help="observe bridge status/events only (never connects or cancels)",
+    )
     monitor.add_argument("--duration", type=float, default=300.0)
     monitor.add_argument(
         "--progress-interval",
         type=float,
         default=DEFAULT_PROGRESS_INTERVAL,
         help="minimum seconds between aggregated weight updates (0.1-60)",
+    )
+    monitor.add_argument(
+        "--workflow-id",
+        default=None,
+        help="observe a specific durable workflow (default: active)",
     )
     scale = sub.add_parser(
         "scale",
@@ -2600,7 +2529,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="auto uses the machine's current setting; otherwise select tank or tap",
     )
-    water.add_argument("--timeout", type=float, default=None, help="completion timeout (5-600 s)")
+    water.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help=(
+            "observation bound only (5-600 s): poll the returned workflow until "
+            "terminal or bound; never cancel/release the daemon. Default: "
+            "core safety_timeout_s + 30 s (capped 5-600)"
+        ),
+    )
     water.add_argument("--confirm-ready", default="")
     tea_validate = sub.add_parser("tea-validate", help="strictly validate an Omni Tea Brewer recipe")
     tea_validate.add_argument("recipe")
@@ -2625,7 +2563,17 @@ def build_parser() -> argparse.ArgumentParser:
     tea_brew.add_argument(
         "--progress-interval", type=float, default=DEFAULT_PROGRESS_INTERVAL
     )
-    sub.add_parser("cancel", help="cancel/exit an armed or running brew")
+    cancel_p = sub.add_parser("cancel", help="cancel/exit an armed or running brew")
+    cancel_p.add_argument(
+        "--workflow-id",
+        default=None,
+        help="durable workflow to cancel (default: active workflow)",
+    )
+    cancel_p.add_argument(
+        "--emergency",
+        action="store_true",
+        help="explicit emergency stop (required when no workflow_id can be resolved)",
+    )
     start = sub.add_parser("start", help="explicitly gated remote start")
     start.add_argument("recipe")
     start.add_argument("--confirm-ready", default="")
@@ -2634,7 +2582,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--progress-interval",
         type=float,
         default=DEFAULT_PROGRESS_INTERVAL,
-        help="minimum seconds between aggregated weight updates (0.1-60)",
+        help="observation bound only (0.1-60 progress interval; not recipe expiry)",
+    )
+    start.add_argument(
+        "--workflow-id",
+        default=None,
+        help="durable workflow from load (default: active coffee loaded workflow)",
+    )
+    tea_start.add_argument(
+        "--workflow-id",
+        default=None,
+        help="durable workflow from tea-load (default: active tea loaded workflow)",
     )
     slots = sub.add_parser("save-slots", help="write guarded recipes to A/B/C; never brews")
     slots.add_argument("recipes", nargs=3, metavar="RECIPE")
@@ -2750,8 +2708,19 @@ def build_parser() -> argparse.ArgumentParser:
     bridge_water.add_argument("--confirm-ready", default="")
     bridge_sub.add_parser("pause", help="pause bridge-owned coffee/grinder/water")
     bridge_sub.add_parser("resume", help="resume the bridge-owned paused activity")
-    bridge_sub.add_parser(
-        "cancel", help="stop/cancel the bridge-owned coffee/tea/scale/grinder/water activity"
+    bridge_cancel = bridge_sub.add_parser(
+        "cancel",
+        help="stop/cancel the bridge-owned coffee/tea/scale/grinder/water activity",
+    )
+    bridge_cancel.add_argument(
+        "--workflow-id",
+        default=None,
+        help="durable workflow to cancel (default: active workflow)",
+    )
+    bridge_cancel.add_argument(
+        "--emergency",
+        action="store_true",
+        help="explicit emergency stop (required when no workflow_id can be resolved)",
     )
     bridge_temp = bridge_sub.add_parser(
         "water-temperature",
@@ -2820,7 +2789,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_state(args)
         if args.command == "bridge":
             return cmd_bridge(args)
-        ensure_bridge_not_running(args.command)
+        # All hardware commands go through the typed bridge client (A9).
+        # Passive discovery is the only direct BLE path.
         if args.command == "scan":
             return asyncio.run(async_scan(args))
         if args.command == "probe":
@@ -2864,7 +2834,17 @@ def main(argv: list[str] | None = None) -> int:
         emit({"command": args.command, "error": "interrupted"})
         return 130
     except Exception as exc:
-        emit({"command": args.command, "error": str(exc), "type": type(exc).__name__})
+        payload: dict[str, Any] = {
+            "command": args.command,
+            "error": str(exc),
+            "type": type(exc).__name__,
+        }
+        # Preserve stable BridgeError.category for Skill branching
+        # (e.g. device_busy_external / recovery classes).
+        category = getattr(exc, "category", None)
+        if category:
+            payload["category"] = str(category)
+        emit(payload)
         return 2
 
 

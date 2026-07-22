@@ -304,22 +304,15 @@ def test_unverified_bridge_grinder_stop_record_blocks_motor(monkeypatch, tmp_pat
         xbloom.require_grinder_rest()
 
 
-@pytest.mark.parametrize(
-    "command",
-    [
-        "water",
-        "tea-brew",
-        "settings",
-        "set-settings",
-        "advanced",
-        "set-advanced",
-    ],
-)
-def test_one_shot_ble_commands_refuse_a_running_bridge(monkeypatch, command):
+def test_hardware_commands_no_longer_refuse_running_bridge(monkeypatch):
+    """A9: hardware commands use the daemon; they must not refuse a running bridge."""
+
     monkeypatch.setattr(bridge_module, "bridge_is_running", lambda: True)
-    with pytest.raises(RuntimeError, match="owns Studio access"):
-        xbloom.ensure_bridge_not_running(command)
-    xbloom.ensure_bridge_not_running("validate")
+    # ensure_bridge_not_running is removed; validate remains non-hardware.
+    assert not hasattr(xbloom, "ensure_bridge_not_running") or not callable(
+        getattr(xbloom, "DIRECT_BLE_COMMANDS", None)
+    )
+    assert not hasattr(xbloom, "DIRECT_BLE_COMMANDS")
 
 
 def test_doctor_reports_unverified_live_adjust_gate(monkeypatch, capsys):

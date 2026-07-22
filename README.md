@@ -207,13 +207,13 @@ disabled until the deployment
 owner enables their documented safety gate. See [standalone tools](skills/xbloom-studio-brew/references/standalone-tools.md)
 and [tea brewing](skills/xbloom-studio-brew/references/tea-brewing.md).
 
-Prefer the persistent bridge for device work. It supports coffee, tea, scale, grinder, FreeSolo
-water, presets, settings, and tuning; while it runs, direct BLE commands refuse to race its
-connection. Live FreeSolo temperature and
-pattern targets are also protocol-implemented behind a separate owner gate. A running
-`center → spiral` pattern change is hardware-verified on firmware `V12.0D.500`; live temperature
-command encoding and its completed BLE write are verified, while physical outlet response remains
-unmeasured. They do not change mid-run volume/flow or edit coffee recipe steps.
+Prefer the persistent bridge for device work. It is the sole BLE owner: top-level active commands
+(probe, load, start, tea, scale, grind, water, settings, cancel, save-slots, …) use typed bridge
+RPC through the daemon; only passive `scan` / `doctor --scan` discover BLE directly. Live FreeSolo
+temperature and pattern targets are also protocol-implemented behind a separate owner gate. A
+running `center → spiral` pattern change is hardware-verified on firmware `V12.0D.500`; live
+temperature command encoding and its completed BLE write are verified, while physical outlet
+response remains unmeasured. They do not change mid-run volume/flow or edit coffee recipe steps.
 
 A/B/C programming is an atomic three-recipe operation. Run `validate <recipe.yaml> --slot` on
 each input first. AUTO slots store pours, grind, ratio, and scale behavior; the machine measures
@@ -228,8 +228,10 @@ Optional `--scale on off on` configures the three on-brew scale flags in A/B/C o
 - `tea-load` uploads a dedicated tea recipe but never executes it; `scale` reports its auto-zero
   baseline and always exits its mode.
 - Firmware/state preflight runs before recipe or preset writes.
-- Remote start requires an owner opt-in, current physical-readiness confirmation, the same recipe
-  hash and machine, and an armed state less than five minutes old.
+- Remote start requires an owner opt-in, current physical-readiness confirmation, and the same
+  recipe hash / durable `workflow_id` on the same machine. Loaded recipes wait indefinitely for
+  explicit start or cancel (no five-minute loaded expiry); the daemon holds BLE until confirmed
+  terminal or cancel.
 - Brew telemetry is aggregated to one progress update per second. Workflow state is cleared only
   after a terminal machine notification; a monitor timeout preserves recovery state for reattach
   or cancel, using the already-recorded machine instead of scanning.

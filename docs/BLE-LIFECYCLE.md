@@ -2,15 +2,17 @@
 
 Status: implemented in `packages/core/xbloom_ble/bridge.py` + `client.py` + `xbloom_storage.StateStore` with fake-client tests.
 
-**Implemented Phase A core slice:** A1 (durable workflow on load), A2 (all mutating RPCs including settings/advanced/presets: `request_id` + SQLite idempotency + emergency stop), A4 (transactional terminal before release), A5 (grinder/water/scale + settings/advanced/presets one-shot durable write + prompt release; read-only settings/advanced release), **A6** (unexpected BLE disconnect signal, explicit `recovery.reconcile`, external busy classification, fail-closed persistence — recovery may reconnect/query/reconcile only; never re-load/start), A7 (orphan idle disconnect fallback), A8 (status/events durable fields), focused A10 tests including BLE-drop / reconcile / external-busy matrix.
+**Implemented Phase A core slice:** A1–A2, A3 (Skill CLI observation/client-exit does not touch daemon workflows), A4–A5, **A6** (unexpected BLE disconnect + `recovery.reconcile` + external busy), A7, A8, **A9 Skill CLI** (`TypedBridgeClient`, probe RPC, category wire, all active Skill hardware via daemon; only passive scan uses discovery), focused A10 tests.
 
-**Still not full Phase A:** A3 client/HTTP disconnect semantics beyond core, A9 Skill/Web/MCP client cutover, A11 hardware validation.
+**Still not full Phase A:** A3 Web/HTTP/MCP client disconnect cutover, A9 Web/MCP clients, A11 hardware validation.
 
 ## Rules in force
 
 | Situation | BLE behavior |
 |---|---|
 | Daemon / `BridgeCore` construction, `status`, `events` | No connect; status/events never arm, reset, or extend the idle timer |
+| Skill CLI `TypedBridgeClient` | Explicit methods; mutating RPCs get `request_id` (caller may supply); workflow-bound methods require `workflow_id`; hardware ensures daemon; status/events never connect BLE; no auto-retry of uncertain ops |
+| `probe` RPC | One-shot connect via BridgeCore; redacted machine info; prompt-release auto-owned; retain explicit debug link; never direct Bleak from CLI |
 | Explicit `connect` RPC | Connect; `connection_scope=explicit`; hold until explicit `disconnect`; **never** auto-released or idle-timed-out; upgrading an existing auto-owned orphan immediately clears idle timeout fields/task |
 | Coffee / tea `load` | Create durable workflow + snapshot **before** BLE load write; connect if needed (`workflow`); return `workflow_id`; reuse connection through start/pause/resume/events/terminal |
 | Coffee / tea still `loaded` (awaiting start) | Hold the workflow connection; wait for start or explicit cancel; **no** time-based cancel, unload, expiry, five-minute loaded timeout, or disconnect |

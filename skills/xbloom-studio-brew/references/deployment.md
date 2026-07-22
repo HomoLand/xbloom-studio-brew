@@ -306,7 +306,8 @@ cloud tokens, or recipes containing private purchase/account data.
 12. Pin RT's offline frame encoding to the app's 20 C sentinel, but keep grinder, water, coffee
    start, and tea start out of unattended release tests.
 13. Run `bridge start`, `bridge status`, and idle `bridge stop` with no hardware connection. Confirm
-   every one-shot BLE command refuses while the bridge owns the local control endpoint.
+   the sole-owner model: top-level active commands use typed bridge RPC through the daemon; only
+   passive `scan` / `doctor --scan` perform direct BLE discovery.
 14. Test bridge state transitions for coffee, tea, scale, grinder, water, presets, settings, and
     advanced tuning against scripted BLE only. Keep grinder/water/coffee/tea actuation and FreeSolo
     live-target commands out of unattended tests; record supervised hardware evidence separately.

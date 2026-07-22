@@ -99,7 +99,8 @@ python scripts/xbloom.py tea-start tea.yaml \
   --confirm-ready tea-brewer-water-cup-clear
 ```
 
-The loaded file must be unchanged, on the same machine, and less than five minutes old. Never
+The loaded file must be unchanged and bound to the durable `workflow_id` on the same machine.
+Loaded tea waits indefinitely for explicit start or cancel (no five-minute loaded expiry). Never
 schedule unattended tea starts.
 
 For a single held connection, `tea-brew` performs the same guarded load and explicit execute steps:
@@ -119,9 +120,9 @@ python scripts/xbloom.py bridge tea-start \
 python scripts/xbloom.py bridge events --since 0
 ```
 
-The bridge preserves the same file hash, five-minute age, owner opt-in, and per-start readiness
-checks. `bridge cancel` exits a loaded or active tea workflow; tea phase reports are telemetry and
-do not create unsupported pause/resume controls.
+The bridge preserves the same file hash / workflow identity, owner opt-in, and per-start readiness
+checks (no time-based loaded expiry). `bridge cancel` exits a loaded or active tea workflow; tea
+phase reports are telemetry and do not create unsupported pause/resume controls.
 
 It emits separate `tea_loaded` and `start_accepted` events, then monitors to a terminal machine
 state. Telemetry may include `tea_phase` (`soaking`, `paused`, or `running`), a

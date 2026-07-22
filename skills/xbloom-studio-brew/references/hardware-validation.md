@@ -11,7 +11,8 @@ telemetry capture.
 
 - Keep a person at the machine and fully close/disconnect the phone xBloom App.
 - Confirm firmware, idle state, selected water source, and the command-specific physical setup.
-- Let the loopback bridge be the sole BLE owner; do not race it with a one-shot process.
+- Let the loopback bridge be the sole BLE owner; top-level active commands use typed bridge RPC,
+  and only passive `scan` / `doctor --scan` discover BLE directly.
 - Keep the physical stop available. Preserve an uncertain state and inspect it before retrying.
 - Record date, firmware, command, requested values, reports/ACKs, visible result, measurements, and
   cleanup state. Do not upgrade evidence beyond what was actually observed.

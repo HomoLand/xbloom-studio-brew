@@ -2940,6 +2940,86 @@ class BridgeCore:
             "vibration_level": vibration_level,
         }
 
+    async def _probe(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        """One-shot redacted machine probe; never a durable workflow.
+
+        Rejects an existing active/recovery workflow *before* any new BLE
+        connection attempt. Connects as one-shot when needed, awaits a fresh
+        state-bearing response where claimed, prompt-releases auto-owned links
+        on success or failure, and retains an existing explicit debug connection.
+        """
+
+        # Fail closed before connect: active activity, recovery flag, or durable
+        # non-terminal workflow must not be probed over a new link.
+        if self.activity is not None:
+            raise BridgeError(
+                f"bridge is busy with {self.activity}:{self.phase}; "
+                "cancel or wait before probing"
+            )
+        if self._recovery_required:
+            raise BridgeError(
+                "recovery_required; resolve recovery before probing"
+            )
+        try:
+            active_wf = self.store.get_active_workflow()
+        except StorageError as exc:
+            # Fail closed: unreadable durable state must never open a new BLE link.
+            raise BridgeError(
+                f"durable workflow state unreadable; refuse probe connect: {exc}",
+                category="durable_state_unreadable",
+            ) from exc
+        if active_wf is not None:
+            raise BridgeError(
+                f"active durable workflow {active_wf.get('workflow_id')!r} "
+                f"(state={active_wf.get('state')!r}); cancel or wait before probing"
+            )
+
+        newly = await self._ensure_connected(params, scope="one-shot")
+        try:
+            if self.client is None or not self.connected:
+                raise BridgeError("probe requires a BLE connection")
+            info = _public_machine_info(await self.client.read_machine_info())
+            self.machine_info.update(info)
+            # Require a *fresh* state-bearing notification after status query.
+            generation_before = self._state_notify_generation
+            self._state_notify_event.clear()
+            state_fresh = False
+            state_unconfirmed_reason: str | None = None
+            try:
+                await self.client.request_status()
+                await self._await_fresh_state_notification(
+                    generation_before=generation_before,
+                    timeout=self.machine_info_timeout,
+                )
+                state_fresh = True
+            except Exception as exc:
+                state_unconfirmed_reason = str(exc)
+            result: dict[str, Any] = {
+                "command": "probe",
+                "status": "ok",
+                "connected": self.connected,
+                "connection_scope": self.connection_scope,
+                "firmware": info.get("firmware"),
+                "machine_info": info,
+                "settings": self._settings_view(info),
+                "vendor_service": True,
+                "brew_control_sent": False,
+                "read_only": True,
+                "newly_connected": newly,
+                "machine_state_fresh": state_fresh,
+            }
+            if state_fresh:
+                result["machine_state"] = self.machine_state
+            else:
+                # Do not present stale machine_state as fresh.
+                result["machine_state"] = None
+                result["machine_state_unconfirmed"] = True
+                if state_unconfirmed_reason:
+                    result["machine_state_unconfirmed_reason"] = state_unconfirmed_reason
+            return result
+        finally:
+            await self._prompt_release_auto_owned("probe_done")
+
     async def _settings_read(self, params: Mapping[str, Any]) -> dict[str, Any]:
         """Read-only one-shot: no durable workflow; prompt-release auto-owned link."""
 
@@ -5267,6 +5347,8 @@ class BridgeCore:
                 return await self._connect_unlocked(params, scope="explicit")
             if method == "disconnect":
                 return await self._disconnect_unlocked(reason="explicit")
+            if method == "probe":
+                return await self._probe(params)
             if method == "settings.read":
                 return await self._settings_read(params)
             if method == "settings.write":
@@ -5558,6 +5640,20 @@ class BridgeServer:
                 "error": str(exc),
                 "type": "BridgeCompatibilityError",
             }
+            category = getattr(exc, "category", None)
+            if category:
+                response["category"] = str(category)
+        except BridgeError as exc:
+            response = {
+                "id": request_id,
+                "ok": False,
+                "error": str(exc),
+                "type": type(exc).__name__,
+            }
+            category = getattr(exc, "category", None)
+            if category:
+                # Stable wire category (e.g. device_busy_external); never tokens.
+                response["category"] = str(category)
         except Exception as exc:
             response = {
                 "id": request_id,
@@ -5919,9 +6015,14 @@ def _bridge_call_raw(
     if not response.get("ok"):
         err_type = str(response.get("type") or "")
         message = str(response.get("error") or "bridge request failed")
+        # Never surface raw auth material if a buggy handler leaked it.
+        if "token" in message.casefold():
+            message = "bridge request failed"
+        category_raw = response.get("category")
+        category = str(category_raw) if category_raw else None
         if err_type == "BridgeCompatibilityError" or "incompatible" in message.lower():
-            raise BridgeCompatibilityError(message)
-        raise BridgeError(message)
+            raise BridgeCompatibilityError(message, category=category)
+        raise BridgeError(message, category=category)
     result = response.get("result")
     if not isinstance(result, dict):
         raise BridgeError("bridge returned a non-object result")

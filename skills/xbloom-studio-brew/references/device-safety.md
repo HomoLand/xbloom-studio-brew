@@ -21,7 +21,7 @@ skill also completed its initial hardware validation on that firmware.
 | `load` | Writes guarded recipe frames and leaves the machine armed. Does not brew. | None |
 | `tea-validate` | Parses a local Omni Tea Brewer recipe. | None |
 | `tea-load` | Uploads tea cup geometry and recipe data; does not execute it. | None |
-| `monitor` | Subscribes to state and scale notifications. | None |
+| `monitor` | Observation-only: polls bridge status/events for a workflow; never connects, starts, cancels, or releases BLE. | None |
 | `scale` | Enters the electronic-scale screen, auto-zeros the entry load, optionally re-tares, streams grams, then exits. | No motor/water command |
 | `save-slots` | Persistently overwrites all three on-machine A/B/C presets. Does not brew. | None |
 | `cancel` | Cancels/exits an armed or active operation. | `0x47` cancel |
@@ -133,14 +133,15 @@ disabled until the deployment owner sets:
 XBLOOM_ENABLE_REMOTE_START=I_UNDERSTAND_REMOTE_HOT_WATER
 ```
 
-The command additionally requires an exact readiness argument and a recipe loaded less than five
-minutes earlier on the same machine with an unchanged file hash:
+The command additionally requires an exact readiness argument and a durable `workflow_id` for the
+same recipe on the same machine (unchanged file hash). Loaded recipes wait indefinitely for
+explicit start or cancel — there is **no** five-minute loaded expiry:
 
 ```text
 python scripts/xbloom.py start recipe.yaml --confirm-ready cup-filter-water-beans
 ```
 
-These gates prevent accidental or stale starts. They do not prove physical safety, so current-turn
+These gates prevent accidental starts. They do not prove physical safety, so current-turn
 user confirmation remains mandatory.
 
 For a local `flash-brew` serving, that current-turn confirmation must also cover the measured ice

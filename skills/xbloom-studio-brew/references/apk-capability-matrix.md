@@ -34,9 +34,9 @@ parity.
 Literal parity is neither possible nor desirable in one Agent Skill:
 
 - Live pause/resume and in-cycle changes need one process to keep the BLE connection open. The
-  bundled loopback bridge now owns and serializes that connection for coffee, tea, scale, grinder,
-  FreeSolo water, presets, settings, and advanced tuning; direct one-shot BLE commands refuse
-  while it runs.
+  bundled loopback bridge is the sole BLE owner and serializes coffee, tea, scale, grinder,
+  FreeSolo water, presets, settings, and advanced tuning. Top-level active commands use typed
+  bridge RPC through the daemon; only passive `scan` / `doctor --scan` discover BLE directly.
 - Login/account mutation, recipe edit/share/pin, history, store/cart, device sharing, cloud logs,
   and J20 remote control are mobile/cloud services rather than Studio BLE appliance commands. The
   Skill exposes bounded own-account catalog reads, an idempotent add-only recipe upload,
@@ -177,10 +177,11 @@ Two findings retain explicit evidence boundaries:
 Track supervised work and its pass/evidence criteria in `hardware-validation.md`; do not replace
 that ledger with informal chat recollection.
 
-The local long-lived BLE bridge is available: it owns one Studio connection, maintains a state
-machine, serializes writes, and covers coffee, tea, scale, grinder, FreeSolo water, A/B/C presets,
-persistent settings, advanced tuning, and bounded telemetry through a token-authenticated loopback
-socket. Direct BLE commands refuse to race it.
+The local long-lived BLE bridge is available: it is the sole BLE owner for Studio. It maintains a
+state machine, serializes writes, and covers coffee, tea, scale, grinder, FreeSolo water, A/B/C
+presets, persistent settings, advanced tuning, and bounded telemetry through a token-authenticated
+loopback socket. Top-level active commands use typed bridge RPC; only passive `scan` /
+`doctor --scan` perform direct BLE discovery.
 
 The next evidence step is a supervised FreeSolo A/B for live target temperature, including measured
 outlet lag. Paused-state pattern/temperature behavior and the other pattern transitions remain

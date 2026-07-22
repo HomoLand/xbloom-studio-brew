@@ -410,7 +410,7 @@ LAN 模式规则：
 - A2 为所有变更 RPC 增加 workflow ID 与 request ID 校验；实现幂等结果缓存、参数 hash 冲突检测和紧急 stop 例外。
   - **已完成（core）**：`MUTATING_METHODS` 覆盖全部机器变更 RPC（含 `settings.write` / `advanced.write` / `presets.save`）；要求 `request_id` + SQLite preflight/reserve；method/params 冲突检测；完成结果缓存先于可变门；pending 永不重发；紧急 `emergency=true` 例外；`connect`/`disconnect` 不在幂等合同内。读-only `settings.read`/`advanced.read` 不要求 `request_id`。
 - A3 咖啡/茶从 `load` 贯穿 `start`、暂停/恢复和机器事件；客户端/HTTP 断开不改变 bridge 监控任务。
-  - **部分完成**：同一 `BridgeCore` 连接在 load→start→pause/resume→events 间复用；无 per-step 重连。Skill/Web/HTTP 客户端切断语义未在本批迁移。
+  - **已完成（core + Skill CLI）**：同一 daemon 连接在 load→start→pause/resume→events 间复用；Skill `monitor` 仅轮询 `status`/`events`，客户端退出或 observation duration 到期不 cancel/release；Web/MCP 切断语义仍属后续。
 - A4 终态处理在一个事务中固化最终事件和历史，再 close session + disconnect；断连失败单独报告，不把已确认终态回滚为 running。
   - **已完成（core）**：`commit_workflow_terminal` 原子固化 state+event(+idempotency)；成功后才 schedule release；持久化失败 → recovery_required 且不 release；断连失败只写 `last_disconnect_error`。
 - A5 独立磨豆、出水、称重在各自确认终态后释放；设置/probe 等单次事务返回完整结果后释放。
@@ -422,9 +422,9 @@ LAN 模式规则：
 - A8 `status()` / `events()` 暴露 instance ID、workflow、版本、连接作用域、事件游标/gap、恢复状态及最近断连原因。
   - **已完成（core）**：`active_workflow_id`、durable `workflow` summary、`recovery`、versions、connection_scope/release/disconnect 字段；durable events cursor + `gap_detected`；idle orphan 可观测字段。
 - A9 Skill、Web 和 MCP 的连接型操作全部收敛到类型化 bridge RPC；仅被动 scan 可直用 BLE discovery。
-  - **未做（下一批）**：本批不迁移 Skill CLI/MCP/Web 客户端。
+  - **已完成（Skill CLI + core client）**：`xbloom_ble.bridge_client.TypedBridgeClient` 类型化 RPC（自动 `request_id`、显式 `workflow_id`、ensure daemon、hello/协议兼容）；`probe` 为 BridgeCore one-shot 读-only；`BridgeError.category` 跨 JSON-line 往返；Skill CLI 全部主动连接/机器操作走 daemon（仅 `scan`/`doctor --scan` 直连 discovery）；无五分钟 loaded 过期。Web/MCP 客户端 cutover 仍属后续。
 - A10 单元/集成测试覆盖并发 start、重复 request ID、错误 workflow ID、客户端退出、daemon restart、BLE drop、loaded 保持连接直至 start 或显式 cancel（无时间驱动自动动作）、确认终态后断连、未确认 control/cancel 保持 recovery 与连接，以及 external busy。
-  - **部分完成（focused）**：fake-client 覆盖 duplicate load/start/settings/presets 单次 BLE 写、request 冲突、pending 不重试、确认 rollback vs 未知 rollback、preset 部分失败、read/write release、explicit 保留、idle orphan / disabled、loaded 超过 idle 超时仍保持；A6 BLE drop 矩阵（idle/loaded coffee/tea/running/start-in-flight）、`recovery.reconcile`、external busy 单次尝试、expected release 无 recovery race、persist fail-closed；storage migration + terminal txn rollback。Skill/Web/HTTP 客户端切断与硬件 A11 仍属后续。
+  - **部分完成（focused）**：core fake-client + A6 矩阵 + A9 typed-client/request/workflow/category/probe/load→start 同 workflow 无 per-step connect；Skill CLI 无 DIRECT_BLE / 无五分钟 helper。Web/MCP 与硬件 A11 仍属后续。
 - A11 真实硬件测试记录一次完整 load/start/pause/resume/complete 的连接次数；完成后从手机官方 App 连接，再从 Web/Skill 发起下一工作流。
 
 **实现落点（已落地）**：`packages/core/xbloom_ble/bridge.py` + `client.py` + `packages/core/xbloom_storage.py`；fake 测试见 `skills/xbloom-studio-brew/tests/test_bridge.py`、`test_client.py` 与 `test_storage.py`。显式 `connect` 保持到显式 `disconnect`；coffee/tea 从 load 保持连接至确认终态或确认 cancel；workflow/one-shot 在确认终态后释放；settings/advanced/presets 写为 durable one-shot；读-only 设置立即释放 auto-owned；遗留 auto-owned 链路可由 idle 兜底；daemon 进程不退出。loaded 无时间驱动的自动 cancel/unload/断连，**无**五分钟 loaded 过期。意外 BLE 掉线进入 recovery；`recovery.reconcile` 仅 connect+query。RPC protocol **v3**（破坏性：变更 RPC 需 `request_id` / workflow-bound 控制需 `workflow_id`）。

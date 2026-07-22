@@ -60,10 +60,11 @@ fully close or disconnect the App. After an uncertain physical action, keep the 
 use `cancel` or the machine's physical control, and confirm the machine is idle before retrying.
 
 For interactive work, `bridge start` creates a loopback-only daemon without connecting; `bridge
-connect` then holds one app-style session. While the daemon runs, direct BLE commands refuse to
-start, preventing two local clients from racing for Studio. Scale, tea, presets, settings, and
-advanced tuning have matching bridge operations, so they no longer require stopping the daemon.
-Use `bridge events` instead of a competing one-shot monitor.
+connect` then holds one app-style session. The bridge is the sole BLE owner: top-level active
+commands (including scale, tea, grinder, water, presets, settings, and tuning) use typed bridge RPC
+through the daemon; only passive `scan` / `doctor --scan` discover BLE directly. Use
+`bridge events` or top-level `monitor` (status/events observation only) rather than a competing
+client-side notification subscription.
 
 For an interactive scale session:
 
@@ -177,10 +178,13 @@ the command semantics are decoded from the official app. A real hot-water dispen
 an unattended self-test.
 
 For RT water, successful JSON must report `"status": "complete"`, `"temp_setting": "RT"`, and a
-metered volume near the request. A timeout or interruption is not success: keep the vessel centered,
-confirm the phone App is disconnected, use `cancel` if the machine may still be active, then retry
-at most once with a finite `--timeout` and the source reported by machine preflight. Do not silently
-substitute 40 C for RT; that changes the requested drink and requires the user's acceptance.
+metered volume near the request. Top-level `water --timeout` is an **observation bound only**
+(poll the returned `workflow_id` until terminal or bound); client exit or observation timeout never
+cancels, releases, or mutates the daemon workflow. If observation ends without a confirmed
+terminal, keep the vessel centered, confirm the phone App is disconnected, use explicit `cancel`
+only when the machine may still be active, then re-observe with `monitor --workflow-id` rather than
+blindly restarting. Do not silently substitute 40 C for RT; that changes the requested drink and
+requires the user's acceptance.
 
 ### Interactive water and live targets
 
