@@ -224,7 +224,7 @@ def test_upsert_recipe_preserves_omitted_provenance_and_returns_stored(tmp_path)
     second = store.upsert_recipe(
         recipe_id="rcp_keep",
         name="Keep Updated",
-        # provenance/metadata omitted — must not wipe to {}
+        # provenance/metadata omitted -- must not wipe to {}
     )
     assert second["name"] == "Keep Updated"
     assert second["kind"] == "coffee"
@@ -782,3 +782,261 @@ def test_open_store_migrate_failure_releases_state_db_for_immediate_rename(tmp_p
         side_path = tmp_path / side
         if side_path.exists():
             side_path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Phase A storage: schema migration v1->v2, idempotency reserve, terminal txn
+# ---------------------------------------------------------------------------
+
+
+def test_schema_migrates_from_v1_database(tmp_path):
+    """Open a database that only has baseline_v1 and upgrade to SCHEMA_VERSION."""
+
+    # Create a v1-shaped DB by applying only baseline tables + version 1 row.
+    db_path = tmp_path / "state.db"
+    conn = __import__("sqlite3").connect(str(db_path))
+    for statement in storage.SCHEMA_STATEMENTS:
+        conn.execute(statement)
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at, checksum) "
+        "VALUES (1, 'baseline_v1', ?, 'legacy')",
+        (storage.utc_now(),),
+    )
+    conn.commit()
+    conn.close()
+
+    store = storage.StateStore(tmp_path)
+    version = store.ensure_schema()
+    assert version == storage.SCHEMA_VERSION
+    assert storage.SCHEMA_VERSION >= 2
+    names = {row["name"] for row in store.list_migrations()}
+    assert "baseline_v1" in names
+    assert any("v2" in name or name.endswith("_v2") or "phase_a" in name for name in names)
+    # Indexes from v2 migration exist.
+    rows = store._connect().execute(
+        "SELECT name FROM sqlite_master WHERE type='index'"
+    ).fetchall()
+    index_names = {r[0] for r in rows}
+    assert "idx_workflows_state_updated" in index_names
+    assert "idx_idempotency_status" in index_names
+    assert store.integrity_check()["ok"] is True
+    store.close()
+
+
+def test_idempotency_reserve_complete_pending_no_retry(tmp_path):
+    store = storage.StateStore(tmp_path)
+    wf = store.create_workflow(kind="coffee", state="loaded")
+    first = store.reserve_idempotency(
+        "req-a",
+        "coffee.start",
+        {"workflow_id": wf["workflow_id"]},
+        workflow_id=wf["workflow_id"],
+    )
+    assert first["reserved"] is True
+    assert first["status"] == storage.IDEM_PENDING
+
+    pending = store.reserve_idempotency(
+        "req-a",
+        "coffee.start",
+        {"workflow_id": wf["workflow_id"]},
+        workflow_id=wf["workflow_id"],
+    )
+    assert pending.get("recovery_required") is True
+    assert pending["status"] == storage.IDEM_PENDING
+
+    completed = store.complete_idempotency("req-a", {"status": "running"})
+    assert completed["status"] == storage.IDEM_COMPLETED
+    cached = store.reserve_idempotency(
+        "req-a",
+        "coffee.start",
+        {"workflow_id": wf["workflow_id"]},
+        workflow_id=wf["workflow_id"],
+    )
+    assert cached["cached"] is True
+    assert cached["result"] == {"status": "running"}
+
+    with pytest.raises(storage.StorageError, match="method mismatch"):
+        store.reserve_idempotency(
+            "req-a",
+            "coffee.pause",
+            {"workflow_id": wf["workflow_id"]},
+            workflow_id=wf["workflow_id"],
+        )
+    with pytest.raises(storage.StorageError, match="params hash"):
+        store.reserve_idempotency(
+            "req-a",
+            "coffee.start",
+            {"workflow_id": "other"},
+            workflow_id=wf["workflow_id"],
+        )
+    with pytest.raises(storage.StorageError, match="workflow_id mismatch"):
+        store.reserve_idempotency(
+            "req-a",
+            "coffee.start",
+            {"workflow_id": wf["workflow_id"]},
+            workflow_id="wf_other",
+        )
+    store.close()
+
+
+def test_commit_workflow_terminal_transaction_and_rollback(tmp_path, monkeypatch):
+    store = storage.StateStore(tmp_path)
+    wf = store.create_workflow(kind="coffee", state="running")
+    store.append_workflow_event(wf["workflow_id"], "started", {"ok": True})
+    store.reserve_idempotency(
+        "req-term",
+        "cancel",
+        {"workflow_id": wf["workflow_id"]},
+        workflow_id=wf["workflow_id"],
+    )
+
+    result = store.commit_workflow_terminal(
+        wf["workflow_id"],
+        state="cancel_sent",
+        event_type="terminal",
+        event_payload={"result": "cancel_sent"},
+        request_id="req-term",
+        idempotency_result={"status": "cancel_sent"},
+    )
+    assert result["state"] == "cancel_sent"
+    assert result["event"]["seq"] == 2
+    loaded = store.get_workflow(wf["workflow_id"])
+    assert loaded["terminal_at"] is not None
+    idem = store.get_idempotency("req-term")
+    assert idem["status"] == storage.IDEM_COMPLETED
+
+    # Rollback: inject failure mid-transaction leaves prior terminal intact
+    # and does not partially apply a second terminal event.
+    wf2 = store.create_workflow(kind="tea", state="running")
+    store.reserve_idempotency(
+        "req-term-2",
+        "cancel",
+        {"workflow_id": wf2["workflow_id"]},
+        workflow_id=wf2["workflow_id"],
+    )
+    real_complete = store.complete_idempotency
+
+    def boom_complete(request_id, result, *, conn=None):
+        raise storage.StorageError("injected complete failure")
+
+    monkeypatch.setattr(store, "complete_idempotency", boom_complete)
+    with pytest.raises(storage.StorageError, match="injected complete failure"):
+        store.commit_workflow_terminal(
+            wf2["workflow_id"],
+            state="cancel_sent",
+            event_type="terminal",
+            event_payload={"result": "cancel_sent"},
+            request_id="req-term-2",
+            idempotency_result={"status": "cancel_sent"},
+        )
+    monkeypatch.setattr(store, "complete_idempotency", real_complete)
+
+    rolled = store.get_workflow(wf2["workflow_id"])
+    assert rolled["terminal_at"] is None
+    assert rolled["state"] == "running"
+    events = store.list_workflow_events(wf2["workflow_id"])
+    assert events == []
+    pending = store.get_idempotency("req-term-2")
+    assert pending["status"] == storage.IDEM_PENDING
+    store.close()
+
+
+def test_active_and_latest_workflow_queries(tmp_path):
+    store = storage.StateStore(tmp_path)
+    a = store.create_workflow(kind="coffee", state="loaded")
+    b = store.create_workflow(kind="scale", state="running")
+    store.commit_workflow_terminal(a["workflow_id"], state="complete")
+    active = store.get_active_workflow()
+    assert active is not None
+    assert active["workflow_id"] == b["workflow_id"]
+    latest = store.get_latest_workflow()
+    # latest may be a (just updated terminal) or b depending on timestamps;
+    # both are valid "most recently updated" -- ensure it returns something.
+    assert latest is not None
+    assert latest["workflow_id"] in {a["workflow_id"], b["workflow_id"]}
+    store.close()
+
+
+def test_clear_recovery_sentinel_and_terminal_default(tmp_path):
+    store = storage.StateStore(tmp_path)
+    wf = store.create_workflow(
+        kind="coffee",
+        state="running",
+        recovery={"reason": "control_unconfirmed"},
+    )
+    loaded = store.get_workflow(wf["workflow_id"])
+    assert loaded["recovery"]["reason"] == "control_unconfirmed"
+    # None preserves recovery.
+    store.update_workflow(wf["workflow_id"], state="running", recovery=None)
+    assert store.get_workflow(wf["workflow_id"])["recovery"]["reason"] == (
+        "control_unconfirmed"
+    )
+    # CLEAR_RECOVERY clears.
+    store.update_workflow(
+        wf["workflow_id"], recovery=storage.CLEAR_RECOVERY
+    )
+    assert store.get_workflow(wf["workflow_id"])["recovery"] is None
+    # Re-set and terminal default clears.
+    store.update_workflow(
+        wf["workflow_id"], recovery={"reason": "again"}
+    )
+    store.commit_workflow_terminal(wf["workflow_id"], state="complete")
+    term = store.get_workflow(wf["workflow_id"])
+    assert term["terminal_at"] is not None
+    assert term["recovery"] is None
+    store.close()
+
+
+def test_create_workflow_with_event_atomic_and_transition(tmp_path, monkeypatch):
+    store = storage.StateStore(tmp_path)
+    created = store.create_workflow_with_event(
+        kind="coffee",
+        state="loading",
+        snapshot={"name": "Demo"},
+        event_type="created",
+    )
+    assert created["workflow_id"]
+    events = store.list_workflow_events(created["workflow_id"])
+    assert len(events) == 1
+    assert events[0]["event_type"] == "created"
+
+    transitioned = store.transition_workflow(
+        created["workflow_id"],
+        state="loaded",
+        event_type="loaded",
+        event_payload={"status": "armed"},
+    )
+    assert transitioned["state"] == "loaded"
+    events = store.list_workflow_events(created["workflow_id"])
+    assert [e["event_type"] for e in events] == ["created", "loaded"]
+
+    # Rollback: if event append fails, state update must not stick.
+    real_append = store.append_workflow_event_in_tx
+
+    def boom_append(conn, workflow_id, event_type, payload=None):
+        raise storage.StorageError("injected event append failure")
+
+    monkeypatch.setattr(store, "append_workflow_event_in_tx", boom_append)
+    with pytest.raises(storage.StorageError, match="injected event append"):
+        store.transition_workflow(
+            created["workflow_id"],
+            state="starting",
+            event_type="starting",
+        )
+    monkeypatch.setattr(store, "append_workflow_event_in_tx", real_append)
+    rolled = store.get_workflow(created["workflow_id"])
+    assert rolled["state"] == "loaded"
+    assert len(store.list_workflow_events(created["workflow_id"])) == 2
+
+    # create_workflow_with_event rolls back the row if event fails.
+    def boom_append2(conn, workflow_id, event_type, payload=None):
+        raise storage.StorageError("injected create event failure")
+
+    monkeypatch.setattr(store, "append_workflow_event_in_tx", boom_append2)
+    before = store.list_active_workflows()
+    with pytest.raises(storage.StorageError, match="injected create event"):
+        store.create_workflow_with_event(kind="tea", state="loading")
+    monkeypatch.setattr(store, "append_workflow_event_in_tx", real_append)
+    after = store.list_active_workflows()
+    assert len(after) == len(before)
+    store.close()

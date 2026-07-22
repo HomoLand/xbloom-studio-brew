@@ -406,26 +406,28 @@ LAN 模式规则：
 
 **任务**：
 - A1 `load` 校验 recipe/revision，在事务中创建 immutable snapshot + `workflow_id`，再调用 `ensure_connected()`；已连接时不重复 scan/connect/open session。
-  - **部分完成（本工作树）**：`BridgeCore` 在咖啡/茶 `load` 与独立工具首个命令时 `ensure_connected`；已连接不重复 connect/open_session。尚无 workflow_id / SQLite snapshot。
+  - **已完成（core）**：`BridgeCore` 拥有 `StateStore`；coffee/tea `load` 在 BLE 写前创建 immutable snapshot + durable workflow 并返回 `workflow_id`；兼容本地 recipe 路径，可选 `recipe_revision_id`；已连接不重复 connect/open_session。
 - A2 为所有变更 RPC 增加 workflow ID 与 request ID 校验；实现幂等结果缓存、参数 hash 冲突检测和紧急 stop 例外。
+  - **已完成（core）**：变更 RPC 要求 `request_id`；start/pause/resume/normal stop/cancel 校验 active `workflow_id`；`StateStore.reserve/complete/fail_idempotency`；紧急 `emergency=true` 例外；RPC protocol v3。
 - A3 咖啡/茶从 `load` 贯穿 `start`、暂停/恢复和机器事件；客户端/HTTP 断开不改变 bridge 监控任务。
-  - **部分完成**：同一 `BridgeCore` 连接在 load→start→pause/resume→events 间复用；无 per-step 重连。
+  - **部分完成**：同一 `BridgeCore` 连接在 load→start→pause/resume→events 间复用；无 per-step 重连。Skill/Web/HTTP 客户端切断语义未在本批迁移。
 - A4 终态处理在一个事务中固化最终事件和历史，再 close session + disconnect；断连失败单独报告，不把已确认终态回滚为 running。
-  - **部分完成**：确认自然终态 / 确认 cancel·stop 后先清理 activity/state，再 `close_session`+`disconnect`；断连失败写入 `last_disconnect_error`，不抹掉 `last_operation`。尚无 SQLite 历史事务。
+  - **已完成（core）**：`commit_workflow_terminal` 原子固化 state+event(+idempotency)；成功后才 schedule release；持久化失败 → recovery_required 且不 release；断连失败只写 `last_disconnect_error`。
 - A5 独立磨豆、出水、称重在各自确认终态后释放；设置/probe 等单次事务返回完整结果后释放。
-  - **部分完成**：grinder / water / scale 确认终态或确认 stop 后 prompt release。设置/presets 仍保持连接（窄范围未做 one-shot 自动释放）。
+  - **部分完成**：grinder / water / scale 有 durable workflow identity，确认终态或确认 stop 后 prompt release。设置/presets 仍保持连接（窄范围未做 one-shot 自动释放）。
 - A6 控制结果不确定、BLE 意外断开或 daemon 重启时进入 recovery，对账机器状态且绝不重复 start。loaded 配方等待 start 或显式 cancel，**不**做时间驱动的自动 cancel/unload/断连；保持 workflow 连接。未确认 control/cancel 保持 recovery 且保持连接。
-  - **部分完成**：`control_unconfirmed` / `stop_unconfirmed` 不自动 release，保留 recovery 与连接；loaded 等待 start 或显式 cancel，无时间驱动自动动作。daemon 重启后的完整 recovery/对账与「绝不重复 start」契约尚未完整落地。
+  - **部分完成**：`control_unconfirmed` / `stop_unconfirmed` 不自动 release；pending request 不重试 start；loaded 无时间驱动自动动作；daemon 从 durable workflow 重建 identity 且不 auto-connect/start。完整机器对账仍未落地。
 - A7 `XBLOOM_BRIDGE_IDLE_DISCONNECT_S` 只处理无活动 workflow 的遗留连接；`status` / `events` 不续期。释放后不自动抢连外部客户端。
   - **部分完成**：`status`/`events` 不建联、不续期；释放后不后台重连。空闲兜底超时计时器尚未实现。
 - A8 `status()` / `events()` 暴露 instance ID、workflow、版本、连接作用域、事件游标/gap、恢复状态及最近断连原因。
-  - **部分完成**：`status` 增加 `connection_scope`、`release_pending`、`last_disconnect_reason`/`time`/`error`。尚无 workflow_id / event gap 契约。
+  - **已完成（core）**：`active_workflow_id`、durable `workflow` summary、`recovery`、versions、connection_scope/release/disconnect 字段；durable events cursor + `gap_detected`。
 - A9 Skill、Web 和 MCP 的连接型操作全部收敛到类型化 bridge RPC；仅被动 scan 可直用 BLE discovery。
+  - **未做（下一批）**：本批不迁移 Skill CLI/MCP/Web 客户端。
 - A10 单元/集成测试覆盖并发 start、重复 request ID、错误 workflow ID、客户端退出、daemon restart、BLE drop、loaded 保持连接直至 start 或显式 cancel（无时间驱动自动动作）、确认终态后断连、未确认 control/cancel 保持 recovery 与连接，以及 external busy。
-  - **部分完成**：fake-client 覆盖 connect 次数、确认终态/取消释放、explicit 不释放、loaded 无时间驱动卸载且 start+终态复用单连接、preflight 区分、终端/控制竞态与断连失败可见性。
+  - **部分完成（focused）**：fake-client 覆盖 duplicate load/start 单次 BLE 写、request 冲突、pending 不重试、错误 workflow 预写拒绝、emergency stop、终态先于 disconnect、持久化失败阻止 release、durable event cursor、one-shot workflow identity、daemon 从 durable 重建且不 auto-connect/start；storage migration + terminal txn rollback。external busy / 完整 BLE drop 矩阵未扩。
 - A11 真实硬件测试记录一次完整 load/start/pause/resume/complete 的连接次数；完成后从手机官方 App 连接，再从 Web/Skill 发起下一工作流。
 
-**实现落点（已落地）**：`packages/core/xbloom_ble/bridge.py` 的连接作用域与 prompt release；fake 测试见 `skills/xbloom-studio-brew/tests/test_bridge.py`。显式 `connect` 保持到显式 `disconnect`；coffee/tea 从 load 保持连接至确认终态或确认 cancel；workflow/one-shot 在确认终态后释放；daemon 进程不退出。loaded 无时间驱动的自动 cancel/unload/断连。
+**实现落点（已落地）**：`packages/core/xbloom_ble/bridge.py` + `packages/core/xbloom_storage.py`；fake 测试见 `skills/xbloom-studio-brew/tests/test_bridge.py` 与 `test_storage.py`。显式 `connect` 保持到显式 `disconnect`；coffee/tea 从 load 保持连接至确认终态或确认 cancel；workflow/one-shot 在确认终态后释放；daemon 进程不退出。loaded 无时间驱动的自动 cancel/unload/断连。RPC protocol **v3**（破坏性：变更 RPC 需 `request_id` / workflow-bound 控制需 `workflow_id`）。
 
 **验收**：一次配方冲配只观察到一次 BLE 建联；loaded 配方等待 start 或显式 cancel，无时间驱动的自动 cancel/unload/断连；连接持有至确认终态后释放；发起客户端退出后冲配仍完成；终态与历史持久化后 `connected=false`、bridge 仍 `running=true`；重复/旧请求不产生第二次机器写；未确认控制/取消保持 recovery 且保持连接、不 release；恢复流程不重复 start；释放后手机可连接，手机占用时 bridge 不抢占；下一次显式 Web/Skill 操作可重新连接并完成 workflow。
 

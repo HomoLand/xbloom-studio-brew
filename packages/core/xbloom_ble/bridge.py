@@ -30,6 +30,15 @@ from xbloom_paths import (
     skill_state_dir as _shared_skill_state_dir,
     state_dir as _shared_state_dir,
 )
+from xbloom_storage import (
+    CLEAR_RECOVERY,
+    IDEM_COMPLETED,
+    IDEM_FAILED,
+    IDEM_PENDING,
+    StateStore,
+    StorageError,
+    content_sha256,
+)
 
 from . import __version__ as CORE_VERSION
 from .client import XBloomClient, scan
@@ -38,15 +47,55 @@ from .telemetry import StatusEvent
 
 
 # Wire/RPC protocol range (Phase 0.3+). v1 lacked required hello + RPC envelope.
-# New clients and daemons speak 2; v1 is legacy (token + method only).
-BRIDGE_PROTOCOL_VERSION = 2
-RPC_PROTOCOL_MIN = 2
-RPC_PROTOCOL_MAX = 2
-RPC_PROTOCOL_CURRENT = 2
+# v2: hello + envelope. v3: mutating RPCs require request_id; workflow-bound
+# control requires workflow_id (emergency stop is the explicit exception).
+BRIDGE_PROTOCOL_VERSION = 3
+RPC_PROTOCOL_MIN = 3
+RPC_PROTOCOL_MAX = 3
+RPC_PROTOCOL_CURRENT = 3
 # Highest wire version that did not require hello/envelope (for upgrade detection).
 LEGACY_RPC_PROTOCOL_MAX = 1
 # Discovery record schema version (independent of the RPC wire version).
 BRIDGE_RECORD_FORMAT_VERSION = 2
+
+# Methods that enforce protocol-v3 request_id + SQLite idempotency in this core
+# slice. settings.write / advanced.write / presets.save are intentionally
+# excluded: they remain gated machine writes but do not yet implement durable
+# request_id idempotency (Phase A2/A5 follow-up). connect/disconnect are not
+# machine-action idempotent.
+MUTATING_METHODS = frozenset(
+    {
+        "coffee.load",
+        "coffee.start",
+        "tea.load",
+        "tea.start",
+        "pause",
+        "resume",
+        "stop",
+        "cancel",
+        "grinder.start",
+        "water.start",
+        "scale.start",
+        "scale.tare",
+        "water.set_temperature",
+        "water.set_pattern",
+    }
+)
+# Control methods that require a matching active workflow_id (unless emergency)
+# and participate in the same idempotency contract as MUTATING_METHODS.
+WORKFLOW_BOUND_METHODS = frozenset(
+    {
+        "coffee.start",
+        "tea.start",
+        "pause",
+        "resume",
+        "stop",
+        "cancel",
+        "scale.tare",
+        "water.set_temperature",
+        "water.set_pattern",
+    }
+)
 
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_RECORD_NAME = "bridge.json"
@@ -450,6 +499,7 @@ class BridgeCore:
         scan_fn: Callable[..., Any] = scan,
         environ: Mapping[str, str] | None = None,
         machine_info_timeout: float = 4.0,
+        store: StateStore | None = None,
     ) -> None:
         self.default_address = default_address or environment_value(
             "XBLOOM_ADDRESS", environ=environ
@@ -470,6 +520,11 @@ class BridgeCore:
         self.core_version = _core_version()
         self.started_at = time.time()
 
+        # Durable state: inject for tests; otherwise own a store at state_dir.
+        self._store_owned = store is None
+        self.store = store if store is not None else StateStore(self.state_dir)
+        self.store.ensure_schema()
+
         self.client: Any | None = None
         self.address: str | None = None
         self.machine_name: str | None = None
@@ -481,6 +536,10 @@ class BridgeCore:
         self.telemetry: dict[str, Any] = {}
         self.last_operation: dict[str, Any] | None = None
         self.last_error: str | None = None
+        self.active_workflow_id: str | None = None
+        self._recovery_required: bool = False
+        self._recovery_detail: dict[str, Any] | None = None
+        self._event_persist_failed: bool = False
         self._saw_active = False
         self._events: deque[dict[str, Any]] = deque(maxlen=2048)
         self._event_seq = 0
@@ -492,7 +551,16 @@ class BridgeCore:
         self._grinder_started_at: float | None = None
         self._water_timer: asyncio.Task[Any] | None = None
         self._scale_task: asyncio.Task[Any] | None = None
+        self._scale_stop_in_progress: bool = False
         self._cup_baseline_g: float | None = None
+        # After daemon restart with durable loaded state, start requires an
+        # explicit machine-state reconcile (request_status -> fresh armed) first.
+        self._loaded_needs_reconcile: bool = False
+        # Generation + event for state-bearing notifications (event.state is not
+        # None). Reconcile clears/captures generation before status query and
+        # awaits a strictly newer generation so stale machine_state cannot pass.
+        self._state_notify_generation: int = 0
+        self._state_notify_event = asyncio.Event()
         # BLE connection lifecycle (user-visible; daemon process stays up).
         # scope: explicit (debug connect), workflow (coffee/tea), one-shot
         # (grinder/water/scale and other auto-connects without workflow ownership).
@@ -503,6 +571,8 @@ class BridgeCore:
         self.last_disconnect_error: str | None = None
         self._pending_release_reason: str | None = None
         self._release_task: asyncio.Task[Any] | None = None
+        # Reconstruct durable workflow identity without auto-connect / start.
+        self._reconstruct_from_store()
 
     @property
     def coffee_state_file(self) -> Path:
@@ -519,6 +589,693 @@ class BridgeCore:
     @property
     def connected(self) -> bool:
         return bool(self.client is not None and self.client.is_connected)
+
+    def _reconstruct_from_store(self) -> None:
+        """Hydrate in-memory activity from durable state; never BLE connect/start."""
+
+        try:
+            active = self.store.get_active_workflow()
+        except StorageError:
+            return
+        if active is None:
+            return
+        self.active_workflow_id = str(active["workflow_id"])
+        kind = str(active.get("kind") or "")
+        state = str(active.get("state") or "recovery")
+        meta = dict(active.get("metadata") or {})
+        # Map durable kind -> activity name.
+        if kind in {"coffee", "coffee_recovery"}:
+            self.activity = "coffee"
+        elif kind in {"tea", "tea_recovery"}:
+            self.activity = "tea"
+        elif kind in {"grinder", "grinder_recovery"}:
+            self.activity = "grinder"
+        elif kind == "water":
+            self.activity = "water"
+        elif kind == "scale":
+            self.activity = "scale"
+        else:
+            self.activity = kind or None
+        # Never auto-start; surface recovery when prior start may be outstanding.
+        # created/loading are unconfirmed -- never map them to loaded.
+        if state in {"created", "loading"}:
+            self.phase = state
+            self._recovery_required = True
+            self._recovery_detail = {
+                "reason": "durable_workflow_unconfirmed",
+                "workflow_id": self.active_workflow_id,
+                "state": state,
+                "message": (
+                    "durable workflow is created/loading (unconfirmed); "
+                    "recovery_required -- do not start"
+                ),
+            }
+        elif state in {"starting", "control_unconfirmed", "stop_unconfirmed", "recovery_required"}:
+            self.phase = state if state != "recovery_required" else "control_unconfirmed"
+            self._recovery_required = True
+            self._recovery_detail = {
+                "reason": "durable_workflow_reconstructed",
+                "workflow_id": self.active_workflow_id,
+                "state": state,
+            }
+        elif state == "loaded":
+            # Confirmed loaded may exist durably, but after process restart the
+            # machine state is unconfirmed. Start requires explicit reconcile.
+            self.phase = "loaded"
+            self._loaded_needs_reconcile = True
+            self._recovery_required = True
+            self._recovery_detail = {
+                "reason": "durable_workflow_reconstructed_loaded",
+                "workflow_id": self.active_workflow_id,
+                "state": state,
+                "message": (
+                    "daemon restarted with loaded workflow; reconcile machine "
+                    "state (armed) before start; never re-load"
+                ),
+            }
+        elif state in {"running", "paused", "soaking", "stopping", "recovering", "recovery"}:
+            self.phase = state if state != "recovery" else "recovering"
+            self._recovery_required = True
+            self._recovery_detail = {
+                "reason": "durable_workflow_reconstructed_running",
+                "workflow_id": self.active_workflow_id,
+                "state": state,
+                "message": "daemon restarted with non-terminal workflow; do not retry start",
+            }
+        else:
+            self.phase = state or "recovery"
+            self._recovery_required = True
+            self._recovery_detail = {
+                "reason": "durable_workflow_reconstructed",
+                "workflow_id": self.active_workflow_id,
+                "state": state,
+            }
+        # Targets from metadata when available (best-effort; no BLE).
+        if isinstance(meta.get("targets"), dict):
+            self.targets = dict(meta["targets"])
+        address = meta.get("address") or active.get("owner")
+        if isinstance(address, str) and address and ":" in address:
+            # Prefer explicit machine address from metadata.
+            pass
+        machine_addr = meta.get("machine_address")
+        if isinstance(machine_addr, str) and machine_addr:
+            self.address = machine_addr
+            self.default_address = self.default_address or machine_addr
+        # Remain disconnected; connection_scope stays None until explicit reconnect.
+        if self.phase not in {"disconnected"}:
+            # In-memory phase reflects workflow, not BLE link.
+            pass
+
+    @staticmethod
+    def _require_request_id(params: Mapping[str, Any]) -> str:
+        raw = params.get("request_id")
+        if raw is None or not str(raw).strip():
+            raise BridgeError("request_id is required for machine-mutating RPCs")
+        return str(raw).strip()
+
+    def _semantic_params(
+        self,
+        method: str,
+        params: Mapping[str, Any],
+        *,
+        workflow_id: str | None,
+    ) -> dict[str, Any]:
+        """Stable semantic identity for idempotency hashing (excludes request_id)."""
+
+        ignored = {
+            "request_id",
+            "token",
+            "protocol_min",
+            "protocol_max",
+            "client_name",
+            "client_version",
+            "config_fingerprint",
+        }
+        semantic = {
+            key: value
+            for key, value in params.items()
+            if key not in ignored
+        }
+        # Normalize path-like recipe fields for stable hashing.
+        if "recipe" in semantic and semantic["recipe"] is not None:
+            try:
+                semantic["recipe"] = str(
+                    Path(str(semantic["recipe"])).expanduser().resolve()
+                )
+            except OSError:
+                semantic["recipe"] = str(semantic["recipe"])
+        semantic["workflow_id"] = workflow_id
+        semantic["method"] = method
+        return semantic
+
+    def _workflow_id_hint(self, params: Mapping[str, Any]) -> str | None:
+        """Semantic workflow_id from params, falling back to active (no gate)."""
+
+        raw = params.get("workflow_id")
+        if raw is not None and str(raw).strip():
+            return str(raw).strip()
+        if self.active_workflow_id:
+            return str(self.active_workflow_id)
+        return None
+
+    def _caller_omitted_workflow_id(self, params: Mapping[str, Any]) -> bool:
+        raw = params.get("workflow_id")
+        return raw is None or not str(raw).strip()
+
+    def _idempotency_preflight(
+        self,
+        method: str,
+        params: Mapping[str, Any],
+        *,
+        workflow_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return cached completed result before phase/cooldown gates, or None.
+
+        Pending exact duplicates raise recovery_required (never reissue).
+        Method / semantic-params / workflow mismatches raise conflict.
+        Failed rows return None so a later reserve may re-attempt pre-BLE work.
+
+        Exact semantic identity is required. A completed duplicate may match
+        using the *stored* workflow_id only when the caller OMITTED workflow_id
+        (e.g. emergency stop after the workflow is already terminal). An
+        explicitly supplied different workflow_id is always a conflict.
+        """
+
+        request_id = self._require_request_id(params)
+        try:
+            existing = self.store.get_idempotency(request_id)
+        except StorageError as exc:
+            raise BridgeError(str(exc)) from exc
+        if existing is None:
+            return None
+        if existing.get("method") != method:
+            raise BridgeError(
+                f"idempotency conflict for request_id {request_id!r}: method mismatch"
+            )
+
+        def _sha_for(wid: str | None) -> str:
+            return content_sha256(
+                self._semantic_params(method, params, workflow_id=wid)
+            )
+
+        stored_wf = existing.get("workflow_id")
+        stored_wf_norm = stored_wf if stored_wf else None
+        caller_omitted = self._caller_omitted_workflow_id(params)
+        status = existing.get("status")
+
+        # Primary: exact match with the semantic workflow_id used for this call.
+        if existing.get("params_sha256") == _sha_for(workflow_id):
+            matched_wid: str | None = workflow_id
+        elif (
+            status == IDEM_COMPLETED
+            and caller_omitted
+            and stored_wf_norm is not None
+            and existing.get("params_sha256") == _sha_for(stored_wf_norm)
+        ):
+            # Terminal already released active ownership; caller omitted
+            # workflow_id and every other semantic param still matches.
+            matched_wid = stored_wf_norm
+        else:
+            # Explicit different workflow_id (or any other param drift) is a
+            # conflict even when the rest of the body matches.
+            if (
+                not caller_omitted
+                and stored_wf_norm is not None
+                and (workflow_id or None) != stored_wf_norm
+            ):
+                raise BridgeError(
+                    f"idempotency conflict for request_id {request_id!r}: "
+                    "workflow_id mismatch"
+                )
+            raise BridgeError(
+                f"idempotency conflict for request_id {request_id!r}: "
+                "params hash mismatch"
+            )
+
+        if status == IDEM_COMPLETED:
+            return dict(existing.get("result") or {})
+        if status == IDEM_PENDING:
+            self._recovery_required = True
+            self._recovery_detail = {
+                "reason": "pending_request",
+                "request_id": request_id,
+                "method": method,
+                "workflow_id": matched_wid or workflow_id,
+            }
+            raise BridgeError(
+                f"recovery_required: request_id {request_id!r} is pending "
+                f"for {method}; do not retry the machine action"
+            )
+        # Failed: allow a fresh reservation after pre-BLE re-validation.
+        if status == IDEM_FAILED:
+            return None
+        return None
+
+    def _reserve_request(
+        self,
+        method: str,
+        params: Mapping[str, Any],
+        *,
+        workflow_id: str | None = None,
+    ) -> dict[str, Any]:
+        request_id = self._require_request_id(params)
+        semantic = self._semantic_params(method, params, workflow_id=workflow_id)
+        try:
+            reserved = self.store.reserve_idempotency(
+                request_id,
+                method,
+                semantic,
+                workflow_id=workflow_id,
+            )
+        except StorageError as exc:
+            raise BridgeError(str(exc)) from exc
+        if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
+            return reserved
+        if reserved.get("recovery_required") or (
+            reserved.get("cached") and reserved.get("status") == IDEM_PENDING
+        ):
+            self._recovery_required = True
+            self._recovery_detail = {
+                "reason": "pending_request",
+                "request_id": request_id,
+                "method": method,
+                "workflow_id": workflow_id,
+            }
+            raise BridgeError(
+                f"recovery_required: request_id {request_id!r} is pending "
+                f"for {method}; do not retry the machine action"
+            )
+        return reserved
+
+    def _complete_request(
+        self, request_id: str, result: Mapping[str, Any]
+    ) -> None:
+        try:
+            self.store.complete_idempotency(request_id, result)
+        except StorageError as exc:
+            # Completing idempotency after a confirmed machine write must not
+            # invent a second write; surface recovery instead.
+            self._recovery_required = True
+            self._recovery_detail = {
+                "reason": "idempotency_complete_failed",
+                "request_id": request_id,
+                "error": str(exc),
+            }
+            raise BridgeError(
+                f"persistence failed after machine action for request_id "
+                f"{request_id!r}: {exc}; recovery_required"
+            ) from exc
+
+    def _fail_request(
+        self,
+        request_id: str,
+        error: str,
+        *,
+        keep_pending: bool = False,
+    ) -> None:
+        try:
+            self.store.fail_idempotency(
+                request_id, error, keep_pending=keep_pending
+            )
+        except StorageError:
+            pass
+
+    def _require_active_workflow(
+        self,
+        params: Mapping[str, Any],
+        *,
+        emergency: bool = False,
+    ) -> tuple[str, bool]:
+        """Return (workflow_id, used_emergency). Reject stale/wrong IDs pre-BLE."""
+
+        raw = params.get("workflow_id")
+        active = self.active_workflow_id
+        if emergency:
+            # Emergency may ignore missing/stale IDs and act on the active workflow.
+            if active is None and self.activity is None:
+                # Fall through to JSON recovery records if present.
+                return "", True
+            return str(active or ""), True
+        if raw is None or not str(raw).strip():
+            raise BridgeError(
+                "workflow_id is required (use emergency=true only for emergency stop)"
+            )
+        wid = str(raw).strip()
+        if active is None:
+            raise BridgeError(
+                f"no active workflow; cannot apply workflow_id {wid!r}"
+            )
+        if wid != active:
+            raise BridgeError(
+                f"workflow_id {wid!r} does not match active workflow {active!r}"
+            )
+        return wid, False
+
+    async def _await_fresh_state_notification(
+        self, *, generation_before: int, timeout: float
+    ) -> None:
+        """Wait until a state-bearing notification advances past generation_before.
+
+        Callers must capture ``_state_notify_generation`` *before* issuing the
+        status query. A notification is fresh only if generation is strictly
+        greater than that snapshot. ``request_status`` only writes a query and
+        returns immediately; ``asyncio.sleep(0)`` is not proof of a reply.
+        """
+
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while self._state_notify_generation <= generation_before:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "no fresh state-bearing notification after status query"
+                )
+            self._state_notify_event.clear()
+            # Re-check after clear to avoid missing a set that raced the clear.
+            if self._state_notify_generation > generation_before:
+                return
+            try:
+                await asyncio.wait_for(
+                    self._state_notify_event.wait(), timeout=remaining
+                )
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(
+                    "no fresh state-bearing notification after status query"
+                ) from exc
+
+    async def _reconcile_loaded_machine_state(
+        self,
+        *,
+        kind: str,
+        request_id: str | None = None,
+    ) -> None:
+        """Smallest safe gate after reconstructed loaded: query, never re-load/start.
+
+        Awaits a *fresh* state-bearing notification caused after the status
+        query begins (not stale ``machine_state``). Coffee may proceed only when
+        that fresh state is exactly ``armed``. Tea has no positive loaded
+        protocol marker in this codebase, so reconstructed tea always remains
+        ``recovery_required`` and never issues ``start_tea``. On failure, no
+        start write is issued; durable workflow ownership and BLE connection
+        are retained for cancel/recovery.
+        """
+
+        if self.client is None or not self.connected:
+            if request_id:
+                self._fail_request(
+                    request_id,
+                    "loaded reconcile requires connection",
+                    keep_pending=False,
+                )
+            raise BridgeError(
+                "recovery_required: reconstructed loaded workflow cannot "
+                "reconcile machine state without a connection; do not start"
+            )
+
+        timeout = self.machine_info_timeout
+        generation_before = self._state_notify_generation
+        self._state_notify_event.clear()
+        try:
+            await self.client.request_status()
+            await self._await_fresh_state_notification(
+                generation_before=generation_before, timeout=timeout
+            )
+        except Exception as exc:
+            self._recovery_required = True
+            self._recovery_detail = {
+                "reason": "loaded_reconcile_failed",
+                "workflow_id": self.active_workflow_id,
+                "kind": kind,
+                "error": str(exc),
+                "machine_state": self.machine_state,
+            }
+            if request_id:
+                self._fail_request(request_id, str(exc), keep_pending=False)
+            raise BridgeError(
+                f"recovery_required: reconstructed loaded cannot query machine "
+                f"state: {exc}; do not start"
+            ) from exc
+
+        if kind == "tea":
+            # Protocol has no positive tea-loaded state marker. Idle/None/any
+            # non-active state is not proof the recipe is still loaded.
+            self._recovery_required = True
+            self._recovery_detail = {
+                "reason": "loaded_reconcile_tea_no_positive_marker",
+                "workflow_id": self.active_workflow_id,
+                "kind": kind,
+                "machine_state": self.machine_state,
+                "message": (
+                    "reconstructed tea loaded cannot confirm recipe still loaded "
+                    "(no positive protocol marker); cancel or recover; do not start"
+                ),
+            }
+            if request_id:
+                self._fail_request(
+                    request_id,
+                    "tea has no positive loaded protocol marker after status query",
+                    keep_pending=False,
+                )
+            raise BridgeError(
+                "recovery_required: reconstructed tea loaded cannot confirm "
+                f"recipe still loaded (machine_state={self.machine_state!r}; "
+                "no positive protocol marker); do not start; never re-load; "
+                "cancel or recover"
+            )
+
+        confirmed = kind == "coffee" and self.machine_state == "armed"
+
+        if not confirmed:
+            self._recovery_required = True
+            self._recovery_detail = {
+                "reason": "loaded_reconcile_not_armed",
+                "workflow_id": self.active_workflow_id,
+                "kind": kind,
+                "machine_state": self.machine_state,
+            }
+            if request_id:
+                self._fail_request(
+                    request_id,
+                    f"machine state {self.machine_state!r} is not armed",
+                    keep_pending=False,
+                )
+            raise BridgeError(
+                "recovery_required: reconstructed loaded cannot confirm armed "
+                f"state (machine_state={self.machine_state!r}); do not start; "
+                "never re-load"
+            )
+        self._loaded_needs_reconcile = False
+        self._recovery_required = False
+        self._recovery_detail = None
+
+    def _persist_event(
+        self,
+        event_type: str,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        workflow_id: str | None = None,
+        critical: bool = False,
+    ) -> dict[str, Any] | None:
+        wid = workflow_id or self.active_workflow_id
+        if not wid:
+            return None
+        try:
+            return self.store.append_workflow_event(
+                wid, event_type, dict(payload or {})
+            )
+        except StorageError as exc:
+            self.last_error = f"workflow event persistence failed: {exc}"
+            self._event_persist_failed = True
+            self._recovery_required = True
+            self._recovery_detail = {
+                "reason": "event_persist_failed",
+                "workflow_id": wid,
+                "event_type": event_type,
+                "error": str(exc),
+            }
+            if critical:
+                raise BridgeError(
+                    f"critical workflow event persistence failed: {exc}"
+                ) from exc
+            return None
+
+    def _set_workflow_state(
+        self,
+        state: str,
+        *,
+        workflow_id: str | None = None,
+        machine_phase: str | None = None,
+        recovery: Mapping[str, Any] | Any = None,
+        metadata: Mapping[str, Any] | None = None,
+        event_type: str | None = None,
+        event_payload: Mapping[str, Any] | None = None,
+        critical: bool = False,
+    ) -> None:
+        wid = workflow_id or self.active_workflow_id
+        if not wid:
+            return
+        try:
+            self.store.transition_workflow(
+                wid,
+                state=state,
+                machine_phase=machine_phase if machine_phase is not None else state,
+                recovery=recovery,
+                metadata=metadata,
+                event_type=event_type,
+                event_payload=(
+                    dict(event_payload)
+                    if event_payload is not None
+                    else ({"state": state} if event_type is not None else None)
+                ),
+            )
+        except StorageError as exc:
+            self.last_error = f"workflow state persistence failed: {exc}"
+            self._recovery_required = True
+            self._recovery_detail = {
+                "reason": "workflow_persist_failed",
+                "workflow_id": wid,
+                "state": state,
+                "error": str(exc),
+            }
+            if critical:
+                raise BridgeError(
+                    f"critical workflow transition to {state!r} failed: {exc}"
+                ) from exc
+
+    def _workflow_public_summary(
+        self, workflow_id: str | None = None
+    ) -> dict[str, Any] | None:
+        try:
+            return self.store.workflow_summary(workflow_id)
+        except StorageError:
+            return None
+
+    def _create_durable_workflow(
+        self,
+        *,
+        kind: str,
+        snapshot: Mapping[str, Any],
+        state: str = "loading",
+        source: str | None = None,
+        owner: str | None = None,
+        recipe_revision_id: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return self.store.create_workflow_with_event(
+                kind=kind,
+                state=state,
+                snapshot=snapshot,
+                source=source or "bridge",
+                owner=owner or "bridge",
+                recipe_revision_id=recipe_revision_id,
+                machine_phase=state,
+                metadata=metadata,
+                event_type="created",
+                event_payload={
+                    "kind": kind,
+                    "state": state,
+                },
+            )
+        except StorageError as exc:
+            raise BridgeError(f"failed to create durable workflow: {exc}") from exc
+
+    def _snapshot_coffee_recipe(self, recipe: Any, path: Path | None) -> dict[str, Any]:
+        data = dict(recipe.to_dict())
+        if path is not None:
+            data["_source_path"] = str(path)
+            data["_source_sha256"] = _sha256(path)
+        return data
+
+    def _snapshot_tea_recipe(self, recipe: Any, path: Path | None) -> dict[str, Any]:
+        data = {
+            "name": recipe.name,
+            "kind": "tea",
+            "leaf_g": recipe.leaf_g,
+            "output_ml_per_steep": recipe.output_ml_per_steep,
+            "pours": [
+                {
+                    "ml": pour.ml,
+                    "temp_c": pour.temp_c,
+                    "pattern": pour.pattern,
+                    "pause_s": pour.pause_s,
+                    "flow_ml_s": pour.flow_ml_s,
+                    **({"label": pour.label} if pour.label else {}),
+                }
+                for pour in recipe.pours
+            ],
+        }
+        if path is not None:
+            data["_source_path"] = str(path)
+            data["_source_sha256"] = _sha256(path)
+        return data
+
+    def _canonical_snapshot_content(
+        self, snapshot: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Drop bridge-private underscore keys for revision hash comparison."""
+
+        return {k: v for k, v in snapshot.items() if not str(k).startswith("_")}
+
+    def _resolve_recipe_revision_id(
+        self,
+        params: Mapping[str, Any],
+        *,
+        kind: str,
+        snapshot: Mapping[str, Any],
+        name: str | None,
+        path_provided: bool = False,
+    ) -> str | None:
+        rev_id = params.get("recipe_revision_id")
+        canonical = self._canonical_snapshot_content(snapshot)
+        expected_sha = content_sha256(canonical)
+        if rev_id is not None and str(rev_id).strip():
+            rid = str(rev_id).strip()
+            existing = self.store.get_recipe_revision(rid)
+            if existing is None:
+                raise BridgeError(f"unknown recipe_revision_id {rid!r}")
+            # When a local path is also provided, revision must match the
+            # validated canonical snapshot (kind + content hash) before BLE.
+            if path_provided:
+                recipe_kind = existing.get("recipe_kind") or (
+                    (existing.get("content") or {}).get("kind")
+                )
+                # Coffee snapshots may omit kind; treat coffee/hot/ice as coffee.
+                if recipe_kind is not None:
+                    kind_norm = str(recipe_kind).lower()
+                    expected_kinds = {kind.lower()}
+                    if kind.lower() == "coffee":
+                        expected_kinds.update({"hot", "ice", "flash"})
+                    if kind_norm not in expected_kinds and kind_norm != kind.lower():
+                        raise BridgeError(
+                            f"recipe_revision_id {rid!r} kind {recipe_kind!r} "
+                            f"does not match load kind {kind!r}"
+                        )
+                existing_sha = existing.get("content_sha256")
+                if existing_sha and existing_sha != expected_sha:
+                    # Also accept direct content equality when hash encoding differs.
+                    content = existing.get("content") or {}
+                    if content_sha256(content) != expected_sha:
+                        raise BridgeError(
+                            f"recipe_revision_id {rid!r} content hash does not "
+                            "match the validated local recipe snapshot"
+                        )
+            return rid
+        # Path-only compatibility: best-effort durable revision (no redesign).
+        try:
+            recipe_row = self.store.upsert_recipe(
+                kind=kind,
+                name=name,
+                source="bridge_load",
+                provenance={"via": "bridge_load"},
+            )
+            rev = self.store.add_recipe_revision(
+                recipe_row["recipe_id"],
+                canonical,
+                provenance={"source": "bridge_load"},
+            )
+            return str(rev["revision_id"])
+        except StorageError:
+            return None
 
     def _grinder_is_recovery(self) -> bool:
         """True only for in-progress or unreadable grinder records.
@@ -604,6 +1361,9 @@ class BridgeCore:
         if event.state is not None:
             self.machine_state = event.state_name
             self.telemetry["machine_state"] = event.state_name
+            # Fresh state-bearing notification for reconcile waiters.
+            self._state_notify_generation += 1
+            self._state_notify_event.set()
         dispensed = event.dispensed_water_ml
         cup_weight = event.cup_weight_g
         if dispensed is not None:
@@ -649,19 +1409,64 @@ class BridgeCore:
 
         if event.state in ACTIVE_STATE_BYTES:
             self._saw_active = True
-        if (
+
+        # Persist normalized machine/telemetry for the active workflow with a
+        # dense per-workflow sequence, before any terminal finalization below.
+        # control_unconfirmed / stop_unconfirmed are resolvable by a later
+        # confirmed telemetry terminal (coffee and tea).
+        _terminal_resolvable_phases = {
+            "running",
+            "paused",
+            "soaking",
+            "starting",
+            "control_unconfirmed",
+            "stop_unconfirmed",
+        }
+        def _terminal_can_resolve(phase: str) -> bool:
+            # Uncertain control/stop may be resolved by a confirmed terminal
+            # even if an active-state byte was never observed (ACK loss paths).
+            if phase in {"control_unconfirmed", "stop_unconfirmed"}:
+                return True
+            return self._saw_active
+
+        will_finish_coffee = (
             self.activity == "coffee"
-            and self.phase in {"running", "paused", "starting", "control_unconfirmed"}
-            and self._saw_active
+            and self.phase in _terminal_resolvable_phases
+            and _terminal_can_resolve(self.phase)
             and event.state in TERMINAL_STATE_BYTES
-        ):
-            self._finish_activity(event.state_name, release_reason="natural_terminal")
-        if (
+        )
+        will_finish_tea = (
             self.activity == "tea"
-            and self.phase in {"running", "soaking", "paused", "starting"}
-            and self._saw_active
+            and self.phase in _terminal_resolvable_phases
+            and _terminal_can_resolve(self.phase)
             and event.state in TERMINAL_STATE_BYTES
-        ):
+        )
+        if self.active_workflow_id and self.activity is not None:
+            # Skip pure machine-info handshake noise once firmware is known.
+            interesting = (
+                event.state is not None
+                or event.command_code is not None
+                or dispensed is not None
+                or cup_weight is not None
+                or event.scale_g is not None
+                or event.report_name is not None
+                or event.is_error
+            )
+            if interesting and not (
+                event.machine_info and event.state is None and event.command_code == 40521
+            ):
+                self._persist_event(
+                    "machine",
+                    {
+                        "source": "telemetry",
+                        **{k: v for k, v in data.items() if k != "seq"},
+                        "live_seq": data.get("seq"),
+                    },
+                )
+
+        if will_finish_coffee:
+            self._finish_activity(event.state_name, release_reason="natural_terminal")
+        if will_finish_tea:
             self._finish_activity(event.state_name, release_reason="natural_terminal")
 
         if (
@@ -678,9 +1483,14 @@ class BridgeCore:
         result: str,
         *,
         release_reason: str | None = None,
+        emergency: bool = False,
+        skip_durable_terminal: bool = False,
+        request_id: str | None = None,
+        idempotency_result: Mapping[str, Any] | None = None,
         **details: Any,
     ) -> None:
         previous = self.activity
+        workflow_id = self.active_workflow_id
         if previous in {"coffee", "water", "tea"}:
             target = self.targets.get("target_dispensed_water_ml")
             if target is None:
@@ -691,6 +1501,87 @@ class BridgeCore:
                 self.telemetry.get("dispensed_water_peak_ml"),
             )
             details.setdefault("cup_delta_g", self.telemetry.get("cup_delta_peak_g"))
+        if emergency:
+            details["emergency"] = True
+        if workflow_id:
+            details.setdefault("workflow_id", workflow_id)
+
+        # Confirmed terminal/cancel/stop must persist final workflow state/event
+        # (and matching request completion when provided) before close_session +
+        # disconnect. Natural terminals have no request_id. One transaction.
+        # Prior machine-event persistence gaps remain observable and block a
+        # fully durable release claim even if the terminal row commits.
+        event_gap = bool(self._event_persist_failed)
+        durable_ok = True
+        if workflow_id and not skip_durable_terminal:
+            try:
+                self.store.commit_workflow_terminal(
+                    workflow_id,
+                    state=str(result),
+                    event_type="terminal",
+                    event_payload={
+                        "result": result,
+                        "activity": previous,
+                        "release_reason": release_reason,
+                        **{
+                            key: value
+                            for key, value in details.items()
+                            if key not in {"workflow_id"}
+                        },
+                    },
+                    machine_phase=str(result),
+                    recovery=(
+                        {
+                            "reason": "event_persist_failed_before_terminal",
+                            "machine_result": result,
+                        }
+                        if event_gap
+                        else CLEAR_RECOVERY
+                    ),
+                    request_id=request_id,
+                    idempotency_result=(
+                        dict(idempotency_result)
+                        if idempotency_result is not None
+                        else None
+                    ),
+                )
+            except StorageError as exc:
+                durable_ok = False
+                self._recovery_required = True
+                self._recovery_detail = {
+                    "reason": "terminal_persist_failed",
+                    "workflow_id": workflow_id,
+                    "machine_result": result,
+                    "request_id": request_id,
+                    "error": str(exc),
+                }
+                self.last_error = (
+                    f"machine terminal confirmed but durable commit failed: {exc}; "
+                    "BLE release withheld; recovery_required"
+                )
+                self.last_operation = {
+                    "activity": previous,
+                    "result": result,
+                    "finished_at": round(time.time(), 3),
+                    "persistence_failed": True,
+                    **details,
+                }
+                # Keep workflow identity and activity linkage for recovery.
+                self.phase = "recovery_required"
+                return
+            if event_gap:
+                durable_ok = False
+                self._recovery_required = True
+                self._recovery_detail = {
+                    "reason": "event_persist_failed_before_terminal",
+                    "workflow_id": workflow_id,
+                    "machine_result": result,
+                }
+                self.last_error = (
+                    "durable terminal committed but earlier machine event "
+                    "persistence failed; BLE release withheld; recovery_required"
+                )
+
         self.last_operation = {
             "activity": previous,
             "result": result,
@@ -706,12 +1597,21 @@ class BridgeCore:
         if previous == "water":
             self._cancel_water_timer()
         self.activity = None
-        self.phase = "idle" if self.connected else "disconnected"
+        self.active_workflow_id = None
+        self.phase = (
+            "recovery_required"
+            if not durable_ok
+            else ("idle" if self.connected else "disconnected")
+        )
         self.targets = {}
         self._saw_active = False
         self._cup_baseline_g = None
-        # Prompt release only for auto-owned scopes (not explicit debug holds).
-        if release_reason is not None:
+        if durable_ok:
+            self._recovery_required = False
+            self._recovery_detail = None
+            self._event_persist_failed = False
+        # Prompt release only after fully durable terminal commit succeeds.
+        if release_reason is not None and durable_ok:
             self._schedule_auto_release(release_reason)
 
     def _reset_liquid_telemetry(self) -> None:
@@ -791,6 +1691,23 @@ class BridgeCore:
         if "cup_weight_g" in public_telemetry:
             public_telemetry["coffee_g"] = public_telemetry["cup_weight_g"]
         recovery_records = self.recovery_record_names()
+        workflow_summary = self._workflow_public_summary(self.active_workflow_id)
+        if workflow_summary is None:
+            workflow_summary = self._workflow_public_summary()
+        recovery_state: dict[str, Any] | None = None
+        if self._recovery_required or self._recovery_detail:
+            recovery_state = {
+                "required": bool(self._recovery_required),
+                "detail": dict(self._recovery_detail or {}),
+            }
+        elif self.phase in {"control_unconfirmed", "stop_unconfirmed", "recovery_required"}:
+            recovery_state = {
+                "required": True,
+                "detail": {
+                    "phase": self.phase,
+                    "workflow_id": self.active_workflow_id,
+                },
+            }
         return {
             "protocol_version": BRIDGE_PROTOCOL_VERSION,
             "rpc_protocol_min": RPC_PROTOCOL_MIN,
@@ -832,6 +1749,9 @@ class BridgeCore:
             "last_error": self.last_error,
             "recovery_records": recovery_records,
             "idle": self.is_idle(),
+            "active_workflow_id": self.active_workflow_id,
+            "workflow": workflow_summary,
+            "recovery": recovery_state,
             "live_adjust": {
                 "protocol_available": True,
                 "hardware_verified": False,
@@ -846,10 +1766,52 @@ class BridgeCore:
             },
         }
 
-    def events_since(self, since: int = 0) -> dict[str, Any]:
+    def events_since(
+        self,
+        since: int = 0,
+        *,
+        workflow_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return events. Prefer durable per-workflow cursor when workflow_id set.
+
+        Live ring-buffer events remain available without workflow_id for
+        compatibility. status/events never initiate BLE.
+        """
+
         since = max(0, int(since))
+        if workflow_id:
+            page = self.store.list_workflow_events_page(
+                str(workflow_id), since_seq=since
+            )
+            # Also include matching live telemetry for the active workflow when
+            # the durable cursor is caught up (no artificial gap from mixing).
+            return {
+                "workflow_id": page["workflow_id"],
+                "events": page["events"],
+                "next_since": page["next_since"],
+                "gap_detected": bool(page.get("gap_detected")),
+                "gap_reason": page.get("gap_reason"),
+                "max_seq": page.get("max_seq"),
+                "source": "durable",
+            }
         events = [event for event in self._events if int(event["seq"]) > since]
-        return {"events": events, "next_since": self._event_seq}
+        # Live ring buffer may drop old events; surface gap when since is behind
+        # the oldest retained sequence.
+        gap_detected = False
+        gap_reason: str | None = None
+        if self._events and since > 0:
+            oldest = int(self._events[0]["seq"])
+            if since + 1 < oldest and since < self._event_seq:
+                gap_detected = True
+                gap_reason = "live_ring_buffer_evicted"
+        return {
+            "events": events,
+            "next_since": self._event_seq,
+            "gap_detected": gap_detected,
+            "gap_reason": gap_reason,
+            "source": "live",
+            "workflow_id": self.active_workflow_id,
+        }
 
     async def _resolve_address(self, requested: str | None, timeout: float) -> tuple[str, str]:
         address = requested or self.default_address
@@ -1017,6 +1979,9 @@ class BridgeCore:
             self.machine_name = None
             self.connection_scope = None
             self.phase = "disconnected"
+            # Drop last machine_state so a later workflow can pass idle preflight
+            # after a confirmed release (fresh link will re-observe reports).
+            self.machine_state = None
             self.release_pending = False
             self._pending_release_reason = None
             self.last_disconnect_reason = reason
@@ -1348,29 +2313,167 @@ class BridgeCore:
         }
 
     async def _coffee_load(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        request_id = self._require_request_id(params)
+        # Completed/pending exact duplicates before any mutable gate / BLE.
+        cached = self._idempotency_preflight(
+            "coffee.load", params, workflow_id=None
+        )
+        if cached is not None:
+            return cached
         self._ensure_no_loaded_record()
+        if self.active_workflow_id is not None and self.activity is not None:
+            raise BridgeError(
+                f"active workflow {self.active_workflow_id} still owns the bridge"
+            )
         raw_path = params.get("recipe")
-        if not raw_path:
-            raise BridgeError("coffee.load requires a local recipe path")
-        path = Path(str(raw_path)).expanduser().resolve(strict=True)
+        rev_param = params.get("recipe_revision_id")
+        if not raw_path and not rev_param:
+            raise BridgeError(
+                "coffee.load requires a local recipe path or recipe_revision_id"
+            )
         from xbloom_safety import load_strict_recipe, recipe_summary
 
-        recipe = load_strict_recipe(path)
-        summary = recipe_summary(recipe, path)
-        newly_connected = await self._ensure_connected(params, scope="workflow")
+        path: Path | None = None
+        if raw_path:
+            path = Path(str(raw_path)).expanduser().resolve(strict=True)
+            recipe = load_strict_recipe(path)
+            summary = recipe_summary(recipe, path)
+        else:
+            revision = self.store.get_recipe_revision(str(rev_param).strip())
+            if revision is None:
+                raise BridgeError(f"unknown recipe_revision_id {rev_param!r}")
+            from .recipe import Recipe
+
+            recipe = Recipe.from_dict(revision["content"])
+            # Synthetic pathless summary.
+            summary = {
+                "name": recipe.name,
+                "kind": (recipe.kind or "hot"),
+                "machine_program": "coffee-pour-over",
+                "machine_dispenses_ice": False,
+                "manual_preload_ice_g": int(recipe.ice_g or 0),
+                "dose_g": int(recipe.dose_g),
+                "grind": int(recipe.grind),
+                "hot_water_ml": recipe.total_water_ml,
+                "bypass_ml": float(recipe.bypass_ml or 0.0),
+                "target_dispensed_water_ml": recipe.total_machine_water_ml,
+                "bypass_temp_c": recipe.bypass_temp_c,
+                "final_water_ml": int(
+                    recipe.water_ml
+                    or (recipe.total_machine_water_ml + int(recipe.ice_g or 0))
+                ),
+                "ice_g": int(recipe.ice_g or 0),
+                "pours": len(recipe.pours),
+                "recipe_sha256": revision.get("content_sha256"),
+            }
+        snapshot = self._snapshot_coffee_recipe(recipe, path)
+        source = str(params.get("source") or "bridge")
+        revision_id = self._resolve_recipe_revision_id(
+            params,
+            kind="coffee",
+            snapshot=snapshot,
+            name=recipe.name,
+            path_provided=bool(raw_path),
+        )
+
+        reserved = self._reserve_request(
+            "coffee.load", params, workflow_id=None
+        )
+        if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
+            return dict(reserved.get("result") or {})
+
+        wf = self._create_durable_workflow(
+            kind="coffee",
+            snapshot=snapshot,
+            state="loading",
+            source=source,
+            owner="bridge",
+            recipe_revision_id=revision_id,
+            metadata={
+                "recipe_path": str(path) if path else None,
+                "recipe_name": path.name if path else recipe.name,
+            },
+        )
+        workflow_id = str(wf["workflow_id"])
+        self.active_workflow_id = workflow_id
+
+        newly_connected = False
+        ble_write_attempted = False
         try:
+            newly_connected = await self._ensure_connected(params, scope="workflow")
             firmware = self._require_idle_write_preflight()
+            ble_write_attempted = True
             event = await self.client.load_recipe(recipe)
             if event.state_name != "armed":
                 raise BridgeError(f"machine did not arm; state={event.state_name}")
-        except BaseException:
+        except BaseException as exc:
+            if ble_write_attempted:
+                # Machine load write may have taken effect: keep pending, retain
+                # workflow + connection, never reissue on this request_id.
+                self.phase = "load_unconfirmed"
+                self.activity = self.activity or "coffee"
+                self.last_error = f"coffee load outcome is unconfirmed: {exc}"
+                self._set_workflow_state(
+                    "load_unconfirmed",
+                    workflow_id=workflow_id,
+                    recovery={
+                        "reason": "load_unconfirmed",
+                        "request_id": request_id,
+                        "error": str(exc),
+                    },
+                    event_type="load_unconfirmed",
+                    event_payload={"error": str(exc)},
+                )
+                self._fail_request(request_id, str(exc), keep_pending=True)
+                self._recovery_required = True
+                self._recovery_detail = {
+                    "reason": "load_unconfirmed",
+                    "request_id": request_id,
+                    "workflow_id": workflow_id,
+                }
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                raise BridgeError(
+                    f"{self.last_error}; do not retry load with the same "
+                    "request_id; inspect status/events then cancel or recover"
+                ) from exc
+            # Pre-BLE validation/connect/preflight: safe failed terminal only
+            # when the durable load_failed commit succeeds. If that persist also
+            # fails, retain ownership -- durable active row is still present.
+            try:
+                self.store.commit_workflow_terminal(
+                    workflow_id,
+                    state="load_failed",
+                    event_type="load_failed",
+                    event_payload={"error": str(exc)},
+                )
+            except StorageError as persist_exc:
+                self._recovery_required = True
+                self._recovery_detail = {
+                    "reason": "load_failed_persist_failed",
+                    "workflow_id": workflow_id,
+                    "error": str(exc),
+                    "persist_error": str(persist_exc),
+                }
+                self.phase = "recovery_required"
+                self.activity = self.activity or "coffee"
+                self.last_error = (
+                    f"coffee load failed before BLE write and load_failed "
+                    f"persist also failed: {persist_exc}; recovery_required"
+                )
+                self._fail_request(request_id, self.last_error, keep_pending=True)
+                raise BridgeError(self.last_error) from persist_exc
+            self.active_workflow_id = None
+            self._fail_request(request_id, str(exc), keep_pending=False)
             await self._release_auto_connect_on_preflight_failure(newly_connected)
             raise
         state = {
             "address": self.address,
             "machine": self.machine_name,
-            "recipe_path": str(path),
-            "recipe_sha256": _sha256(path),
+            "recipe_path": str(path) if path else None,
+            "recipe_sha256": (
+                _sha256(path) if path is not None else summary.get("recipe_sha256")
+            ),
             "loaded_at": time.time(),
             "status": "armed",
             "firmware": firmware,
@@ -1378,41 +2481,128 @@ class BridgeCore:
             "serving_kind": summary["kind"],
             "machine_program": summary["machine_program"],
             "manual_preload_ice_g": summary["manual_preload_ice_g"],
+            "workflow_id": workflow_id,
+            "snapshot_sha256": wf.get("snapshot_sha256"),
         }
         _atomic_json(self.coffee_state_file, state, private=True)
         self.activity = "coffee"
         self.phase = "loaded"
+        self._loaded_needs_reconcile = False
+        self._recovery_required = False
+        self._recovery_detail = None
         self.last_error = None
-        # Promote a non-explicit auto-connect to workflow ownership.
         if self.connection_scope != "explicit":
             self.connection_scope = "workflow"
         self.targets = {
-            "recipe": path.name,
+            "recipe": path.name if path else recipe.name,
             "target_dispensed_water_ml": recipe.total_machine_water_ml,
             "machine_program": summary["machine_program"],
             "machine_dispenses_ice": summary["machine_dispenses_ice"],
             "manual_preload_ice_g": summary["manual_preload_ice_g"],
         }
         self._saw_active = False
-        return {
+        self._set_workflow_state(
+            "loaded",
+            workflow_id=workflow_id,
+            machine_phase="loaded",
+            metadata={
+                "recipe_path": str(path) if path else None,
+                "recipe_name": path.name if path else recipe.name,
+                "machine_address": self.address,
+                "targets": dict(self.targets),
+            },
+            event_type="loaded",
+            event_payload={"status": "armed", "firmware": firmware},
+            critical=True,
+        )
+        result = {
             "status": "armed",
-            "recipe": path.name,
+            "state": "loaded",
+            "kind": "coffee",
+            "workflow_id": workflow_id,
+            "recipe_revision_id": revision_id,
+            "snapshot_sha256": wf.get("snapshot_sha256"),
+            "source": source,
+            "recipe": path.name if path else recipe.name,
             "firmware": firmware,
             **summary,
         }
+        self._complete_request(request_id, result)
+        return result
 
     async def _coffee_start(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        request_id = self._require_request_id(params)
+        wid_hint = self._workflow_id_hint(params)
+        # Exact completed duplicates after terminal/phase change return cache
+        # before active-workflow or loaded-phase gates.
+        cached = self._idempotency_preflight(
+            "coffee.start", params, workflow_id=wid_hint
+        )
+        if cached is not None:
+            return cached
+        workflow_id, _emergency = self._require_active_workflow(params)
         self._require_hot_water(params.get("confirmation"), READY_SENTINEL)
-        if self.activity != "coffee" or self.phase != "loaded":
+        if self.activity != "coffee":
             raise BridgeError("bridge has no loaded coffee recipe")
-        state = _read_json(self.coffee_state_file)
+        if self.phase in {"created", "loading"}:
+            raise BridgeError(
+                "recovery_required: coffee workflow is created/loading "
+                "(unconfirmed); do not start"
+            )
+        if self.phase != "loaded":
+            raise BridgeError("bridge has no loaded coffee recipe")
+        if self._recovery_required and not self._loaded_needs_reconcile:
+            raise BridgeError(
+                "recovery_required: coffee start blocked until recovery clears"
+            )
+        reserved = self._reserve_request(
+            "coffee.start", params, workflow_id=workflow_id
+        )
+        if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
+            return dict(reserved.get("result") or {})
+        if self.coffee_state_file.exists():
+            state = _read_json(self.coffee_state_file)
+        else:
+            # Daemon reconstruction: durable workflow is authoritative for
+            # recipe identity, but machine armed state must be re-confirmed.
+            wf = self.store.get_workflow(workflow_id) or {}
+            meta = dict(wf.get("metadata") or {})
+            state = {
+                "recipe_path": meta.get("recipe_path"),
+                "recipe_sha256": (wf.get("snapshot") or {}).get("_source_sha256"),
+                "machine_program": "coffee-pour-over",
+                "manual_preload_ice_g": 0,
+                "workflow_id": workflow_id,
+                "status": "armed",
+            }
+            self._loaded_needs_reconcile = True
         path = Path(str(state.get("recipe_path") or ""))
-        if not path.is_file() or _sha256(path) != state.get("recipe_sha256"):
-            raise BridgeError("recipe changed or disappeared since it was loaded")
+        if state.get("recipe_path"):
+            if not path.is_file() or (
+                state.get("recipe_sha256")
+                and _sha256(path) != state.get("recipe_sha256")
+            ):
+                self._fail_request(
+                    request_id, "recipe changed or disappeared", keep_pending=False
+                )
+                raise BridgeError("recipe changed or disappeared since it was loaded")
+        if not self.connected:
+            await self._ensure_connected(params, scope="workflow")
+        if self._loaded_needs_reconcile:
+            await self._reconcile_loaded_machine_state(
+                kind="coffee", request_id=request_id
+            )
         self._reset_liquid_telemetry()
         state.update(status="start_pending", start_requested_at=time.time())
         _atomic_json(self.coffee_state_file, state, private=True)
         self.phase = "starting"
+        self._set_workflow_state(
+            "starting",
+            workflow_id=workflow_id,
+            event_type="starting",
+            event_payload={"request_id": request_id},
+            critical=True,
+        )
         try:
             event = await self.client.start()
         except BaseException as exc:
@@ -1424,27 +2614,105 @@ class BridgeCore:
                 last_state=self.machine_state or state.get("last_state"),
             )
             _atomic_json(self.coffee_state_file, state, private=True)
+            self._set_workflow_state(
+                "control_unconfirmed",
+                workflow_id=workflow_id,
+                recovery={
+                    "reason": "start_unconfirmed",
+                    "request_id": request_id,
+                    "error": str(exc),
+                },
+                event_type="start_unconfirmed",
+                event_payload={"error": str(exc)},
+            )
+            # Keep pending so a retry never reissues start.
+            self._fail_request(request_id, str(exc), keep_pending=True)
+            self._recovery_required = True
+            self._recovery_detail = {
+                "reason": "start_unconfirmed",
+                "request_id": request_id,
+                "workflow_id": workflow_id,
+            }
             if isinstance(exc, asyncio.CancelledError):
                 raise
             raise BridgeError(
                 f"{self.last_error}; inspect bridge events/status, then cancel or use "
                 "the physical control; do not retry start"
             ) from exc
+        # Terminal may arrive during start (mirrors terminal-during-control).
+        # Also cover durable-commit failure: activity may still be coffee while
+        # phase is recovery_required -- never resurrect phase=running.
+        terminal_during_start = (
+            self.activity != "coffee"
+            or self.active_workflow_id != workflow_id
+            or self.phase in {"idle", "disconnected", "recovery_required"}
+            or self._recovery_required
+            or bool((self.last_operation or {}).get("persistence_failed"))
+            or (
+                event.state is not None
+                and event.state in TERMINAL_STATE_BYTES
+            )
+        )
+        if terminal_during_start:
+            result = {
+                "status": self.phase,
+                "activity": self.activity,
+                "workflow_id": workflow_id,
+                "state": (
+                    (self.last_operation or {}).get("result")
+                    if self.last_operation
+                    else (event.state_name if event is not None else self.phase)
+                ),
+                "terminal_during_start": True,
+                "machine_program": state.get("machine_program", "coffee-pour-over"),
+                "machine_dispenses_ice": False,
+                "manual_preload_ice_g": int(state.get("manual_preload_ice_g", 0) or 0),
+            }
+            if self.phase == "recovery_required" or self._recovery_required:
+                result["recovery_required"] = True
+                # Uncertain durable terminal: keep pending so retries never
+                # reissue start or claim a false completed running result.
+                self._fail_request(
+                    request_id,
+                    self.last_error or "terminal during start with recovery_required",
+                    keep_pending=True,
+                )
+            else:
+                self._complete_request(request_id, result)
+            return result
         self.phase = "running"
         self.last_error = None
         self._saw_active = event.state in ACTIVE_STATE_BYTES or self._saw_active
         state.update(status="running", started_at=time.time(), last_state=event.state_name)
         _atomic_json(self.coffee_state_file, state, private=True)
-        return {
+        self._set_workflow_state(
+            "running",
+            workflow_id=workflow_id,
+            event_type="started",
+            event_payload={"state": event.state_name},
+            critical=True,
+        )
+        result = {
             "status": "running",
             "state": event.state_name,
+            "workflow_id": workflow_id,
             "machine_program": state.get("machine_program", "coffee-pour-over"),
             "machine_dispenses_ice": False,
             "manual_preload_ice_g": int(state.get("manual_preload_ice_g", 0) or 0),
         }
+        self._complete_request(request_id, result)
+        return result
 
     async def _tea_load(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        request_id = self._require_request_id(params)
+        cached = self._idempotency_preflight("tea.load", params, workflow_id=None)
+        if cached is not None:
+            return cached
         self._ensure_no_loaded_record()
+        if self.active_workflow_id is not None and self.activity is not None:
+            raise BridgeError(
+                f"active workflow {self.active_workflow_id} still owns the bridge"
+            )
         raw_path = params.get("recipe")
         if not raw_path:
             raise BridgeError("tea.load requires a local recipe path")
@@ -1452,11 +2720,92 @@ class BridgeCore:
         from .tea import TeaRecipe
 
         recipe = TeaRecipe.from_yaml(path)
-        newly_connected = await self._ensure_connected(params, scope="workflow")
+        snapshot = self._snapshot_tea_recipe(recipe, path)
+        source = str(params.get("source") or "bridge")
+
+        revision_id = self._resolve_recipe_revision_id(
+            params,
+            kind="tea",
+            snapshot=snapshot,
+            name=recipe.name,
+            path_provided=True,
+        )
+        reserved = self._reserve_request("tea.load", params, workflow_id=None)
+        if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
+            return dict(reserved.get("result") or {})
+        wf = self._create_durable_workflow(
+            kind="tea",
+            snapshot=snapshot,
+            state="loading",
+            source=source,
+            owner="bridge",
+            recipe_revision_id=revision_id,
+            metadata={"recipe_path": str(path), "recipe_name": path.name},
+        )
+        workflow_id = str(wf["workflow_id"])
+        self.active_workflow_id = workflow_id
+
+        newly_connected = False
+        ble_write_attempted = False
         try:
+            newly_connected = await self._ensure_connected(params, scope="workflow")
             firmware = self._require_idle_write_preflight()
+            ble_write_attempted = True
             event = await self.client.load_tea_recipe(recipe)
-        except BaseException:
+        except BaseException as exc:
+            if ble_write_attempted:
+                self.phase = "load_unconfirmed"
+                self.activity = self.activity or "tea"
+                self.last_error = f"tea load outcome is unconfirmed: {exc}"
+                self._set_workflow_state(
+                    "load_unconfirmed",
+                    workflow_id=workflow_id,
+                    recovery={
+                        "reason": "load_unconfirmed",
+                        "request_id": request_id,
+                        "error": str(exc),
+                    },
+                    event_type="load_unconfirmed",
+                    event_payload={"error": str(exc)},
+                )
+                self._fail_request(request_id, str(exc), keep_pending=True)
+                self._recovery_required = True
+                self._recovery_detail = {
+                    "reason": "load_unconfirmed",
+                    "request_id": request_id,
+                    "workflow_id": workflow_id,
+                }
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                raise BridgeError(
+                    f"{self.last_error}; do not retry load with the same "
+                    "request_id; inspect status/events then cancel or recover"
+                ) from exc
+            try:
+                self.store.commit_workflow_terminal(
+                    workflow_id,
+                    state="load_failed",
+                    event_type="load_failed",
+                    event_payload={"error": str(exc)},
+                )
+            except StorageError as persist_exc:
+                self._recovery_required = True
+                self._recovery_detail = {
+                    "reason": "load_failed_persist_failed",
+                    "workflow_id": workflow_id,
+                    "error": str(exc),
+                    "persist_error": str(persist_exc),
+                }
+                self.phase = "recovery_required"
+                self.activity = self.activity or "tea"
+                self.last_error = (
+                    f"tea load failed before BLE write and load_failed "
+                    f"persist also failed: {persist_exc}; recovery_required"
+                )
+                self._fail_request(request_id, self.last_error, keep_pending=True)
+                raise BridgeError(self.last_error) from persist_exc
+            self.active_workflow_id = None
+            self._fail_request(request_id, str(exc), keep_pending=False)
             await self._release_auto_connect_on_preflight_failure(newly_connected)
             raise
         state = {
@@ -1468,10 +2817,15 @@ class BridgeCore:
             "status": "tea_loaded",
             "firmware": firmware,
             "owner": "bridge",
+            "workflow_id": workflow_id,
+            "snapshot_sha256": wf.get("snapshot_sha256"),
         }
         _atomic_json(self.tea_state_file, state, private=True)
         self.activity = "tea"
         self.phase = "loaded"
+        self._loaded_needs_reconcile = False
+        self._recovery_required = False
+        self._recovery_detail = None
         self.last_error = None
         if self.connection_scope != "explicit":
             self.connection_scope = "workflow"
@@ -1482,25 +2836,153 @@ class BridgeCore:
             "steeps": len(recipe.pours),
         }
         self._saw_active = False
-        return {
+        self._set_workflow_state(
+            "loaded",
+            workflow_id=workflow_id,
+            machine_phase="loaded",
+            metadata={
+                "recipe_path": str(path),
+                "recipe_name": path.name,
+                "machine_address": self.address,
+                "targets": dict(self.targets),
+            },
+            event_type="loaded",
+            event_payload={"status": "tea_loaded", "firmware": firmware},
+            critical=True,
+        )
+        result = {
             "status": "tea_loaded",
+            "state": "loaded",
+            "kind": "tea",
+            "workflow_id": workflow_id,
+            "recipe_revision_id": revision_id,
+            "snapshot_sha256": wf.get("snapshot_sha256"),
+            "source": source,
             "recipe": path.name,
             "firmware": firmware,
             "ack": event.command_code,
             "summary": recipe.summary(),
         }
+        self._complete_request(request_id, result)
+        return result
 
     async def _tea_start(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        request_id = self._require_request_id(params)
+        wid_hint = self._workflow_id_hint(params)
+        cached = self._idempotency_preflight(
+            "tea.start", params, workflow_id=wid_hint
+        )
+        if cached is not None:
+            return cached
+        workflow_id, _emergency = self._require_active_workflow(params)
         self._require_hot_water(params.get("confirmation"), TEA_READY_SENTINEL)
-        if self.activity != "tea" or self.phase != "loaded":
+        if self.activity != "tea":
             raise BridgeError("bridge has no loaded tea recipe")
-        state = _read_json(self.tea_state_file)
+        if self.phase in {"created", "loading"}:
+            raise BridgeError(
+                "recovery_required: tea workflow is created/loading "
+                "(unconfirmed); do not start"
+            )
+        if self.phase != "loaded":
+            raise BridgeError("bridge has no loaded tea recipe")
+        if self._recovery_required and not self._loaded_needs_reconcile:
+            raise BridgeError(
+                "recovery_required: tea start blocked until recovery clears"
+            )
+        reserved = self._reserve_request(
+            "tea.start", params, workflow_id=workflow_id
+        )
+        if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
+            return dict(reserved.get("result") or {})
+        if self.tea_state_file.exists():
+            state = _read_json(self.tea_state_file)
+        else:
+            wf = self.store.get_workflow(workflow_id) or {}
+            meta = dict(wf.get("metadata") or {})
+            state = {
+                "recipe_path": meta.get("recipe_path"),
+                "recipe_sha256": (wf.get("snapshot") or {}).get("_source_sha256"),
+                "workflow_id": workflow_id,
+                "status": "tea_loaded",
+            }
+            self._loaded_needs_reconcile = True
         path = Path(str(state.get("recipe_path") or ""))
-        if not path.is_file() or _sha256(path) != state.get("recipe_sha256"):
+        if not path.is_file() or (
+            state.get("recipe_sha256")
+            and _sha256(path) != state.get("recipe_sha256")
+        ):
+            self._fail_request(
+                request_id, "tea recipe changed or disappeared", keep_pending=False
+            )
             raise BridgeError("tea recipe changed or disappeared since it was loaded")
+        if not self.connected:
+            await self._ensure_connected(params, scope="workflow")
+        if self._loaded_needs_reconcile:
+            await self._reconcile_loaded_machine_state(
+                kind="tea", request_id=request_id
+            )
         self._reset_liquid_telemetry()
         self.phase = "starting"
-        event = await self.client.start_tea()
+        self._set_workflow_state(
+            "starting",
+            workflow_id=workflow_id,
+            event_type="starting",
+            event_payload={"request_id": request_id},
+            critical=True,
+        )
+        try:
+            event = await self.client.start_tea()
+        except BaseException as exc:
+            self.phase = "control_unconfirmed"
+            self.last_error = f"tea start outcome is unconfirmed: {exc}"
+            self._set_workflow_state(
+                "control_unconfirmed",
+                workflow_id=workflow_id,
+                recovery={"reason": "start_unconfirmed", "error": str(exc)},
+                event_type="start_unconfirmed",
+                event_payload={"error": str(exc)},
+            )
+            self._fail_request(request_id, str(exc), keep_pending=True)
+            self._recovery_required = True
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise BridgeError(
+                f"{self.last_error}; do not retry start"
+            ) from exc
+        terminal_during_start = (
+            self.activity != "tea"
+            or self.active_workflow_id != workflow_id
+            or self.phase in {"idle", "disconnected", "recovery_required"}
+            or self._recovery_required
+            or bool((self.last_operation or {}).get("persistence_failed"))
+            or (
+                event.state is not None
+                and event.state in TERMINAL_STATE_BYTES
+            )
+        )
+        if terminal_during_start:
+            result = {
+                "status": self.phase,
+                "activity": self.activity,
+                "workflow_id": workflow_id,
+                "state": (
+                    (self.last_operation or {}).get("result")
+                    if self.last_operation
+                    else (event.state_name if event is not None else self.phase)
+                ),
+                "ack": event.command_code,
+                "terminal_during_start": True,
+            }
+            if self.phase == "recovery_required" or self._recovery_required:
+                result["recovery_required"] = True
+                self._fail_request(
+                    request_id,
+                    self.last_error or "terminal during start with recovery_required",
+                    keep_pending=True,
+                )
+            else:
+                self._complete_request(request_id, result)
+            return result
         self.phase = "running"
         self.last_error = None
         # Dedicated tea activity reports do not consistently carry the generic
@@ -1509,13 +2991,29 @@ class BridgeCore:
         self._saw_active = True
         state.update(status="running", started_at=time.time(), last_state=event.state_name)
         _atomic_json(self.tea_state_file, state, private=True)
-        return {
+        self._set_workflow_state(
+            "running",
+            workflow_id=workflow_id,
+            event_type="started",
+            event_payload={"state": event.state_name, "ack": event.command_code},
+            critical=True,
+        )
+        result = {
             "status": "running",
             "state": event.state_name,
             "ack": event.command_code,
+            "workflow_id": workflow_id,
         }
+        self._complete_request(request_id, result)
+        return result
 
     async def _scale_start(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        request_id = self._require_request_id(params)
+        cached = self._idempotency_preflight(
+            "scale.start", params, workflow_id=None
+        )
+        if cached is not None:
+            return cached
         duration = float(params.get("duration_s", 30.0))
         raw_tare = params.get("tare", False)
         if not isinstance(raw_tare, bool):
@@ -1524,12 +3022,25 @@ class BridgeCore:
         if not 0.1 <= duration <= 3600:
             raise BridgeError("scale duration must be 0.1-3600 seconds")
         self._ensure_no_loaded_record()
+        reserved = self._reserve_request("scale.start", params, workflow_id=None)
+        if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
+            return dict(reserved.get("result") or {})
         newly_connected = await self._ensure_connected(params, scope="one-shot")
         try:
             firmware = self._require_idle_write_preflight()
-        except BaseException:
+        except BaseException as exc:
+            self._fail_request(request_id, str(exc), keep_pending=False)
             await self._release_auto_connect_on_preflight_failure(newly_connected)
             raise
+        wf = self._create_durable_workflow(
+            kind="scale",
+            snapshot={"duration_s": duration, "tare": tare},
+            state="starting",
+            source=str(params.get("source") or "bridge"),
+            metadata={"targets": {"duration_s": duration, "tare": tare}},
+        )
+        workflow_id = str(wf["workflow_id"])
+        self.active_workflow_id = workflow_id
         self.activity = "scale"
         self.phase = "starting"
         if self.connection_scope != "explicit":
@@ -1545,6 +3056,7 @@ class BridgeCore:
         async def on_ready() -> None:
             if self.activity == "scale":
                 self.phase = "running"
+                self._set_workflow_state("running", workflow_id=workflow_id)
 
         async def ignore_reading(_event: StatusEvent) -> None:
             # The permanent event listener already records and publishes it.
@@ -1559,15 +3071,17 @@ class BridgeCore:
                     on_ready=on_ready,
                 )
             except asyncio.CancelledError:
-                if self.activity == "scale":
+                # External stop/cancel owns the single terminal+idempotency
+                # commit. Do not finalize here when _stop_scale is driving.
+                if self.activity == "scale" and not self._scale_stop_in_progress:
                     self._finish_activity("stopped", release_reason="scale_stopped")
                 raise
             except Exception as exc:
-                if self.activity == "scale":
+                if self.activity == "scale" and not self._scale_stop_in_progress:
                     self._finish_activity("failed", release_reason="scale_failed")
                 self.last_error = f"scale session failed: {exc}"
             else:
-                if self.activity == "scale":
+                if self.activity == "scale" and not self._scale_stop_in_progress:
                     self._finish_activity("complete", release_reason="scale_complete")
             finally:
                 if asyncio.current_task() is self._scale_task:
@@ -1575,35 +3089,90 @@ class BridgeCore:
 
         self._scale_task = asyncio.create_task(run())
         await asyncio.sleep(0)
-        return {
+        result = {
             "status": self.phase,
             "firmware": firmware,
+            "workflow_id": workflow_id,
+            "kind": "scale",
+            "snapshot_sha256": wf.get("snapshot_sha256"),
             **target_snapshot,
         }
+        self._complete_request(request_id, result)
+        return result
 
-    async def _scale_tare(self) -> dict[str, Any]:
+    async def _scale_tare(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        params = {} if params is None else dict(params)
+        request_id = self._require_request_id(params)
+        wid_hint = self._workflow_id_hint(params)
+        cached = self._idempotency_preflight(
+            "scale.tare", params, workflow_id=wid_hint
+        )
+        if cached is not None:
+            return cached
+        workflow_id, _ = self._require_active_workflow(params)
         if self.activity != "scale" or self.phase != "running":
             raise BridgeError("scale tare requires a running scale session")
+        reserved = self._reserve_request(
+            "scale.tare", params, workflow_id=workflow_id
+        )
+        if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
+            return dict(reserved.get("result") or {})
         await self.client.tare_scale()
-        return {
+        result = {
             "status": "running",
             "activity": "scale",
+            "workflow_id": workflow_id,
             "command_write_verified": True,
             "report_observed": False,
         }
+        self._complete_request(request_id, result)
+        return result
 
-    async def _stop_scale(self, reason: str) -> dict[str, Any]:
-        task = self._scale_task
-        if task is not None and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        if self.activity == "scale":
-            # Cancelled path already finished+scheduled inside the scale task.
-            self._finish_activity(reason, release_reason="scale_stopped")
-        return {"status": "stopped", "activity": "scale"}
+    async def _stop_scale(
+        self,
+        reason: str,
+        *,
+        request_id: str | None = None,
+        emergency: bool = False,
+        workflow_id: str | None = None,
+    ) -> dict[str, Any]:
+        # Exactly one terminal commit for stop/cancel: task cancellation must
+        # not finalize before this path can supply request_id.
+        self._scale_stop_in_progress = True
+        try:
+            task = self._scale_task
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            result = {
+                "status": "stopped",
+                "activity": "scale",
+                "workflow_id": workflow_id or self.active_workflow_id,
+            }
+            if emergency:
+                result["emergency"] = True
+            if self.activity == "scale":
+                self._finish_activity(
+                    reason,
+                    release_reason="scale_stopped",
+                    emergency=emergency,
+                    request_id=request_id,
+                    idempotency_result=result if request_id else None,
+                )
+                if request_id and self.phase == "recovery_required":
+                    raise BridgeError(
+                        self.last_error
+                        or "scale stop confirmed but durable terminal commit failed"
+                    )
+            elif request_id:
+                # Natural complete/fail already terminalized; complete request only.
+                self._complete_request(request_id, result)
+            return result
+        finally:
+            self._scale_stop_in_progress = False
 
     async def _save_presets(self, params: Mapping[str, Any]) -> dict[str, Any]:
         raw_recipes = params.get("recipes")
@@ -1721,6 +3290,13 @@ class BridgeCore:
         self._grinder_timer = asyncio.create_task(timer())
 
     async def _grinder_start(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        request_id = self._require_request_id(params)
+        # Completed duplicates during cooldown must return cache before rest gate.
+        cached = self._idempotency_preflight(
+            "grinder.start", params, workflow_id=None
+        )
+        if cached is not None:
+            return cached
         self._require_grinder(params.get("confirmation"))
         size = int(params.get("size", 0))
         rpm = int(params.get("rpm", 100))
@@ -1733,12 +3309,28 @@ class BridgeCore:
             raise BridgeError("grinder runtime must be 0.1-30 seconds")
         self._ensure_no_loaded_record()
         self._check_grinder_rest()
+        reserved = self._reserve_request("grinder.start", params, workflow_id=None)
+        if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
+            return dict(reserved.get("result") or {})
         newly_connected = await self._ensure_connected(params, scope="one-shot")
         try:
             firmware = self._require_idle_write_preflight()
-        except BaseException:
+        except BaseException as exc:
+            self._fail_request(request_id, str(exc), keep_pending=False)
             await self._release_auto_connect_on_preflight_failure(newly_connected)
             raise
+        wf = self._create_durable_workflow(
+            kind="grinder",
+            snapshot={"size": size, "rpm": rpm, "seconds": seconds},
+            state="starting",
+            source=str(params.get("source") or "bridge"),
+            metadata={
+                "targets": {"size": size, "rpm": rpm, "runtime_s": seconds},
+                "machine_address": self.address,
+            },
+        )
+        workflow_id = str(wf["workflow_id"])
+        self.active_workflow_id = workflow_id
         self._write_grinder_running_record(seconds)
         self.activity = "grinder"
         self.phase = "starting"
@@ -1748,12 +3340,28 @@ class BridgeCore:
         try:
             await self.client.start_grinder_session(size, rpm)
         except Exception as exc:
+            self._fail_request(request_id, str(exc), keep_pending=True)
             await self._abort_grinder_after_control_error("start", exc)
         self.phase = "running"
         self.last_error = None
         self._grinder_remaining = seconds
         self._start_grinder_timer()
-        return {"status": "running", "firmware": firmware, **self.targets}
+        self._set_workflow_state(
+            "running",
+            workflow_id=workflow_id,
+            event_type="started",
+            event_payload={"size": size, "rpm": rpm, "seconds": seconds},
+        )
+        result = {
+            "status": "running",
+            "firmware": firmware,
+            "workflow_id": workflow_id,
+            "kind": "grinder",
+            "snapshot_sha256": wf.get("snapshot_sha256"),
+            **self.targets,
+        }
+        self._complete_request(request_id, result)
+        return result
 
     async def _abort_grinder_after_control_error(
         self, operation: str, cause: Exception
@@ -1807,6 +3415,12 @@ class BridgeCore:
         self._water_timer = asyncio.create_task(timer())
 
     async def _water_start(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        request_id = self._require_request_id(params)
+        cached = self._idempotency_preflight(
+            "water.start", params, workflow_id=None
+        )
+        if cached is not None:
+            return cached
         self._require_hot_water(params.get("confirmation"), WATER_READY_SENTINEL)
         volume = float(params.get("volume_ml", 0))
         temp = int(params.get("temp_c", -1))
@@ -1827,6 +3441,9 @@ class BridgeCore:
         if source not in {"auto", "tank", "tap"}:
             raise BridgeError("water source must be auto, tank, or tap")
         self._ensure_no_loaded_record()
+        reserved = self._reserve_request("water.start", params, workflow_id=None)
+        if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
+            return dict(reserved.get("result") or {})
         newly_connected = await self._ensure_connected(params, scope="one-shot")
         try:
             firmware = self._require_idle_write_preflight()
@@ -1834,10 +3451,26 @@ class BridgeCore:
                 source = str(self.machine_info.get("water_source") or "")
             if source not in {"tank", "tap"}:
                 raise BridgeError("water source must be tank/tap or readable via auto")
-        except BaseException:
+        except BaseException as exc:
+            self._fail_request(request_id, str(exc), keep_pending=False)
             await self._release_auto_connect_on_preflight_failure(newly_connected)
             raise
         water_feed = {"tank": 0, "tap": 1}[source]
+        wf = self._create_durable_workflow(
+            kind="water",
+            snapshot={
+                "volume_ml": volume,
+                "temp_c": temp,
+                "flow_ml_s": flow,
+                "pattern": pattern,
+                "water_source": source,
+            },
+            state="starting",
+            source=str(params.get("source") or "bridge"),
+            metadata={"machine_address": self.address},
+        )
+        workflow_id = str(wf["workflow_id"])
+        self.active_workflow_id = workflow_id
         self.activity = "water"
         self.phase = "starting"
         if self.connection_scope != "explicit":
@@ -1871,20 +3504,47 @@ class BridgeCore:
                 self.last_error = (
                     f"water start failed and STOP/QUIT is unconfirmed: {stop_exc}"
                 )
+                self._fail_request(request_id, str(stop_exc), keep_pending=True)
                 raise BridgeError(self.last_error) from stop_exc
             self._finish_activity(
                 "start_failed_stopped", release_reason="water_confirmed_stop"
             )
             self.last_error = "water start failed; STOP/QUIT was confirmed"
+            self._fail_request(request_id, self.last_error, keep_pending=False)
             raise BridgeError(self.last_error) from exc
         self.phase = "running"
         self.last_error = None
         self._start_water_timer(float(self.targets["safety_timeout_s"]))
-        return {"status": "running", "firmware": firmware, **self.targets}
+        self._set_workflow_state(
+            "running",
+            workflow_id=workflow_id,
+            event_type="started",
+            event_payload={"volume_ml": volume, "temp_c": temp},
+        )
+        result = {
+            "status": "running",
+            "firmware": firmware,
+            "workflow_id": workflow_id,
+            "kind": "water",
+            "snapshot_sha256": wf.get("snapshot_sha256"),
+            **self.targets,
+        }
+        self._complete_request(request_id, result)
+        return result
 
-    async def _pause(self) -> dict[str, Any]:
+    async def _pause(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        params = {} if params is None else dict(params)
+        request_id = self._require_request_id(params)
+        wid_hint = self._workflow_id_hint(params)
+        cached = self._idempotency_preflight("pause", params, workflow_id=wid_hint)
+        if cached is not None:
+            return cached
+        workflow_id, _ = self._require_active_workflow(params)
         if self.activity not in {"coffee", "grinder", "water"} or self.phase != "running":
             raise BridgeError("pause requires a running coffee, grinder, or water activity")
+        reserved = self._reserve_request("pause", params, workflow_id=workflow_id)
+        if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
+            return dict(reserved.get("result") or {})
         activity = self.activity
         try:
             if activity == "coffee":
@@ -1902,27 +3562,89 @@ class BridgeCore:
                 event = await self.client.pause_water()
         except Exception as exc:
             if activity == "grinder":
+                self._fail_request(request_id, str(exc), keep_pending=True)
                 await self._abort_grinder_after_control_error("pause", exc)
             self.phase = "control_unconfirmed"
             self.last_error = f"{activity} pause outcome is unconfirmed: {exc}"
+            self._set_workflow_state(
+                "control_unconfirmed",
+                workflow_id=workflow_id,
+                recovery={"reason": "pause_unconfirmed", "error": str(exc)},
+            )
+            self._fail_request(request_id, str(exc), keep_pending=True)
             raise BridgeError(
                 f"{self.last_error}; use bridge cancel or the physical control"
             ) from exc
-        if self.activity != activity:
-            return {
+        terminal_during_control = (
+            self.activity != activity
+            or self.active_workflow_id != workflow_id
+            or self.phase in {"idle", "disconnected", "recovery_required"}
+            or self._recovery_required
+            or bool((self.last_operation or {}).get("persistence_failed"))
+            or (
+                getattr(event, "state", None) is not None
+                and event.state in TERMINAL_STATE_BYTES
+            )
+        )
+        if terminal_during_control:
+            result = {
                 "status": self.phase,
                 "activity": self.activity,
+                "workflow_id": workflow_id,
                 "ack": event.command_code,
                 "terminal_during_control": True,
+                "state": (
+                    (self.last_operation or {}).get("result")
+                    if self.last_operation
+                    else self.phase
+                ),
             }
+            if self.phase == "recovery_required" or self._recovery_required:
+                result["recovery_required"] = True
+                self._fail_request(
+                    request_id,
+                    self.last_error
+                    or "terminal during pause with recovery_required",
+                    keep_pending=True,
+                )
+            else:
+                self._complete_request(request_id, result)
+            return result
         self.phase = "paused"
-        return {"status": "paused", "activity": activity, "ack": event.command_code}
+        self._set_workflow_state(
+            "paused",
+            workflow_id=workflow_id,
+            event_type="paused",
+            event_payload={"activity": activity},
+            critical=True,
+        )
+        result = {
+            "status": "paused",
+            "activity": activity,
+            "workflow_id": workflow_id,
+            "ack": event.command_code,
+        }
+        self._complete_request(request_id, result)
+        return result
 
-    async def _resume(self) -> dict[str, Any]:
+    async def _resume(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        params = {} if params is None else dict(params)
+        request_id = self._require_request_id(params)
+        wid_hint = self._workflow_id_hint(params)
+        cached = self._idempotency_preflight("resume", params, workflow_id=wid_hint)
+        if cached is not None:
+            return cached
+        workflow_id, _ = self._require_active_workflow(params)
         if self.activity not in {"coffee", "grinder", "water"} or self.phase != "paused":
             raise BridgeError("resume requires a paused coffee, grinder, or water activity")
+        reserved = self._reserve_request("resume", params, workflow_id=workflow_id)
+        if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
+            return dict(reserved.get("result") or {})
         activity = self.activity
         if activity == "grinder" and self._grinder_remaining <= 0:
+            self._fail_request(
+                request_id, "grinder runtime exhausted", keep_pending=False
+            )
             raise BridgeError("grinder runtime is already exhausted; stop it")
         try:
             if activity == "coffee":
@@ -1934,23 +3656,79 @@ class BridgeCore:
                 event = await self.client.resume_water()
         except Exception as exc:
             if activity == "grinder":
+                self._fail_request(request_id, str(exc), keep_pending=True)
                 await self._abort_grinder_after_control_error("resume", exc)
             self.phase = "control_unconfirmed"
             self.last_error = f"{activity} resume outcome is unconfirmed: {exc}"
+            self._set_workflow_state(
+                "control_unconfirmed",
+                workflow_id=workflow_id,
+                recovery={"reason": "resume_unconfirmed", "error": str(exc)},
+            )
+            self._fail_request(request_id, str(exc), keep_pending=True)
             raise BridgeError(
                 f"{self.last_error}; use bridge cancel or the physical control"
             ) from exc
-        if self.activity != activity:
-            return {
+        terminal_during_control = (
+            self.activity != activity
+            or self.active_workflow_id != workflow_id
+            or self.phase in {"idle", "disconnected", "recovery_required"}
+            or self._recovery_required
+            or bool((self.last_operation or {}).get("persistence_failed"))
+            or (
+                getattr(event, "state", None) is not None
+                and event.state in TERMINAL_STATE_BYTES
+            )
+        )
+        if terminal_during_control:
+            result = {
                 "status": self.phase,
                 "activity": self.activity,
+                "workflow_id": workflow_id,
                 "ack": event.command_code,
                 "terminal_during_control": True,
+                "state": (
+                    (self.last_operation or {}).get("result")
+                    if self.last_operation
+                    else self.phase
+                ),
             }
+            if self.phase == "recovery_required" or self._recovery_required:
+                result["recovery_required"] = True
+                self._fail_request(
+                    request_id,
+                    self.last_error
+                    or "terminal during resume with recovery_required",
+                    keep_pending=True,
+                )
+            else:
+                self._complete_request(request_id, result)
+            return result
         self.phase = "running"
-        return {"status": "running", "activity": activity, "ack": event.command_code}
+        self._set_workflow_state(
+            "running",
+            workflow_id=workflow_id,
+            event_type="resumed",
+            event_payload={"activity": activity},
+            critical=True,
+        )
+        result = {
+            "status": "running",
+            "activity": activity,
+            "workflow_id": workflow_id,
+            "ack": event.command_code,
+        }
+        self._complete_request(request_id, result)
+        return result
 
-    async def _stop_grinder(self, reason: str) -> dict[str, Any]:
+    async def _stop_grinder(
+        self,
+        reason: str,
+        *,
+        request_id: str | None = None,
+        emergency: bool = False,
+        workflow_id: str | None = None,
+    ) -> dict[str, Any]:
         self.phase = "stopping"
         self._cancel_grinder_timer()
         try:
@@ -1958,12 +3736,40 @@ class BridgeCore:
         except Exception as exc:
             self.phase = "stop_unconfirmed"
             self.last_error = f"grinder STOP/QUIT is unconfirmed: {exc}"
+            if request_id:
+                self._fail_request(request_id, str(exc), keep_pending=True)
             raise BridgeError(self.last_error) from exc
         self._write_grinder_stopped_record()
-        self._finish_activity(reason, release_reason="grinder_confirmed_stop")
-        return {"status": "stopped", "activity": "grinder", "ack": event.command_code}
+        result = {
+            "status": "stopped",
+            "activity": "grinder",
+            "ack": event.command_code,
+            "workflow_id": workflow_id or self.active_workflow_id,
+        }
+        if emergency:
+            result["emergency"] = True
+        self._finish_activity(
+            reason,
+            release_reason="grinder_confirmed_stop",
+            emergency=emergency,
+            request_id=request_id,
+            idempotency_result=result if request_id else None,
+        )
+        if request_id and self.phase == "recovery_required":
+            raise BridgeError(
+                self.last_error
+                or "grinder stop confirmed but durable terminal commit failed"
+            )
+        return result
 
-    async def _stop_water(self, reason: str) -> dict[str, Any]:
+    async def _stop_water(
+        self,
+        reason: str,
+        *,
+        request_id: str | None = None,
+        emergency: bool = False,
+        workflow_id: str | None = None,
+    ) -> dict[str, Any]:
         self.phase = "stopping"
         self._cancel_water_timer()
         target = float(self.targets.get("volume_ml", 0.0))
@@ -1974,14 +3780,32 @@ class BridgeCore:
         except Exception as exc:
             self.phase = "stop_unconfirmed"
             self.last_error = f"water STOP/QUIT is unconfirmed: {exc}"
+            if request_id:
+                self._fail_request(request_id, str(exc), keep_pending=True)
             raise BridgeError(self.last_error) from exc
+        result = {
+            "status": "stopped",
+            "activity": "water",
+            "ack": event.command_code,
+            "workflow_id": workflow_id or self.active_workflow_id,
+        }
+        if emergency:
+            result["emergency"] = True
         self._finish_activity(
             reason,
             release_reason="water_confirmed_stop",
+            emergency=emergency,
+            request_id=request_id,
+            idempotency_result=result if request_id else None,
             target_volume_ml=target,
             metered_volume_ml=metered,
         )
-        return {"status": "stopped", "activity": "water", "ack": event.command_code}
+        if request_id and self.phase == "recovery_required":
+            raise BridgeError(
+                self.last_error
+                or "water stop confirmed but durable terminal commit failed"
+            )
+        return result
 
     async def _recover_loaded_record(self) -> dict[str, Any] | None:
         records = [
@@ -2022,62 +3846,189 @@ class BridgeCore:
             "record_cleared": True,
         }
 
-    async def _stop(self) -> dict[str, Any]:
+    async def _stop(
+        self,
+        params: Mapping[str, Any] | None = None,
+        *,
+        rpc_method: str = "cancel",
+    ) -> dict[str, Any]:
+        params = {} if params is None else dict(params)
+        request_id = self._require_request_id(params)
+        emergency = bool(params.get("emergency"))
+        # Preserve the actual RPC method identity for stop vs cancel. Emergency
+        # is a param; it must not silently rename the idempotency method.
+        method_name = rpc_method if rpc_method in {"stop", "cancel"} else "cancel"
+        wid_hint = self._workflow_id_hint(params)
+        # Exact completed duplicates after terminal return cache before activity gates.
+        cached = self._idempotency_preflight(
+            method_name, params, workflow_id=wid_hint
+        )
+        if cached is not None:
+            return cached
+        # Legacy JSON recovery without an in-memory activity: allow without
+        # matching workflow_id (explicit recovery path).
         if self.activity is None:
-            recovered = await self._recover_loaded_record()
-            if recovered is not None:
-                return recovered
+            if self.coffee_state_file.exists() or self.tea_state_file.exists():
+                reserved = self._reserve_request(
+                    method_name, params, workflow_id=self.active_workflow_id
+                )
+                if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
+                    return dict(reserved.get("result") or {})
+                recovered = await self._recover_loaded_record()
+                if recovered is not None:
+                    recovered = dict(recovered)
+                    recovered["workflow_id"] = self.active_workflow_id
+                    if emergency:
+                        recovered["emergency"] = True
+                    self._complete_request(request_id, recovered)
+                    return recovered
             raise BridgeError("there is no bridge-owned activity to stop")
+
+        workflow_id, used_emergency = self._require_active_workflow(
+            params, emergency=emergency
+        )
+        reserved = self._reserve_request(
+            method_name,
+            params,
+            workflow_id=workflow_id or self.active_workflow_id,
+        )
+        if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
+            return dict(reserved.get("result") or {})
+
         if self.activity == "coffee":
             self.phase = "stopping"
+            if not self.connected:
+                await self._ensure_connected(params, scope="workflow")
             try:
                 await self.client.cancel_brew()
             except Exception as exc:
                 self.phase = "stop_unconfirmed"
                 self.last_error = f"coffee cancel is unconfirmed: {exc}"
+                self._set_workflow_state(
+                    "stop_unconfirmed",
+                    recovery={"reason": "cancel_unconfirmed", "error": str(exc)},
+                )
+                self._fail_request(request_id, str(exc), keep_pending=True)
                 raise BridgeError(self.last_error) from exc
             _unlink(self.coffee_state_file)
-            self._finish_activity("cancel_sent", release_reason="cancel")
-            return {"status": "cancel_sent", "activity": "coffee"}
+            result = {
+                "status": "cancel_sent",
+                "activity": "coffee",
+                "workflow_id": workflow_id or None,
+            }
+            if used_emergency:
+                result["emergency"] = True
+            self._finish_activity(
+                "cancel_sent",
+                release_reason="cancel",
+                emergency=used_emergency,
+                request_id=request_id,
+                idempotency_result=result,
+            )
+            if self.phase == "recovery_required":
+                raise BridgeError(
+                    self.last_error
+                    or "cancel confirmed but durable terminal commit failed"
+                )
+            return result
         if self.activity == "tea":
             self.phase = "stopping"
+            if not self.connected:
+                await self._ensure_connected(params, scope="workflow")
             try:
                 await self.client.unload_tea_recipe()
             except Exception as exc:
                 self.phase = "stop_unconfirmed"
                 self.last_error = f"tea cancel/exit is unconfirmed: {exc}"
+                self._set_workflow_state(
+                    "stop_unconfirmed",
+                    recovery={"reason": "cancel_unconfirmed", "error": str(exc)},
+                )
+                self._fail_request(request_id, str(exc), keep_pending=True)
                 raise BridgeError(self.last_error) from exc
             _unlink(self.tea_state_file)
-            self._finish_activity("cancel_sent", release_reason="cancel")
-            return {"status": "cancel_sent", "activity": "tea"}
+            result = {
+                "status": "cancel_sent",
+                "activity": "tea",
+                "workflow_id": workflow_id or None,
+            }
+            if used_emergency:
+                result["emergency"] = True
+            self._finish_activity(
+                "cancel_sent",
+                release_reason="cancel",
+                emergency=used_emergency,
+                request_id=request_id,
+                idempotency_result=result,
+            )
+            if self.phase == "recovery_required":
+                raise BridgeError(
+                    self.last_error
+                    or "cancel confirmed but durable terminal commit failed"
+                )
+            return result
         if self.activity == "scale":
-            return await self._stop_scale("stopped")
+            result = await self._stop_scale(
+                "stopped",
+                request_id=request_id,
+                emergency=used_emergency,
+                workflow_id=workflow_id or self.active_workflow_id,
+            )
+            return result
         if self.activity == "grinder":
-            return await self._stop_grinder("stopped")
+            result = await self._stop_grinder(
+                "stopped",
+                request_id=request_id,
+                emergency=used_emergency,
+                workflow_id=workflow_id or None,
+            )
+            return result
         if self.activity == "water":
-            return await self._stop_water("stopped")
+            result = await self._stop_water(
+                "stopped",
+                request_id=request_id,
+                emergency=used_emergency,
+                workflow_id=workflow_id or None,
+            )
+            return result
         raise BridgeError(f"stop is not implemented for activity {self.activity}")
 
     async def _set_water_temperature(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        request_id = self._require_request_id(params)
+        wid_hint = self._workflow_id_hint(params)
+        cached = self._idempotency_preflight(
+            "water.set_temperature", params, workflow_id=wid_hint
+        )
+        if cached is not None:
+            return cached
+        workflow_id, _ = self._require_active_workflow(params)
         self._require_live_adjust(params.get("confirmation"))
         if self.activity != "water" or self.phase not in {"running", "paused"}:
             raise BridgeError("temperature adjustment requires running/paused FreeSolo water")
+        reserved = self._reserve_request(
+            "water.set_temperature", params, workflow_id=workflow_id
+        )
+        if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
+            return dict(reserved.get("result") or {})
         temp = int(params.get("temp_c", -1))
         if temp != ROOM_TEMPERATURE_C and not 40 <= temp <= 98:
+            self._fail_request(request_id, "invalid temp", keep_pending=False)
             raise BridgeError("water temperature must be RT or 40-98 C")
         try:
             event = await self.client.set_water_temperature(temp)
         except Exception as exc:
             self.phase = "control_unconfirmed"
             self.last_error = f"water temperature adjustment outcome is unconfirmed: {exc}"
+            self._fail_request(request_id, str(exc), keep_pending=True)
             raise BridgeError(
                 f"{self.last_error}; use bridge cancel or the physical control"
             ) from exc
         self.targets["temp_c"] = temp
         self.targets["temp_setting"] = "RT" if temp == ROOM_TEMPERATURE_C else f"{temp} C"
-        return {
+        result = {
             "status": self.phase,
             "activity": "water",
+            "workflow_id": workflow_id,
             "target_temp_c": temp,
             "report": event.command_code if event is not None else None,
             "report_observed": event is not None,
@@ -2087,13 +4038,29 @@ class BridgeCore:
             # correct BLE write is not a physical outlet-temperature measure.
             "hardware_effect_verified": False,
         }
+        self._complete_request(request_id, result)
+        return result
 
     async def _set_water_pattern(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        request_id = self._require_request_id(params)
+        wid_hint = self._workflow_id_hint(params)
+        cached = self._idempotency_preflight(
+            "water.set_pattern", params, workflow_id=wid_hint
+        )
+        if cached is not None:
+            return cached
+        workflow_id, _ = self._require_active_workflow(params)
         self._require_live_adjust(params.get("confirmation"))
         if self.activity != "water" or self.phase not in {"running", "paused"}:
             raise BridgeError("pattern adjustment requires running/paused FreeSolo water")
+        reserved = self._reserve_request(
+            "water.set_pattern", params, workflow_id=workflow_id
+        )
+        if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
+            return dict(reserved.get("result") or {})
         pattern = str(params.get("pattern", ""))
         if pattern not in {"center", "spiral", "circular", "ring"}:
+            self._fail_request(request_id, "invalid pattern", keep_pending=False)
             raise BridgeError("pattern must be center, spiral, or circular")
         if pattern == "ring":
             pattern = "circular"
@@ -2102,28 +4069,36 @@ class BridgeCore:
         except Exception as exc:
             self.phase = "control_unconfirmed"
             self.last_error = f"water pattern adjustment outcome is unconfirmed: {exc}"
+            self._fail_request(request_id, str(exc), keep_pending=True)
             raise BridgeError(
                 f"{self.last_error}; use bridge cancel or the physical control"
             ) from exc
         self.targets["pattern"] = pattern
         firmware = str(self.machine_info.get("firmware") or "")
         verified = firmware in LIVE_PATTERN_VERIFIED_FIRMWARE
-        return {
+        result = {
             "status": self.phase,
             "activity": "water",
+            "workflow_id": workflow_id,
             "target_pattern": pattern,
             "report": event.command_code if event is not None else None,
             "report_observed": event is not None,
             "hardware_effect_verified": verified,
             "verified_firmware": firmware if verified else None,
         }
+        self._complete_request(request_id, result)
+        return result
 
     async def rpc(self, method: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         params = {} if params is None else dict(params)
         if method in {"ping", "status"}:
             return self.status()
         if method == "events":
-            return self.events_since(int(params.get("since", 0)))
+            workflow_id = params.get("workflow_id")
+            return self.events_since(
+                int(params.get("since", 0)),
+                workflow_id=str(workflow_id) if workflow_id else None,
+            )
         async with self._op_lock:
             if method == "connect":
                 return await self._connect_unlocked(params, scope="explicit")
@@ -2148,7 +4123,7 @@ class BridgeCore:
             if method == "scale.start":
                 return await self._scale_start(params)
             if method == "scale.tare":
-                return await self._scale_tare()
+                return await self._scale_tare(params)
             if method == "presets.save":
                 return await self._save_presets(params)
             if method == "grinder.start":
@@ -2156,11 +4131,11 @@ class BridgeCore:
             if method == "water.start":
                 return await self._water_start(params)
             if method == "pause":
-                return await self._pause()
+                return await self._pause(params)
             if method == "resume":
-                return await self._resume()
+                return await self._resume(params)
             if method in {"stop", "cancel"}:
-                return await self._stop()
+                return await self._stop(params, rpc_method=method)
             if method == "water.set_temperature":
                 return await self._set_water_temperature(params)
             if method == "water.set_pattern":
@@ -2174,12 +4149,40 @@ class BridgeCore:
                     raise BridgeError(
                         f"bridge owns {self.activity}:{self.phase}; stop/cancel before shutdown"
                     )
-                await self._stop()
+                await self._stop(
+                    {
+                        "request_id": f"shutdown_{uuid4().hex}",
+                        "emergency": True,
+                        "workflow_id": self.active_workflow_id,
+                    }
+                )
             elif force and (self.coffee_state_file.exists() or self.tea_state_file.exists()):
-                await self._stop()
+                await self._stop(
+                    {
+                        "request_id": f"shutdown_{uuid4().hex}",
+                        "emergency": True,
+                        "workflow_id": self.active_workflow_id,
+                    }
+                )
             self._cancel_pending_release()
             if self.connected:
-                await self._disconnect_unlocked(reason="shutdown")
+                # Force shutdown may still own a recovery activity; drop the
+                # link without requiring idle (durable recovery is retained).
+                await self._disconnect_unlocked(
+                    reason="shutdown",
+                    require_idle_activity=not force,
+                )
+            if force and self.activity is not None:
+                # Last resort: clear process-local activity without claiming a
+                # successful machine stop or rolling back durable terminal.
+                self.activity = None
+                self.phase = "disconnected"
+                self.targets = {}
+            if self._store_owned:
+                try:
+                    self.store.close()
+                except Exception:
+                    pass
 
 
 class BridgeServer:
@@ -2441,7 +4444,7 @@ class BridgeServer:
         try:
             # Even with the OS lock held, a lockless/legacy peer may still be
             # answering on a live record. Probe before unlinking.
-            # Self-owned only when *both* token and instance_id match — token
+            # Self-owned only when *both* token and instance_id match -- token
             # collision/reuse must not clobber a responsive different instance.
             # Run the probe in a worker thread so a same-loop test/legacy peer
             # can still accept the diagnostic connection.
@@ -2997,7 +5000,7 @@ def _upgrade_or_reuse_running_daemon(
         status["idle_restart_recommended"] = True
         status["status"] = "config_mismatch_idle"
         status["message"] = (
-            "running daemon config fingerprint differs; daemon is idle — "
+            "running daemon config fingerprint differs; daemon is idle -- "
             "call restart-if-idle to apply the client config"
         )
         return _mark_lifecycle_result(status, client_ready=True, ensured=True)
@@ -3102,7 +5105,7 @@ def start_bridge_daemon(
         except BridgeError:
             existing = {}
         if existing and _probe_record_responsive(existing, timeout=0.5):
-            # Live peer without us holding its lock — do not race it.
+            # Live peer without us holding its lock -- do not race it.
             # Route through the same compatibility/upgrade decision path.
             return _upgrade_or_reuse_running_daemon(
                 path=path,

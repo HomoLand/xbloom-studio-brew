@@ -352,11 +352,12 @@ def test_start_bridge_daemon_compat_signature_ignores_script_path(tmp_path, monk
     stop_bridge_daemon(state_root=tmp_path)
 
 
-def test_protocol_version_is_v2():
-    assert BRIDGE_PROTOCOL_VERSION == 2
-    assert RPC_PROTOCOL_MIN == 2
-    assert RPC_PROTOCOL_MAX == 2
-    assert RPC_PROTOCOL_CURRENT == 2
+def test_protocol_version_is_v3():
+    # v3: mutating RPCs require request_id; workflow-bound control requires workflow_id.
+    assert BRIDGE_PROTOCOL_VERSION == 3
+    assert RPC_PROTOCOL_MIN == 3
+    assert RPC_PROTOCOL_MAX == 3
+    assert RPC_PROTOCOL_CURRENT == 3
     assert BRIDGE_RECORD_FORMAT_VERSION == 2
 
 

@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -31,6 +32,26 @@ from xbloom_ble.bridge import (
     bridge_call,
 )
 from xbloom_ble.telemetry import StatusEvent
+import xbloom_storage as storage
+
+
+def _rid(prefix: str = "req") -> str:
+    return f"{prefix}_{uuid4().hex}"
+
+
+def _with_ids(
+    params: dict | None = None,
+    *,
+    workflow_id: str | None = None,
+    request_id: str | None = None,
+    **extra,
+) -> dict:
+    body = dict(params or {})
+    body.update(extra)
+    body["request_id"] = request_id or _rid()
+    if workflow_id is not None:
+        body["workflow_id"] = workflow_id
+    return body
 
 
 def _event(
@@ -65,7 +86,13 @@ class FakeBridgeClient:
         self.calls = []
         self.fail_grinder_pause = False
         self.fail_coffee_start = False
+        self.fail_coffee_load = False
+        self.fail_tea_load = False
         self.coffee_terminal_on_pause = False
+        self.coffee_terminal_on_resume = False
+        self.coffee_terminal_on_start = False
+        self.status_state: int | None = None
+        self.status_state_name: str | None = None
         self.machine_info = {
             "serial_number": "private",
             "firmware": "V12.0D.500",
@@ -104,13 +131,23 @@ class FakeBridgeClient:
 
     async def request_status(self):
         self.calls.append("request_status")
-        self.emit(
-            _event(
-                command=40521,
-                name="machine_info",
-                machine_info=dict(self.machine_info),
+        if self.status_state is not None:
+            self.emit(
+                _event(
+                    command=40521,
+                    state=self.status_state,
+                    name=self.status_state_name or "status",
+                    machine_info=dict(self.machine_info),
+                )
             )
-        )
+        else:
+            self.emit(
+                _event(
+                    command=40521,
+                    name="machine_info",
+                    machine_info=dict(self.machine_info),
+                )
+            )
 
     async def read_machine_info(self):
         self.calls.append("read_machine_info")
@@ -134,6 +171,8 @@ class FakeBridgeClient:
 
     async def load_recipe(self, recipe):
         self.calls.append(("load_recipe", recipe.name))
+        if self.fail_coffee_load:
+            raise RuntimeError("load acknowledgement lost")
         event = _event(state=0x1F, name="armed")
         self.emit(event)
         return event
@@ -142,6 +181,11 @@ class FakeBridgeClient:
         self.calls.append("coffee_start")
         if self.fail_coffee_start:
             raise RuntimeError("start acknowledgement lost")
+        if self.coffee_terminal_on_start:
+            # Active then terminal while start is in-flight (before return).
+            self.emit(_event(state=0x22, name="starting"))
+            self.emit(_event(state=0x24, name="ready"))
+            return _event(state=0x24, name="ready")
         event = _event(state=0x22, name="starting")
         self.emit(event)
         return event
@@ -154,6 +198,9 @@ class FakeBridgeClient:
 
     async def resume_coffee(self):
         self.calls.append("coffee_resume")
+        if self.coffee_terminal_on_resume:
+            self.emit(_event(state=0x24, name="ready"))
+            return _event(command=40524, state=0x24, name="ready")
         return _event(command=40524)
 
     async def cancel_brew(self):
@@ -161,6 +208,8 @@ class FakeBridgeClient:
 
     async def load_tea_recipe(self, recipe):
         self.calls.append(("tea_load", recipe.name))
+        if self.fail_tea_load:
+            raise RuntimeError("tea load acknowledgement lost")
         event = _event(command=4513, name="tea_recipe_code")
         self.emit(event)
         return event
@@ -306,17 +355,24 @@ def test_coffee_lifecycle_uses_one_held_client(tmp_path):
         assert connected["connected"] is True
         assert "serial_number" not in core.machine_info
 
-        loaded = await core.rpc("coffee.load", {"recipe": str(recipe)})
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
         assert loaded["status"] == "armed"
+        assert loaded["workflow_id"]
         assert core.coffee_state_file.exists()
+        wid = loaded["workflow_id"]
 
-        await core.rpc("coffee.start", {"confirmation": READY_SENTINEL})
+        await core.rpc(
+            "coffee.start",
+            _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+        )
         assert core.status()["phase"] == "running"
-        await core.rpc("pause")
+        await core.rpc("pause", _with_ids(workflow_id=wid))
         assert core.status()["phase"] == "paused"
-        await core.rpc("resume")
+        await core.rpc("resume", _with_ids(workflow_id=wid))
         assert core.status()["phase"] == "running"
-        await core.rpc("cancel")
+        await core.rpc("cancel", _with_ids(workflow_id=wid))
         assert core.status()["activity"] is None
         assert not core.coffee_state_file.exists()
         await core.shutdown()
@@ -332,9 +388,20 @@ def test_coffee_start_failure_requires_recovery_instead_of_retry(tmp_path):
     recipe = _recipe(tmp_path / "recipe.yaml")
 
     async def go():
-        await core.rpc("coffee.load", {"recipe": str(recipe)})
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        start_req = _rid("start")
         with pytest.raises(BridgeError, match="do not retry start"):
-            await core.rpc("coffee.start", {"confirmation": READY_SENTINEL})
+            await core.rpc(
+                "coffee.start",
+                _with_ids(
+                    {"confirmation": READY_SENTINEL},
+                    workflow_id=wid,
+                    request_id=start_req,
+                ),
+            )
 
         status = core.status()
         assert status["activity"] == "coffee"
@@ -344,11 +411,26 @@ def test_coffee_start_failure_requires_recovery_instead_of_retry(tmp_path):
         assert "start_requested_at" in saved
         assert "start_unconfirmed_at" in saved
 
+        # Same pending request_id must not reissue start.
+        with pytest.raises(BridgeError, match="recovery_required|do not retry"):
+            await core.rpc(
+                "coffee.start",
+                _with_ids(
+                    {"confirmation": READY_SENTINEL},
+                    workflow_id=wid,
+                    request_id=start_req,
+                ),
+            )
+        assert fake.calls.count("coffee_start") == 1
+        # Fresh request_id while phase is not loaded is also rejected (no BLE).
         with pytest.raises(BridgeError, match="no loaded coffee recipe"):
-            await core.rpc("coffee.start", {"confirmation": READY_SENTINEL})
+            await core.rpc(
+                "coffee.start",
+                _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+            )
         assert fake.calls.count("coffee_start") == 1
 
-        await core.rpc("cancel")
+        await core.rpc("cancel", _with_ids(workflow_id=wid))
         assert not core.coffee_state_file.exists()
         await core.shutdown()
 
@@ -361,9 +443,15 @@ def test_coffee_terminal_during_pause_does_not_restore_stale_paused_state(tmp_pa
     recipe = _recipe(tmp_path / "recipe.yaml")
 
     async def go():
-        await core.rpc("coffee.load", {"recipe": str(recipe)})
-        await core.rpc("coffee.start", {"confirmation": READY_SENTINEL})
-        result = await core.rpc("pause")
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        await core.rpc(
+            "coffee.start",
+            _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+        )
+        result = await core.rpc("pause", _with_ids(workflow_id=wid))
         assert result["terminal_during_control"] is True
         assert core.status()["activity"] is None
         assert core.status()["phase"] == "idle"
@@ -394,12 +482,10 @@ def test_cancel_recovers_loaded_record_after_bridge_restart(
     )
 
     async def go():
-        result = await core.rpc("cancel")
-        assert result == {
-            "status": "recovery_cancel_sent",
-            "activity": kind,
-            "record_cleared": True,
-        }
+        result = await core.rpc("cancel", _with_ids())
+        assert result["status"] == "recovery_cancel_sent"
+        assert result["activity"] == kind
+        assert result["record_cleared"] is True
         assert not record.exists()
         await core.shutdown()
 
@@ -412,12 +498,17 @@ def test_tea_lifecycle_stays_on_held_connection_and_finishes_on_terminal(tmp_pat
     recipe = _tea_recipe(tmp_path / "tea.yaml")
 
     async def go():
-        loaded = await core.rpc("tea.load", {"recipe": str(recipe)})
+        loaded = await core.rpc(
+            "tea.load", _with_ids({"recipe": str(recipe)})
+        )
         assert loaded["status"] == "tea_loaded"
+        assert loaded["workflow_id"]
         assert core.tea_state_file.exists()
+        wid = loaded["workflow_id"]
 
         started = await core.rpc(
-            "tea.start", {"confirmation": TEA_READY_SENTINEL}
+            "tea.start",
+            _with_ids({"confirmation": TEA_READY_SENTINEL}, workflow_id=wid),
         )
         assert started["ack"] == 4512
         fake.emit(
@@ -445,15 +536,17 @@ def test_scale_runs_in_background_supports_retare_and_cancel(tmp_path):
 
     async def go():
         started = await core.rpc(
-            "scale.start", {"duration_s": 10, "tare": False}
+            "scale.start", _with_ids({"duration_s": 10, "tare": False})
         )
         assert started["entry_auto_zero"] is True
+        assert started["workflow_id"]
+        wid = started["workflow_id"]
         await asyncio.sleep(0)
         assert core.status()["activity"] == "scale"
         assert core.status()["telemetry"]["scale_g"] == 12.34
-        tare = await core.rpc("scale.tare")
+        tare = await core.rpc("scale.tare", _with_ids(workflow_id=wid))
         assert tare["command_write_verified"] is True
-        await core.rpc("cancel")
+        await core.rpc("cancel", _with_ids(workflow_id=wid))
         assert core.status()["activity"] is None
         assert core.status()["last_operation"]["result"] == "stopped"
         await core.shutdown()
@@ -539,11 +632,13 @@ def test_local_validation_and_recovery_records_block_before_ble_connect(tmp_path
         with pytest.raises(BridgeError, match="volume must be 20-360"):
             await core.rpc(
                 "water.start",
-                {
-                    "volume_ml": 500,
-                    "temp_c": 85,
-                    "confirmation": WATER_READY_SENTINEL,
-                },
+                _with_ids(
+                    {
+                        "volume_ml": 500,
+                        "temp_c": 85,
+                        "confirmation": WATER_READY_SENTINEL,
+                    }
+                ),
             )
     asyncio.run(go())
     assert fake.calls == []
@@ -553,22 +648,28 @@ def test_freesolo_water_live_adjust_is_separately_gated(tmp_path):
     core, _fake = _core(tmp_path, live_adjust=False)
 
     async def blocked():
-        await core.rpc(
+        started = await core.rpc(
             "water.start",
-            {
-                "volume_ml": 100,
-                "temp_c": 20,
-                "pattern": "center",
-                "water_source": "tank",
-                "confirmation": WATER_READY_SENTINEL,
-            },
+            _with_ids(
+                {
+                    "volume_ml": 100,
+                    "temp_c": 20,
+                    "pattern": "center",
+                    "water_source": "tank",
+                    "confirmation": WATER_READY_SENTINEL,
+                }
+            ),
         )
+        wid = started["workflow_id"]
         with pytest.raises(BridgeError, match="not hardware A/B verified"):
             await core.rpc(
                 "water.set_pattern",
-                {"pattern": "spiral", "confirmation": LIVE_ADJUST_SENTINEL},
+                _with_ids(
+                    {"pattern": "spiral", "confirmation": LIVE_ADJUST_SENTINEL},
+                    workflow_id=wid,
+                ),
             )
-        await core.rpc("cancel")
+        await core.rpc("cancel", _with_ids(workflow_id=wid))
         await core.shutdown()
 
     asyncio.run(blocked())
@@ -576,30 +677,39 @@ def test_freesolo_water_live_adjust_is_separately_gated(tmp_path):
     enabled, fake = _core(tmp_path / "enabled", live_adjust=True)
 
     async def allowed():
-        await enabled.rpc(
+        started = await enabled.rpc(
             "water.start",
-            {
-                "volume_ml": 100,
-                "temp_c": 20,
-                "pattern": "center",
-                "water_source": "tank",
-                "confirmation": WATER_READY_SENTINEL,
-            },
+            _with_ids(
+                {
+                    "volume_ml": 100,
+                    "temp_c": 20,
+                    "pattern": "center",
+                    "water_source": "tank",
+                    "confirmation": WATER_READY_SENTINEL,
+                }
+            ),
         )
-        await enabled.rpc("pause")
+        wid = started["workflow_id"]
+        await enabled.rpc("pause", _with_ids(workflow_id=wid))
         temperature = await enabled.rpc(
             "water.set_temperature",
-            {"temp_c": 60, "confirmation": LIVE_ADJUST_SENTINEL},
+            _with_ids(
+                {"temp_c": 60, "confirmation": LIVE_ADJUST_SENTINEL},
+                workflow_id=wid,
+            ),
         )
         pattern = await enabled.rpc(
             "water.set_pattern",
-            {"pattern": "spiral", "confirmation": LIVE_ADJUST_SENTINEL},
+            _with_ids(
+                {"pattern": "spiral", "confirmation": LIVE_ADJUST_SENTINEL},
+                workflow_id=wid,
+            ),
         )
         assert not temperature["hardware_effect_verified"]
         assert pattern["hardware_effect_verified"]
         assert pattern["report"] == 8107
-        await enabled.rpc("resume")
-        await enabled.rpc("cancel")
+        await enabled.rpc("resume", _with_ids(workflow_id=wid))
+        await enabled.rpc("cancel", _with_ids(workflow_id=wid))
         await enabled.shutdown()
 
     asyncio.run(allowed())
@@ -611,20 +721,23 @@ def test_grinder_pause_extends_timer_and_stop_persists_cooldown(tmp_path):
     core, fake = _core(tmp_path)
 
     async def go():
-        await core.rpc(
+        started = await core.rpc(
             "grinder.start",
-            {
-                "size": 60,
-                "rpm": 100,
-                "seconds": 0.15,
-                "confirmation": GRINDER_READY_SENTINEL,
-            },
+            _with_ids(
+                {
+                    "size": 60,
+                    "rpm": 100,
+                    "seconds": 0.15,
+                    "confirmation": GRINDER_READY_SENTINEL,
+                }
+            ),
         )
+        wid = started["workflow_id"]
         await asyncio.sleep(0.03)
-        await core.rpc("pause")
+        await core.rpc("pause", _with_ids(workflow_id=wid))
         await asyncio.sleep(0.18)
         assert core.status()["phase"] == "paused"
-        await core.rpc("resume")
+        await core.rpc("resume", _with_ids(workflow_id=wid))
         await asyncio.sleep(0.16)
         assert core.status()["activity"] is None
         record = core.grinder_state_file.read_text(encoding="utf-8")
@@ -641,17 +754,20 @@ def test_grinder_pause_ack_loss_forces_confirmed_stop(tmp_path):
     fake.fail_grinder_pause = True
 
     async def go():
-        await core.rpc(
+        started = await core.rpc(
             "grinder.start",
-            {
-                "size": 60,
-                "rpm": 100,
-                "seconds": 10,
-                "confirmation": GRINDER_READY_SENTINEL,
-            },
+            _with_ids(
+                {
+                    "size": 60,
+                    "rpm": 100,
+                    "seconds": 10,
+                    "confirmation": GRINDER_READY_SENTINEL,
+                }
+            ),
         )
+        wid = started["workflow_id"]
         with pytest.raises(BridgeError, match="STOP/QUIT was confirmed"):
-            await core.rpc("pause")
+            await core.rpc("pause", _with_ids(workflow_id=wid))
         assert core.status()["activity"] is None
         assert core.status()["last_operation"]["result"] == "pause_failed_stopped"
         assert '"in_progress": false' in core.grinder_state_file.read_text(
@@ -669,13 +785,15 @@ def test_natural_water_stop_requires_metered_target(tmp_path):
     async def go():
         await core.rpc(
             "water.start",
-            {
-                "volume_ml": 100,
-                "temp_c": 85,
-                "pattern": "center",
-                "water_source": "tank",
-                "confirmation": WATER_READY_SENTINEL,
-            },
+            _with_ids(
+                {
+                    "volume_ml": 100,
+                    "temp_c": 85,
+                    "pattern": "center",
+                    "water_source": "tank",
+                    "confirmation": WATER_READY_SENTINEL,
+                }
+            ),
         )
         fake.emit(_event(command=40523, name="water_volume", water_ml=70.0))
         fake.emit(_event(command=40511, name="brewer_stopped"))
@@ -697,13 +815,15 @@ def test_natural_water_stop_uses_peak_before_firmware_meter_reset(tmp_path):
     async def go():
         await core.rpc(
             "water.start",
-            {
-                "volume_ml": 100,
-                "temp_c": 20,
-                "pattern": "center",
-                "water_source": "tank",
-                "confirmation": WATER_READY_SENTINEL,
-            },
+            _with_ids(
+                {
+                    "volume_ml": 100,
+                    "temp_c": 20,
+                    "pattern": "center",
+                    "water_source": "tank",
+                    "confirmation": WATER_READY_SENTINEL,
+                }
+            ),
         )
         fake.emit(_event(command=40523, name="water_volume", water_ml=100.7))
         fake.emit(_event(command=40511, name="brewer_stopped"))
@@ -727,13 +847,15 @@ def test_water_status_separates_target_dispensed_and_cup_scale_delta(tmp_path):
     async def go():
         await core.rpc(
             "water.start",
-            {
-                "volume_ml": 100,
-                "temp_c": 85,
-                "pattern": "circular",
-                "water_source": "tank",
-                "confirmation": WATER_READY_SENTINEL,
-            },
+            _with_ids(
+                {
+                    "volume_ml": 100,
+                    "temp_c": 85,
+                    "pattern": "circular",
+                    "water_source": "tank",
+                    "confirmation": WATER_READY_SENTINEL,
+                }
+            ),
         )
         fake.emit(_event(cup_g=30.0, name="scale"))
         fake.emit(_event(command=40523, name="water_volume", water_ml=55.0))
@@ -765,19 +887,22 @@ def test_water_peak_survives_firmware_meter_reset_after_explicit_stop(tmp_path):
     core, fake = _core(tmp_path)
 
     async def go():
-        await core.rpc(
+        started = await core.rpc(
             "water.start",
-            {
-                "volume_ml": 200,
-                "temp_c": 20,
-                "pattern": "center",
-                "water_source": "tank",
-                "confirmation": WATER_READY_SENTINEL,
-            },
+            _with_ids(
+                {
+                    "volume_ml": 200,
+                    "temp_c": 20,
+                    "pattern": "center",
+                    "water_source": "tank",
+                    "confirmation": WATER_READY_SENTINEL,
+                }
+            ),
         )
+        wid = started["workflow_id"]
         fake.emit(_event(command=40523, name="water_volume", water_ml=97.65))
         fake.emit(_event(command=40523, name="water_volume", water_ml=0.0))
-        result = await core.rpc("cancel")
+        result = await core.rpc("cancel", _with_ids(workflow_id=wid))
         assert result["ack"] == 4507
         status = core.status()
         assert status["last_operation"]["metered_volume_ml"] == 97.65
@@ -794,13 +919,15 @@ def test_water_safety_timer_stops_without_cancelling_its_own_cleanup(tmp_path):
     async def go():
         await core.rpc(
             "water.start",
-            {
-                "volume_ml": 100,
-                "temp_c": 85,
-                "pattern": "center",
-                "water_source": "tank",
-                "confirmation": WATER_READY_SENTINEL,
-            },
+            _with_ids(
+                {
+                    "volume_ml": 100,
+                    "temp_c": 85,
+                    "pattern": "center",
+                    "water_source": "tank",
+                    "confirmation": WATER_READY_SENTINEL,
+                }
+            ),
         )
         core._start_water_timer(0.01)
         await asyncio.sleep(0.03)
@@ -895,20 +1022,28 @@ def test_coffee_workflow_connects_once_and_releases_on_natural_terminal(tmp_path
     recipe = _recipe(tmp_path / "recipe.yaml")
 
     async def go():
-        loaded = await core.rpc("coffee.load", {"recipe": str(recipe)})
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
         assert loaded["status"] == "armed"
+        wid = loaded["workflow_id"]
         assert core.status()["connection_scope"] == "workflow"
+        assert core.status()["active_workflow_id"] == wid
         assert fake.calls.count("connect") == 1
         assert fake.calls.count("open_session") == 1
 
-        await core.rpc("coffee.start", {"confirmation": READY_SENTINEL})
-        await core.rpc("pause")
+        await core.rpc(
+            "coffee.start",
+            _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+        )
+        await core.rpc("pause", _with_ids(workflow_id=wid))
         assert core.status()["phase"] == "paused"
-        await core.rpc("resume")
+        await core.rpc("resume", _with_ids(workflow_id=wid))
         assert core.status()["phase"] == "running"
         # status/events must not reconnect or extend the link
         await core.rpc("status")
         await core.rpc("events", {"since": 0})
+        await core.rpc("events", {"since": 0, "workflow_id": wid})
         assert fake.calls.count("connect") == 1
 
         fake.emit(_event(state=0x24, name="ready"))
@@ -922,12 +1057,20 @@ def test_coffee_workflow_connects_once_and_releases_on_natural_terminal(tmp_path
         assert status["last_disconnect_reason"] == "natural_terminal"
         assert status["last_disconnect_error"] is None
         assert not core.coffee_state_file.exists()
+        # Durable terminal committed before release.
+        wf = core.store.get_workflow(wid)
+        assert wf is not None
+        assert wf["terminal_at"] is not None
 
         # Next workflow can reconnect once the daemon remains up.
-        await core.rpc("coffee.load", {"recipe": str(recipe)})
+        loaded2 = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
         assert core.status()["connected"] is True
         assert fake.calls.count("connect") == 2
-        await core.rpc("cancel")
+        await core.rpc(
+            "cancel", _with_ids(workflow_id=loaded2["workflow_id"])
+        )
         await _drain_release(core)
         await core.shutdown()
 
@@ -944,8 +1087,14 @@ def test_tea_workflow_releases_once_on_natural_terminal(tmp_path):
     recipe = _tea_recipe(tmp_path / "tea.yaml")
 
     async def go():
-        await core.rpc("tea.load", {"recipe": str(recipe)})
-        await core.rpc("tea.start", {"confirmation": TEA_READY_SENTINEL})
+        loaded = await core.rpc(
+            "tea.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        await core.rpc(
+            "tea.start",
+            _with_ids({"confirmation": TEA_READY_SENTINEL}, workflow_id=wid),
+        )
         await core.rpc("status")
         fake.emit(_event(state=0x01, name="idle"))
         await _drain_release(core)
@@ -969,9 +1118,15 @@ def test_explicit_cancel_stop_releases_once_for_each_activity(tmp_path):
 
     async def coffee_cancel():
         core, fake = _core(tmp_path / "coffee")
-        await core.rpc("coffee.load", {"recipe": str(recipe)})
-        await core.rpc("coffee.start", {"confirmation": READY_SENTINEL})
-        await core.rpc("cancel")
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        await core.rpc(
+            "coffee.start",
+            _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+        )
+        await core.rpc("cancel", _with_ids(workflow_id=wid))
         await _drain_release(core)
         assert core.status()["connected"] is False
         assert core.status()["last_disconnect_reason"] == "cancel"
@@ -981,8 +1136,10 @@ def test_explicit_cancel_stop_releases_once_for_each_activity(tmp_path):
 
     async def tea_cancel():
         core, fake = _core(tmp_path / "tea")
-        await core.rpc("tea.load", {"recipe": str(tea)})
-        await core.rpc("cancel")
+        loaded = await core.rpc(
+            "tea.load", _with_ids({"recipe": str(tea)})
+        )
+        await core.rpc("cancel", _with_ids(workflow_id=loaded["workflow_id"]))
         await _drain_release(core)
         assert core.status()["connected"] is False
         assert core.status()["last_disconnect_reason"] == "cancel"
@@ -992,16 +1149,20 @@ def test_explicit_cancel_stop_releases_once_for_each_activity(tmp_path):
 
     async def grinder_stop():
         core, fake = _core(tmp_path / "grinder")
-        await core.rpc(
+        started = await core.rpc(
             "grinder.start",
-            {
-                "size": 60,
-                "rpm": 100,
-                "seconds": 10,
-                "confirmation": GRINDER_READY_SENTINEL,
-            },
+            _with_ids(
+                {
+                    "size": 60,
+                    "rpm": 100,
+                    "seconds": 10,
+                    "confirmation": GRINDER_READY_SENTINEL,
+                }
+            ),
         )
-        await core.rpc("cancel")
+        await core.rpc(
+            "cancel", _with_ids(workflow_id=started["workflow_id"])
+        )
         await _drain_release(core)
         assert core.status()["connected"] is False
         assert core.status()["last_disconnect_reason"] == "grinder_confirmed_stop"
@@ -1011,17 +1172,21 @@ def test_explicit_cancel_stop_releases_once_for_each_activity(tmp_path):
 
     async def water_stop():
         core, fake = _core(tmp_path / "water")
-        await core.rpc(
+        started = await core.rpc(
             "water.start",
-            {
-                "volume_ml": 100,
-                "temp_c": 85,
-                "pattern": "center",
-                "water_source": "tank",
-                "confirmation": WATER_READY_SENTINEL,
-            },
+            _with_ids(
+                {
+                    "volume_ml": 100,
+                    "temp_c": 85,
+                    "pattern": "center",
+                    "water_source": "tank",
+                    "confirmation": WATER_READY_SENTINEL,
+                }
+            ),
         )
-        await core.rpc("cancel")
+        await core.rpc(
+            "cancel", _with_ids(workflow_id=started["workflow_id"])
+        )
         await _drain_release(core)
         assert core.status()["connected"] is False
         assert core.status()["last_disconnect_reason"] == "water_confirmed_stop"
@@ -1031,8 +1196,12 @@ def test_explicit_cancel_stop_releases_once_for_each_activity(tmp_path):
 
     async def scale_stop():
         core, fake = _core(tmp_path / "scale")
-        await core.rpc("scale.start", {"duration_s": 10, "tare": False})
-        await core.rpc("cancel")
+        started = await core.rpc(
+            "scale.start", _with_ids({"duration_s": 10, "tare": False})
+        )
+        await core.rpc(
+            "cancel", _with_ids(workflow_id=started["workflow_id"])
+        )
         await _drain_release(core)
         assert core.status()["connected"] is False
         assert core.status()["last_disconnect_reason"] in {
@@ -1057,10 +1226,16 @@ def test_explicit_connect_does_not_auto_release(tmp_path):
     async def go():
         await core.rpc("connect")
         assert core.status()["connection_scope"] == "explicit"
-        await core.rpc("coffee.load", {"recipe": str(recipe)})
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
         assert core.status()["connection_scope"] == "explicit"
-        await core.rpc("coffee.start", {"confirmation": READY_SENTINEL})
-        await core.rpc("cancel")
+        await core.rpc(
+            "coffee.start",
+            _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+        )
+        await core.rpc("cancel", _with_ids(workflow_id=wid))
         await _drain_release(core)
         status = core.status()
         assert status["connected"] is True
@@ -1084,7 +1259,10 @@ def test_loaded_recipe_holds_without_timeout_then_start_reuses_connection(tmp_pa
     recipe = _recipe(tmp_path / "recipe.yaml")
 
     async def go():
-        await core.rpc("coffee.load", {"recipe": str(recipe)})
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
         assert core.status()["phase"] == "loaded"
         assert core.status()["connected"] is True
         assert core.status()["connection_scope"] == "workflow"
@@ -1108,12 +1286,15 @@ def test_loaded_recipe_holds_without_timeout_then_start_reuses_connection(tmp_pa
         assert fake.calls.count("disconnect") == 0
         assert "coffee_cancel" not in fake.calls
 
-        await core.rpc("coffee.start", {"confirmation": READY_SENTINEL})
+        await core.rpc(
+            "coffee.start",
+            _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+        )
         assert core.status()["phase"] == "running"
         assert fake.calls.count("connect") == 1
 
-        await core.rpc("pause")
-        await core.rpc("resume")
+        await core.rpc("pause", _with_ids(workflow_id=wid))
+        await core.rpc("resume", _with_ids(workflow_id=wid))
         await core.rpc("status")
         await core.rpc("events", {"since": 0})
         assert fake.calls.count("connect") == 1
@@ -1144,7 +1325,9 @@ def test_preflight_failure_releases_auto_connect_keeps_explicit(tmp_path):
         core, fake = _core(tmp_path / "auto")
         fake.machine_info["firmware"] = "UNSUPPORTED.1"
         with pytest.raises(BridgeError, match="not in the tested set"):
-            await core.rpc("coffee.load", {"recipe": str(recipe)})
+            await core.rpc(
+                "coffee.load", _with_ids({"recipe": str(recipe)})
+            )
         await _drain_release(core)
         assert core.status()["connected"] is False
         assert core.status()["last_disconnect_reason"] == "preflight_or_load_failed"
@@ -1159,7 +1342,9 @@ def test_preflight_failure_releases_auto_connect_keeps_explicit(tmp_path):
         # machine_info already cached from connect; force untested firmware gate
         core.machine_info["firmware"] = "UNSUPPORTED.1"
         with pytest.raises(BridgeError, match="not in the tested set"):
-            await core.rpc("coffee.load", {"recipe": str(recipe)})
+            await core.rpc(
+                "coffee.load", _with_ids({"recipe": str(recipe)})
+            )
         await _drain_release(core)
         assert core.status()["connected"] is True
         assert core.status()["connection_scope"] == "explicit"
@@ -1177,9 +1362,15 @@ def test_terminal_during_control_does_not_deadlock_and_releases(tmp_path):
     recipe = _recipe(tmp_path / "recipe.yaml")
 
     async def go():
-        await core.rpc("coffee.load", {"recipe": str(recipe)})
-        await core.rpc("coffee.start", {"confirmation": READY_SENTINEL})
-        result = await core.rpc("pause")
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        await core.rpc(
+            "coffee.start",
+            _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+        )
+        result = await core.rpc("pause", _with_ids(workflow_id=wid))
         assert result["terminal_during_control"] is True
         assert result["activity"] is None
         # Terminal result is visible before/without waiting on disconnect.
@@ -1202,8 +1393,14 @@ def test_disconnect_failure_preserves_terminal_result(tmp_path):
     recipe = _recipe(tmp_path / "recipe.yaml")
 
     async def go():
-        await core.rpc("coffee.load", {"recipe": str(recipe)})
-        await core.rpc("coffee.start", {"confirmation": READY_SENTINEL})
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        await core.rpc(
+            "coffee.start",
+            _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+        )
 
         async def boom_close():
             fake.calls.append("close_session")
@@ -1216,7 +1413,7 @@ def test_disconnect_failure_preserves_terminal_result(tmp_path):
 
         fake.close_session = boom_close  # type: ignore[method-assign]
         fake.disconnect = boom_disconnect  # type: ignore[method-assign]
-        await core.rpc("cancel")
+        await core.rpc("cancel", _with_ids(workflow_id=wid))
         await _drain_release(core)
         status = core.status()
         assert status["last_operation"]["result"] == "cancel_sent"
@@ -1227,5 +1424,1509 @@ def test_disconnect_failure_preserves_terminal_result(tmp_path):
         # Must not retry physical cancel.
         assert fake.calls.count("coffee_cancel") == 1
         await core.shutdown()
+
+    asyncio.run(go())
+
+# ---------------------------------------------------------------------------
+# Phase A focused A10 tests (durable workflow, idempotency, terminal, recovery)
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_load_and_start_single_ble_write(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        load_req = _rid("load")
+        first = await core.rpc(
+            "coffee.load",
+            _with_ids({"recipe": str(recipe)}, request_id=load_req),
+        )
+        second = await core.rpc(
+            "coffee.load",
+            _with_ids({"recipe": str(recipe)}, request_id=load_req),
+        )
+        assert first["workflow_id"] == second["workflow_id"]
+        assert fake.calls.count(("load_recipe", "Bridge test")) == 1
+
+        wid = first["workflow_id"]
+        start_req = _rid("start")
+        s1 = await core.rpc(
+            "coffee.start",
+            _with_ids(
+                {"confirmation": READY_SENTINEL},
+                workflow_id=wid,
+                request_id=start_req,
+            ),
+        )
+        s2 = await core.rpc(
+            "coffee.start",
+            _with_ids(
+                {"confirmation": READY_SENTINEL},
+                workflow_id=wid,
+                request_id=start_req,
+            ),
+        )
+        assert s1["status"] == s2["status"] == "running"
+        assert fake.calls.count("coffee_start") == 1
+        await core.rpc("cancel", _with_ids(workflow_id=wid))
+        await _drain_release(core)
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_request_id_method_and_params_conflict(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+    other = _recipe(tmp_path / "other.yaml")
+
+    async def go():
+        req = _rid("conflict")
+        # Reserve via successful load, then cancel so a later call hits
+        # idempotency identity checks rather than "already loaded".
+        loaded = await core.rpc(
+            "coffee.load",
+            _with_ids({"recipe": str(recipe)}, request_id=req),
+        )
+        await core.rpc("cancel", _with_ids(workflow_id=loaded["workflow_id"]))
+        await _drain_release(core)
+
+        with pytest.raises(BridgeError, match="idempotency conflict|method mismatch"):
+            await core.rpc(
+                "grinder.start",
+                _with_ids(
+                    {
+                        "size": 50,
+                        "rpm": 100,
+                        "seconds": 5,
+                        "confirmation": GRINDER_READY_SENTINEL,
+                    },
+                    request_id=req,
+                ),
+            )
+        # Same method, different semantic params.
+        with pytest.raises(BridgeError, match="params hash|idempotency conflict"):
+            await core.rpc(
+                "coffee.load",
+                _with_ids({"recipe": str(other)}, request_id=req),
+            )
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_wrong_workflow_id_rejected_before_ble_write(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        before = list(fake.calls)
+        with pytest.raises(BridgeError, match="does not match active workflow"):
+            await core.rpc(
+                "coffee.start",
+                _with_ids(
+                    {"confirmation": READY_SENTINEL},
+                    workflow_id="wf_stale_not_active",
+                ),
+            )
+        assert fake.calls == before
+        assert "coffee_start" not in fake.calls
+        await core.rpc(
+            "cancel", _with_ids(workflow_id=loaded["workflow_id"])
+        )
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_emergency_stop_allows_missing_workflow_id(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        await core.rpc(
+            "coffee.start",
+            _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+        )
+        result = await core.rpc(
+            "cancel",
+            _with_ids({"emergency": True}),  # no workflow_id
+        )
+        assert result["status"] == "cancel_sent"
+        assert result.get("emergency") is True
+        await _drain_release(core)
+        events = core.store.list_workflow_events(wid)
+        terminal = [e for e in events if e["event_type"] == "terminal"]
+        assert terminal
+        assert terminal[-1]["payload"].get("emergency") is True
+        await core.shutdown()
+
+    asyncio.run(go())
+    assert "coffee_cancel" in fake.calls
+
+
+def test_persistence_failure_prevents_ble_release(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        await core.rpc(
+            "coffee.start",
+            _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+        )
+
+        def boom_terminal(*_a, **_k):
+            raise storage.StorageError("injected terminal commit failure")
+
+        core.store.commit_workflow_terminal = boom_terminal  # type: ignore[method-assign]
+        fake.emit(_event(state=0x24, name="ready"))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        status = core.status()
+        assert status["phase"] == "recovery_required"
+        assert status["connected"] is True  # release withheld
+        assert status["release_pending"] is False
+        assert fake.calls.count("disconnect") == 0
+        assert status["recovery"]["required"] is True
+        # Disconnect failure path is separate; terminal state not rolled back.
+        assert status["last_operation"]["result"] == "ready"
+        assert status["last_operation"].get("persistence_failed") is True
+        # Restore real commit so force-shutdown recovery can finish cleanly.
+        import xbloom_storage as _storage
+
+        core.store.commit_workflow_terminal = (  # type: ignore[method-assign]
+            _storage.StateStore.commit_workflow_terminal.__get__(
+                core.store, _storage.StateStore
+            )
+        )
+        await core.shutdown(force=True)
+
+    asyncio.run(go())
+
+
+def test_durable_event_cursor_no_artificial_gaps(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        page1 = await core.rpc("events", {"workflow_id": wid, "since": 0})
+        assert page1["source"] == "durable"
+        assert page1["gap_detected"] is False
+        assert page1["events"]
+        next_since = page1["next_since"]
+        await core.rpc(
+            "coffee.start",
+            _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+        )
+        page2 = await core.rpc(
+            "events", {"workflow_id": wid, "since": next_since}
+        )
+        assert page2["gap_detected"] is False
+        seqs = [e["seq"] for e in page1["events"] + page2["events"]]
+        assert seqs == sorted(seqs)
+        # Dense: no holes in durable sequence for this workflow.
+        all_events = core.store.list_workflow_events(wid)
+        for i, ev in enumerate(all_events, start=1):
+            assert ev["seq"] == i
+        await core.rpc("cancel", _with_ids(workflow_id=wid))
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_one_shot_grinder_has_durable_workflow_identity(tmp_path):
+    core, fake = _core(tmp_path)
+
+    async def go():
+        started = await core.rpc(
+            "grinder.start",
+            _with_ids(
+                {
+                    "size": 50,
+                    "rpm": 100,
+                    "seconds": 10,
+                    "confirmation": GRINDER_READY_SENTINEL,
+                }
+            ),
+        )
+        assert started["workflow_id"]
+        assert started["kind"] == "grinder"
+        assert started["snapshot_sha256"]
+        status = core.status()
+        assert status["active_workflow_id"] == started["workflow_id"]
+        assert status["workflow"]["kind"] == "grinder"
+        await core.rpc(
+            "cancel", _with_ids(workflow_id=started["workflow_id"])
+        )
+        await _drain_release(core)
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_daemon_reconstruction_from_durable_state_no_auto_connect_or_start(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        assert core.connected is True
+        # Simulate process loss: close durable store without terminal / without
+        # auto-start. BLE link is process-local and dies with the process.
+        # Keep the local armed-state file so reconstruct is "loaded" (confirmed
+        # load in a prior process) rather than bare durable-only.
+        core.store.close()
+        fake2 = FakeBridgeClient("AA:BB")
+        # Reconcile gate requires confirmed armed after restart.
+        fake2.status_state = 0x1F
+        fake2.status_state_name = "armed"
+        core2 = BridgeCore(
+            default_address="AA:BB",
+            state_dir=tmp_path,
+            client_factory=lambda _a: fake2,
+            environ=_environment(),
+            machine_info_timeout=0.1,
+        )
+        assert core2.active_workflow_id == wid
+        assert core2.activity == "coffee"
+        assert core2.phase == "loaded"
+        assert core2.connected is False
+        assert core2._loaded_needs_reconcile is True
+        assert fake2.calls == []  # no auto-connect, no auto-start
+        status = core2.status()
+        assert status["active_workflow_id"] == wid
+        assert status["connected"] is False
+        assert status["running"] is True
+        # Explicit start after reconstruct may proceed only after reconcile;
+        # never auto-fired and never re-loads.
+        await core2.rpc(
+            "coffee.start",
+            _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+        )
+        assert fake2.calls.count("coffee_start") == 1
+        assert ("load_recipe", "Bridge test") not in fake2.calls
+        assert "request_status" in fake2.calls
+        await core2.rpc("cancel", _with_ids(workflow_id=wid))
+        await _drain_release(core2)
+        await core2.shutdown()
+
+    asyncio.run(go())
+
+
+def test_status_exposes_workflow_recovery_and_versions(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        assert core.status()["active_workflow_id"] is None
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        status = core.status()
+        assert status["active_workflow_id"] == loaded["workflow_id"]
+        assert status["workflow"]["workflow_id"] == loaded["workflow_id"]
+        assert status["workflow"]["snapshot_sha256"]
+        assert status["rpc_protocol_current"] == bridge_mod.RPC_PROTOCOL_CURRENT
+        assert status["instance_id"] == core.instance_id
+        assert status["core_version"]
+        assert status["connection_scope"] == "workflow"
+        assert "recovery" in status
+        await core.rpc(
+            "cancel", _with_ids(workflow_id=loaded["workflow_id"])
+        )
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+# ---------------------------------------------------------------------------
+# Phase A correctness pass (Codex review blocking findings)
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_start_after_terminal_returns_cached(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        start_req = _rid("start_term")
+        first = await core.rpc(
+            "coffee.start",
+            _with_ids(
+                {"confirmation": READY_SENTINEL},
+                workflow_id=wid,
+                request_id=start_req,
+            ),
+        )
+        fake.emit(_event(state=0x22, name="starting"))
+        fake.emit(_event(state=0x24, name="ready"))
+        await asyncio.sleep(0)
+        await _drain_release(core)
+        assert core.activity is None
+        before = list(fake.calls)
+        second = await core.rpc(
+            "coffee.start",
+            _with_ids(
+                {"confirmation": READY_SENTINEL},
+                workflow_id=wid,
+                request_id=start_req,
+            ),
+        )
+        assert second["status"] == first["status"] == "running"
+        assert fake.calls == before
+        assert fake.calls.count("coffee_start") == 1
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_duplicate_pause_after_phase_change_returns_cached(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        await core.rpc(
+            "coffee.start",
+            _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+        )
+        pause_req = _rid("pause_dup")
+        first = await core.rpc(
+            "pause", _with_ids(workflow_id=wid, request_id=pause_req)
+        )
+        assert first["status"] == "paused"
+        assert core.phase == "paused"
+        before = list(fake.calls)
+        second = await core.rpc(
+            "pause", _with_ids(workflow_id=wid, request_id=pause_req)
+        )
+        assert second == first
+        assert fake.calls == before
+        assert fake.calls.count("coffee_pause") == 1
+        await core.rpc("cancel", _with_ids(workflow_id=wid))
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_duplicate_cancel_after_terminal_returns_cached(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        cancel_req = _rid("cancel_dup")
+        first = await core.rpc(
+            "cancel", _with_ids(workflow_id=wid, request_id=cancel_req)
+        )
+        await _drain_release(core)
+        assert core.activity is None
+        before = list(fake.calls)
+        second = await core.rpc(
+            "cancel", _with_ids(workflow_id=wid, request_id=cancel_req)
+        )
+        assert second["status"] == first["status"] == "cancel_sent"
+        assert fake.calls == before
+        assert fake.calls.count("coffee_cancel") == 1
+        # Emergency stop duplicates also cache after terminal.
+        emerg_req = _rid("emerg")
+        loaded2 = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        await core.rpc(
+            "coffee.start",
+            _with_ids(
+                {"confirmation": READY_SENTINEL},
+                workflow_id=loaded2["workflow_id"],
+            ),
+        )
+        e1 = await core.rpc(
+            "cancel",
+            _with_ids({"emergency": True}, request_id=emerg_req),
+        )
+        await _drain_release(core)
+        e2 = await core.rpc(
+            "cancel",
+            _with_ids({"emergency": True}, request_id=emerg_req),
+        )
+        assert e1["status"] == e2["status"] == "cancel_sent"
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_duplicate_one_shot_start_after_terminal_and_cooldown(tmp_path):
+    core, fake = _core(tmp_path)
+
+    async def go():
+        start_req = _rid("grind_dup")
+        params = {
+            "size": 50,
+            "rpm": 100,
+            "seconds": 0.2,
+            "confirmation": GRINDER_READY_SENTINEL,
+        }
+        first = await core.rpc(
+            "grinder.start", _with_ids(params, request_id=start_req)
+        )
+        await core.rpc(
+            "cancel", _with_ids(workflow_id=first["workflow_id"])
+        )
+        await _drain_release(core)
+        # Cooldown record present; exact duplicate still returns cache.
+        before = list(fake.calls)
+        second = await core.rpc(
+            "grinder.start", _with_ids(params, request_id=start_req)
+        )
+        assert second["status"] == first["status"] == "running"
+        assert second["workflow_id"] == first["workflow_id"]
+        assert fake.calls == before
+        assert sum(1 for c in fake.calls if c[0] == "grinder_start") == 1
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_coffee_load_ack_loss_pending_no_retry(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+    fake.fail_coffee_load = True
+    load_req = _rid("load_ack")
+
+    async def go():
+        with pytest.raises(BridgeError, match="unconfirmed|do not retry"):
+            await core.rpc(
+                "coffee.load",
+                _with_ids({"recipe": str(recipe)}, request_id=load_req),
+            )
+        status = core.status()
+        assert status["connected"] is True
+        assert status["phase"] == "load_unconfirmed"
+        assert status["active_workflow_id"]
+        assert status["recovery"]["required"] is True
+        assert fake.calls.count(("load_recipe", "Bridge test")) == 1
+        idem = core.store.get_idempotency(load_req)
+        assert idem is not None
+        assert idem["status"] == storage.IDEM_PENDING
+        # Duplicate request_id must not reissue BLE.
+        with pytest.raises(BridgeError, match="recovery_required|pending"):
+            await core.rpc(
+                "coffee.load",
+                _with_ids({"recipe": str(recipe)}, request_id=load_req),
+            )
+        assert fake.calls.count(("load_recipe", "Bridge test")) == 1
+        await core.rpc(
+            "cancel",
+            _with_ids(
+                {"emergency": True},
+                workflow_id=status["active_workflow_id"],
+            ),
+        )
+        await core.shutdown(force=True)
+
+    asyncio.run(go())
+
+
+def test_tea_load_ack_loss_pending_no_retry(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _tea_recipe(tmp_path / "tea.yaml")
+    fake.fail_tea_load = True
+    load_req = _rid("tea_ack")
+
+    async def go():
+        with pytest.raises(BridgeError, match="unconfirmed|do not retry"):
+            await core.rpc(
+                "tea.load",
+                _with_ids({"recipe": str(recipe)}, request_id=load_req),
+            )
+        status = core.status()
+        assert status["connected"] is True
+        assert status["phase"] == "load_unconfirmed"
+        assert status["active_workflow_id"]
+        assert fake.calls.count(("tea_load", "Bridge tea test")) == 1
+        idem = core.store.get_idempotency(load_req)
+        assert idem["status"] == storage.IDEM_PENDING
+        with pytest.raises(BridgeError, match="recovery_required|pending"):
+            await core.rpc(
+                "tea.load",
+                _with_ids({"recipe": str(recipe)}, request_id=load_req),
+            )
+        assert fake.calls.count(("tea_load", "Bridge tea test")) == 1
+        await core.shutdown(force=True)
+
+    asyncio.run(go())
+
+
+def test_terminal_idempotency_atomic_success_and_rollback(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        cancel_req = _rid("atomic_cancel")
+        result = await core.rpc(
+            "cancel", _with_ids(workflow_id=wid, request_id=cancel_req)
+        )
+        assert result["status"] == "cancel_sent"
+        await _drain_release(core)
+        wf = core.store.get_workflow(wid)
+        assert wf["terminal_at"] is not None
+        assert wf["recovery"] is None  # CLEAR_RECOVERY on success
+        idem = core.store.get_idempotency(cancel_req)
+        assert idem["status"] == storage.IDEM_COMPLETED
+        assert idem["result"]["status"] == "cancel_sent"
+
+        # Rollback: inject failure mid terminal+idempotency transaction.
+        loaded2 = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid2 = loaded2["workflow_id"]
+        fail_req = _rid("atomic_fail")
+        real = core.store.commit_workflow_terminal
+
+        def boom(*_a, **_k):
+            raise storage.StorageError("injected atomic terminal failure")
+
+        core.store.commit_workflow_terminal = boom  # type: ignore[method-assign]
+        with pytest.raises(BridgeError, match="durable|persist|recovery"):
+            await core.rpc(
+                "cancel", _with_ids(workflow_id=wid2, request_id=fail_req)
+            )
+        core.store.commit_workflow_terminal = real  # type: ignore[method-assign]
+        status = core.status()
+        assert status["connected"] is True
+        assert status["phase"] == "recovery_required"
+        assert status["release_pending"] is False
+        # BLE must still be held; cancel write already happened but durable
+        # terminal+idempotency rolled back together.
+        assert status["release_pending"] is False
+        pending = core.store.get_idempotency(fail_req)
+        assert pending is not None
+        assert pending["status"] == storage.IDEM_PENDING
+        rolled = core.store.get_workflow(wid2)
+        assert rolled["terminal_at"] is None
+        # Activity retained for recovery (terminal commit rolled back).
+        assert status["connected"] is True
+        await core.shutdown(force=True)
+
+    asyncio.run(go())
+
+
+def test_machine_telemetry_persisted_and_terminal_ordering(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        await core.rpc(
+            "coffee.start",
+            _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+        )
+        fake.emit(
+            _event(state=0x10, name="brewing", water_ml=40.0, cup_g=12.0)
+        )
+        fake.emit(_event(state=0x24, name="ready"))
+        await asyncio.sleep(0)
+        await _drain_release(core)
+        events = core.store.list_workflow_events(wid)
+        types = [e["event_type"] for e in events]
+        assert "machine" in types
+        assert types[-1] == "terminal"
+        machine_rows = [e for e in events if e["event_type"] == "machine"]
+        assert any(
+            (e["payload"].get("dispensed_water_ml") == 40.0)
+            or (e["payload"].get("water_ml") == 40.0)
+            for e in machine_rows
+        )
+        page = await core.rpc("events", {"workflow_id": wid, "since": 0})
+        assert page["source"] == "durable"
+        assert any(e["event_type"] == "machine" for e in page["events"])
+        assert page["events"][-1]["event_type"] == "terminal"
+        for i, ev in enumerate(events, start=1):
+            assert ev["seq"] == i
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_workflow_create_and_transition_rollback(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        # Creation atomicity: event append failure rolls back the workflow row.
+        real_create = core.store.create_workflow_with_event
+
+        def boom_create(**_kwargs):
+            raise storage.StorageError("injected create failure")
+
+        core.store.create_workflow_with_event = boom_create  # type: ignore[method-assign]
+        with pytest.raises(BridgeError, match="durable workflow|create"):
+            await core.rpc(
+                "coffee.load", _with_ids({"recipe": str(recipe)})
+            )
+        core.store.create_workflow_with_event = real_create  # type: ignore[method-assign]
+        assert core.store.get_active_workflow() is None
+        assert ("load_recipe", "Bridge test") not in fake.calls
+
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+
+        real_transition = core.store.transition_workflow
+
+        def boom_transition(*_a, **_k):
+            raise storage.StorageError("injected transition failure")
+
+        core.store.transition_workflow = boom_transition  # type: ignore[method-assign]
+        with pytest.raises(BridgeError, match="critical workflow transition"):
+            await core.rpc(
+                "coffee.start",
+                _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+            )
+        core.store.transition_workflow = real_transition  # type: ignore[method-assign]
+        # Must not claim running success when transition failed.
+        assert core.phase != "running"
+        assert "coffee_start" not in fake.calls or core.phase in {
+            "loaded",
+            "starting",
+            "control_unconfirmed",
+            "recovery_required",
+        }
+        # start BLE write happens after starting transition -- starting is critical
+        # before BLE, so coffee_start should not have run.
+        assert "coffee_start" not in fake.calls
+        await core.rpc("cancel", _with_ids(workflow_id=wid))
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_recipe_revision_mismatch_rejected_pre_ble(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+    other = _recipe(tmp_path / "other.yaml")
+    other.write_text(
+        other.read_text(encoding="utf-8").replace("Bridge test", "Other recipe"),
+        encoding="utf-8",
+    )
+
+    async def go():
+        # Seed an unrelated revision via a successful load of `other`.
+        first = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(other)})
+        )
+        await core.rpc("cancel", _with_ids(workflow_id=first["workflow_id"]))
+        await _drain_release(core)
+        bad_rev = first["recipe_revision_id"]
+        before = list(fake.calls)
+        with pytest.raises(
+            BridgeError, match="content hash|does not match|kind"
+        ):
+            await core.rpc(
+                "coffee.load",
+                _with_ids(
+                    {
+                        "recipe": str(recipe),
+                        "recipe_revision_id": bad_rev,
+                    }
+                ),
+            )
+        assert fake.calls == before
+        assert ("load_recipe", "Bridge test") not in fake.calls
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_terminal_during_start_no_resurrection(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+    fake.coffee_terminal_on_start = True
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        start_req = _rid("start_term_race")
+        result = await core.rpc(
+            "coffee.start",
+            _with_ids(
+                {"confirmation": READY_SENTINEL},
+                workflow_id=wid,
+                request_id=start_req,
+            ),
+        )
+        assert result.get("terminal_during_start") is True
+        assert result.get("status") != "running"
+        assert core.phase in {"idle", "disconnected", "recovery_required"}
+        assert core.activity is None
+        # Must not rewrite durable state back to running after terminal.
+        wf = core.store.get_workflow(wid)
+        assert wf["terminal_at"] is not None
+        assert wf["state"] != "running"
+        assert not any(
+            e["event_type"] == "started" for e in core.store.list_workflow_events(wid)
+        )
+        await _drain_release(core)
+        # Exact duplicate returns cache; no second BLE start.
+        before = list(fake.calls)
+        cached = await core.rpc(
+            "coffee.start",
+            _with_ids(
+                {"confirmation": READY_SENTINEL},
+                workflow_id=wid,
+                request_id=start_req,
+            ),
+        )
+        assert cached.get("terminal_during_start") is True
+        assert cached.get("status") != "running"
+        assert fake.calls == before
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_terminal_during_start_durable_fail_no_running_resurrection(tmp_path):
+    """If terminal arrives during start but durable commit fails, never claim running."""
+
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+    fake.coffee_terminal_on_start = True
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+
+        def boom(*_a, **_k):
+            raise storage.StorageError("injected terminal during start")
+
+        core.store.commit_workflow_terminal = boom  # type: ignore[method-assign]
+        start_req = _rid("start_term_fail")
+        result = await core.rpc(
+            "coffee.start",
+            _with_ids(
+                {"confirmation": READY_SENTINEL},
+                workflow_id=wid,
+                request_id=start_req,
+            ),
+        )
+        assert result.get("terminal_during_start") is True
+        assert result.get("status") != "running"
+        assert result.get("recovery_required") is True
+        assert core.phase == "recovery_required"
+        assert core.phase != "running"
+        # Must not complete as successful running.
+        idem = core.store.get_idempotency(start_req)
+        assert idem is not None
+        assert idem["status"] == storage.IDEM_PENDING
+        wf = core.store.get_workflow(wid)
+        assert wf["terminal_at"] is None
+        assert wf["state"] != "running"
+        # Duplicate must not reissue start.
+        with pytest.raises(BridgeError, match="recovery_required|pending"):
+            await core.rpc(
+                "coffee.start",
+                _with_ids(
+                    {"confirmation": READY_SENTINEL},
+                    workflow_id=wid,
+                    request_id=start_req,
+                ),
+            )
+        assert fake.calls.count("coffee_start") == 1
+        core.store.commit_workflow_terminal = (  # type: ignore[method-assign]
+            storage.StateStore.commit_workflow_terminal.__get__(
+                core.store, storage.StateStore
+            )
+        )
+        await core.shutdown(force=True)
+
+    asyncio.run(go())
+
+
+def test_mutating_methods_do_not_advertise_unenforced_settings(tmp_path):
+    # Protocol honesty: constants must not list methods without v3 idempotency.
+    assert "settings.write" not in bridge_mod.MUTATING_METHODS
+    assert "advanced.write" not in bridge_mod.MUTATING_METHODS
+    assert "presets.save" not in bridge_mod.MUTATING_METHODS
+    assert "connect" not in bridge_mod.MUTATING_METHODS
+    assert "disconnect" not in bridge_mod.MUTATING_METHODS
+    assert "coffee.load" in bridge_mod.MUTATING_METHODS
+    assert "cancel" in bridge_mod.MUTATING_METHODS
+
+
+# ---------------------------------------------------------------------------
+# Phase A safety/correctness blockers (Codex review correction pass)
+# ---------------------------------------------------------------------------
+
+
+def test_completed_duplicate_rejects_stale_explicit_workflow_id(tmp_path):
+    """After terminal, same request_id + different explicit workflow_id conflicts."""
+
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        start_req = _rid("start_stale_wf")
+        first = await core.rpc(
+            "coffee.start",
+            _with_ids(
+                {"confirmation": READY_SENTINEL},
+                workflow_id=wid,
+                request_id=start_req,
+            ),
+        )
+        fake.emit(_event(state=0x22, name="starting"))
+        fake.emit(_event(state=0x24, name="ready"))
+        await asyncio.sleep(0)
+        await _drain_release(core)
+        assert core.activity is None
+        # Exact duplicate with original workflow_id still caches.
+        cached = await core.rpc(
+            "coffee.start",
+            _with_ids(
+                {"confirmation": READY_SENTINEL},
+                workflow_id=wid,
+                request_id=start_req,
+            ),
+        )
+        assert cached["status"] == first["status"]
+        # Explicit different/stale workflow_id is a conflict, not a cache hit.
+        before = list(fake.calls)
+        with pytest.raises(
+            BridgeError, match="workflow_id mismatch|idempotency conflict"
+        ):
+            await core.rpc(
+                "coffee.start",
+                _with_ids(
+                    {"confirmation": READY_SENTINEL},
+                    workflow_id="wf_stale_other",
+                    request_id=start_req,
+                ),
+            )
+        assert fake.calls == before
+        assert fake.calls.count("coffee_start") == 1
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_stop_and_cancel_preserve_rpc_method_identity(tmp_path):
+    """rpc(stop) and rpc(cancel) reserve/cache under their own method names."""
+
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        cancel_req = _rid("cancel_id")
+        first = await core.rpc(
+            "cancel", _with_ids(workflow_id=wid, request_id=cancel_req)
+        )
+        await _drain_release(core)
+        idem = core.store.get_idempotency(cancel_req)
+        assert idem["method"] == "cancel"
+        assert idem["status"] == storage.IDEM_COMPLETED
+        # Same request_id as stop is a method conflict, not emergency rename.
+        with pytest.raises(BridgeError, match="method mismatch|idempotency conflict"):
+            await core.rpc(
+                "stop",
+                _with_ids(
+                    {"emergency": True},
+                    workflow_id=wid,
+                    request_id=cancel_req,
+                ),
+            )
+        # Fresh stop path caches under method=stop.
+        loaded2 = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        stop_req = _rid("stop_id")
+        s1 = await core.rpc(
+            "stop",
+            _with_ids(workflow_id=loaded2["workflow_id"], request_id=stop_req),
+        )
+        await _drain_release(core)
+        stop_idem = core.store.get_idempotency(stop_req)
+        assert stop_idem["method"] == "stop"
+        assert stop_idem["status"] == storage.IDEM_COMPLETED
+        s2 = await core.rpc(
+            "stop",
+            _with_ids(workflow_id=loaded2["workflow_id"], request_id=stop_req),
+        )
+        assert s2["status"] == s1["status"]
+        # Emergency cancel still stores method=cancel (not renamed to stop).
+        loaded3 = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        emerg_req = _rid("emerg_cancel")
+        await core.rpc(
+            "cancel",
+            _with_ids(
+                {"emergency": True},
+                workflow_id=loaded3["workflow_id"],
+                request_id=emerg_req,
+            ),
+        )
+        await _drain_release(core)
+        emerg_idem = core.store.get_idempotency(emerg_req)
+        assert emerg_idem["method"] == "cancel"
+        await core.shutdown()
+
+    asyncio.run(go())
+    assert "coffee_cancel" in fake.calls
+
+
+def test_reconstruct_created_loading_never_start(tmp_path):
+    """created/loading reconstruct must not map to loaded or allow start writes."""
+
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+    # Seed a durable loading workflow without completing BLE load.
+    snap = {"name": "Bridge test", "kind": "coffee"}
+    wf = core.store.create_workflow(
+        kind="coffee",
+        snapshot=snap,
+        state="loading",
+        source="test",
+        owner="bridge",
+        metadata={"recipe_path": str(recipe), "recipe_name": recipe.name},
+    )
+    wid = wf["workflow_id"]
+    core.store.close()
+
+    fake2 = FakeBridgeClient("AA:BB")
+    core2 = BridgeCore(
+        default_address="AA:BB",
+        state_dir=tmp_path,
+        client_factory=lambda _a: fake2,
+        environ=_environment(),
+        machine_info_timeout=0.1,
+    )
+    assert core2.active_workflow_id == wid
+    assert core2.phase == "loading"
+    assert core2.phase != "loaded"
+    assert core2._recovery_required is True
+    assert fake2.calls == []
+
+    async def go():
+        before = list(fake2.calls)
+        with pytest.raises(BridgeError, match="created/loading|recovery_required|do not start"):
+            await core2.rpc(
+                "coffee.start",
+                _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+            )
+        assert fake2.calls == before
+        assert "coffee_start" not in fake2.calls
+        assert ("load_recipe", "Bridge test") not in fake2.calls
+        await core2.shutdown(force=True)
+
+    asyncio.run(go())
+
+
+def test_reconstruct_loaded_rejects_start_without_armed_confirm(tmp_path):
+    """Reconstructed loaded must not start when machine armed cannot be confirmed."""
+
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        core.store.close()
+        fake2 = FakeBridgeClient("AA:BB")
+        # request_status returns info only -- not armed.
+        fake2.status_state = None
+        core2 = BridgeCore(
+            default_address="AA:BB",
+            state_dir=tmp_path,
+            client_factory=lambda _a: fake2,
+            environ=_environment(),
+            machine_info_timeout=0.05,
+        )
+        assert core2.phase == "loaded"
+        assert core2._loaded_needs_reconcile is True
+        with pytest.raises(
+            BridgeError,
+            match=(
+                "cannot confirm armed|no fresh state|recovery_required|do not start"
+            ),
+        ):
+            await core2.rpc(
+                "coffee.start",
+                _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+            )
+        assert "coffee_start" not in fake2.calls
+        assert ("load_recipe", "Bridge test") not in fake2.calls
+        # Pre-start failure: retain durable ownership; connection held for recovery.
+        assert core2.active_workflow_id == wid
+        assert core2._recovery_required is True
+        assert core2.connected is True
+        await core2.shutdown(force=True)
+
+    asyncio.run(go())
+
+
+def test_reconstruct_loaded_stale_armed_without_fresh_state_fails(tmp_path):
+    """Stale machine_state=armed must not pass without a post-query state notification."""
+
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        core.store.close()
+        fake2 = FakeBridgeClient("AA:BB")
+        # Status query emits machine_info only (no state byte) -- proves sleep(0)
+        # / stale cache is insufficient.
+        fake2.status_state = None
+        core2 = BridgeCore(
+            default_address="AA:BB",
+            state_dir=tmp_path,
+            client_factory=lambda _a: fake2,
+            environ=_environment(),
+            machine_info_timeout=0.05,
+        )
+        assert core2.phase == "loaded"
+        assert core2._loaded_needs_reconcile is True
+        # Inject stale armed evidence before start (as if a prior session left it).
+        core2.machine_state = "armed"
+        with pytest.raises(
+            BridgeError,
+            match="no fresh state|recovery_required|do not start",
+        ):
+            await core2.rpc(
+                "coffee.start",
+                _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+            )
+        assert "coffee_start" not in fake2.calls
+        assert "request_status" in fake2.calls
+        assert ("load_recipe", "Bridge test") not in fake2.calls
+        assert core2.active_workflow_id == wid
+        assert core2._recovery_required is True
+        assert core2._loaded_needs_reconcile is True
+        assert core2.connected is True
+        await core2.shutdown(force=True)
+
+    asyncio.run(go())
+
+
+def test_reconstruct_loaded_fresh_coffee_armed_passes(tmp_path):
+    """Fresh post-query armed state allows coffee start without re-load."""
+
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        core.store.close()
+        fake2 = FakeBridgeClient("AA:BB")
+        fake2.status_state = 0x1F
+        fake2.status_state_name = "armed"
+        core2 = BridgeCore(
+            default_address="AA:BB",
+            state_dir=tmp_path,
+            client_factory=lambda _a: fake2,
+            environ=_environment(),
+            machine_info_timeout=0.05,
+        )
+        await core2.rpc(
+            "coffee.start",
+            _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+        )
+        assert fake2.calls.count("coffee_start") == 1
+        assert "request_status" in fake2.calls
+        assert ("load_recipe", "Bridge test") not in fake2.calls
+        assert core2._loaded_needs_reconcile is False
+        await core2.rpc("cancel", _with_ids(workflow_id=wid))
+        await _drain_release(core2)
+        await core2.shutdown()
+
+    asyncio.run(go())
+
+
+def test_reconstruct_loaded_tea_none_status_never_starts(tmp_path):
+    """Tea reconstructed-loaded: status without state never writes start_tea."""
+
+    core, fake = _core(tmp_path)
+    recipe = _tea_recipe(tmp_path / "tea.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "tea.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        core.store.close()
+        fake2 = FakeBridgeClient("AA:BB")
+        fake2.status_state = None
+        core2 = BridgeCore(
+            default_address="AA:BB",
+            state_dir=tmp_path,
+            client_factory=lambda _a: fake2,
+            environ=_environment(),
+            machine_info_timeout=0.05,
+        )
+        assert core2.phase == "loaded"
+        assert core2.activity == "tea"
+        with pytest.raises(
+            BridgeError,
+            match=(
+                "no positive protocol marker|no fresh state|"
+                "recovery_required|do not start"
+            ),
+        ):
+            await core2.rpc(
+                "tea.start",
+                _with_ids({"confirmation": TEA_READY_SENTINEL}, workflow_id=wid),
+            )
+        assert "tea_start" not in fake2.calls
+        assert ("tea_load", "Bridge tea test") not in fake2.calls
+        assert core2.active_workflow_id == wid
+        assert core2._recovery_required is True
+        assert core2.connected is True
+        await core2.rpc("cancel", _with_ids(workflow_id=wid, emergency=True))
+        await _drain_release(core2)
+        await core2.shutdown(force=True)
+
+    asyncio.run(go())
+
+
+def test_reconstruct_loaded_tea_idle_never_starts(tmp_path):
+    """Tea reconstructed-loaded: fresh idle/ready is not a positive loaded marker."""
+
+    core, fake = _core(tmp_path)
+    recipe = _tea_recipe(tmp_path / "tea.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "tea.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        core.store.close()
+        fake2 = FakeBridgeClient("AA:BB")
+        # Fresh non-active state still must not authorize tea start.
+        fake2.status_state = 0x24
+        fake2.status_state_name = "ready"
+        core2 = BridgeCore(
+            default_address="AA:BB",
+            state_dir=tmp_path,
+            client_factory=lambda _a: fake2,
+            environ=_environment(),
+            machine_info_timeout=0.05,
+        )
+        assert core2.phase == "loaded"
+        assert core2.activity == "tea"
+        with pytest.raises(
+            BridgeError,
+            match="no positive protocol marker|recovery_required|do not start",
+        ):
+            await core2.rpc(
+                "tea.start",
+                _with_ids({"confirmation": TEA_READY_SENTINEL}, workflow_id=wid),
+            )
+        assert "tea_start" not in fake2.calls
+        assert "request_status" in fake2.calls
+        assert ("tea_load", "Bridge tea test") not in fake2.calls
+        assert core2.active_workflow_id == wid
+        assert core2._recovery_required is True
+        assert core2.connected is True
+        await core2.rpc("cancel", _with_ids(workflow_id=wid, emergency=True))
+        await _drain_release(core2)
+        await core2.shutdown(force=True)
+
+    asyncio.run(go())
+
+
+def test_terminal_during_pause_durable_fail_no_paused_resurrection(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+    fake.coffee_terminal_on_pause = True
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        await core.rpc(
+            "coffee.start",
+            _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+        )
+
+        def boom(*_a, **_k):
+            raise storage.StorageError("injected terminal during pause")
+
+        core.store.commit_workflow_terminal = boom  # type: ignore[method-assign]
+        pause_req = _rid("pause_term_fail")
+        result = await core.rpc(
+            "pause", _with_ids(workflow_id=wid, request_id=pause_req)
+        )
+        assert result.get("terminal_during_control") is True
+        assert result.get("status") != "paused"
+        assert result.get("recovery_required") is True
+        assert core.phase == "recovery_required"
+        assert core.phase != "paused"
+        idem = core.store.get_idempotency(pause_req)
+        assert idem["status"] == storage.IDEM_PENDING
+        wf = core.store.get_workflow(wid)
+        assert wf["state"] != "paused"
+        assert wf["terminal_at"] is None
+        core.store.commit_workflow_terminal = (  # type: ignore[method-assign]
+            storage.StateStore.commit_workflow_terminal.__get__(
+                core.store, storage.StateStore
+            )
+        )
+        await core.shutdown(force=True)
+
+    asyncio.run(go())
+
+
+def test_terminal_during_resume_no_running_resurrection(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+    fake.coffee_terminal_on_resume = True
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        await core.rpc(
+            "coffee.start",
+            _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+        )
+        await core.rpc("pause", _with_ids(workflow_id=wid))
+        assert core.phase == "paused"
+        resume_req = _rid("resume_term")
+        result = await core.rpc(
+            "resume", _with_ids(workflow_id=wid, request_id=resume_req)
+        )
+        assert result.get("terminal_during_control") is True
+        assert result.get("status") != "running"
+        assert core.phase in {"idle", "disconnected", "recovery_required"}
+        wf = core.store.get_workflow(wid)
+        assert wf["terminal_at"] is not None
+        assert wf["state"] != "running"
+        assert not any(
+            e["event_type"] == "resumed"
+            for e in core.store.list_workflow_events(wid)
+        )
+        await _drain_release(core)
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_telemetry_terminal_resolves_control_unconfirmed_coffee(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+    fake.fail_coffee_start = True
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        with pytest.raises(BridgeError, match="unconfirmed|do not retry"):
+            await core.rpc(
+                "coffee.start",
+                _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+            )
+        assert core.phase == "control_unconfirmed"
+        assert core.active_workflow_id == wid
+        # Later confirmed terminal must resolve uncertain control.
+        fake.emit(_event(state=0x22, name="starting"))
+        fake.emit(_event(state=0x24, name="ready"))
+        await asyncio.sleep(0)
+        await _drain_release(core)
+        wf = core.store.get_workflow(wid)
+        assert wf["terminal_at"] is not None
+        assert core.activity is None
+        assert core.phase in {"idle", "disconnected"}
+        assert core.connected is False
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_telemetry_terminal_resolves_control_unconfirmed_tea(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _tea_recipe(tmp_path / "tea.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "tea.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        await core.rpc(
+            "tea.start",
+            _with_ids({"confirmation": TEA_READY_SENTINEL}, workflow_id=wid),
+        )
+        # Force uncertain control phase after a confirmed start boundary.
+        core.phase = "control_unconfirmed"
+        core._saw_active = True
+        core.store.update_workflow(
+            wid, state="control_unconfirmed", recovery={"reason": "test"}
+        )
+        fake.emit(_event(state=0x24, name="ready"))
+        await asyncio.sleep(0)
+        await _drain_release(core)
+        wf = core.store.get_workflow(wid)
+        assert wf["terminal_at"] is not None
+        assert core.activity is None
+        assert core.connected is False
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_scale_stop_terminal_and_idempotency_one_transaction(tmp_path):
+    core, fake = _core(tmp_path)
+
+    async def go():
+        started = await core.rpc(
+            "scale.start",
+            _with_ids({"duration_s": 30.0, "tare": False}),
+        )
+        wid = started["workflow_id"]
+        cancel_req = _rid("scale_cancel_ok")
+        result = await core.rpc(
+            "cancel", _with_ids(workflow_id=wid, request_id=cancel_req)
+        )
+        assert result["status"] == "stopped"
+        await _drain_release(core)
+        wf = core.store.get_workflow(wid)
+        assert wf["terminal_at"] is not None
+        idem = core.store.get_idempotency(cancel_req)
+        assert idem["status"] == storage.IDEM_COMPLETED
+        assert idem["result"]["status"] == "stopped"
+
+        # Rollback: terminal+idempotency fail together; release withheld.
+        started2 = await core.rpc(
+            "scale.start",
+            _with_ids({"duration_s": 30.0, "tare": False}),
+        )
+        wid2 = started2["workflow_id"]
+        fail_req = _rid("scale_cancel_fail")
+        real = core.store.commit_workflow_terminal
+
+        def boom(*_a, **_k):
+            raise storage.StorageError("injected scale terminal failure")
+
+        core.store.commit_workflow_terminal = boom  # type: ignore[method-assign]
+        with pytest.raises(BridgeError, match="durable|persist|recovery"):
+            await core.rpc(
+                "cancel", _with_ids(workflow_id=wid2, request_id=fail_req)
+            )
+        core.store.commit_workflow_terminal = real  # type: ignore[method-assign]
+        status = core.status()
+        assert status["connected"] is True
+        assert status["phase"] == "recovery_required"
+        assert status["release_pending"] is False
+        pending = core.store.get_idempotency(fail_req)
+        assert pending is not None
+        assert pending["status"] == storage.IDEM_PENDING
+        rolled = core.store.get_workflow(wid2)
+        assert rolled["terminal_at"] is None
+        await core.shutdown(force=True)
+
+    asyncio.run(go())
+
+
+def test_load_failed_persist_failure_retains_ownership(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        # Fail pre-BLE by making connect raise after workflow create.
+        real_connect = FakeBridgeClient.connect
+
+        async def boom_connect(self):
+            self.calls.append("connect")
+            raise RuntimeError("simulated connect failure")
+
+        FakeBridgeClient.connect = boom_connect  # type: ignore[method-assign]
+        real_commit = core.store.commit_workflow_terminal
+
+        def boom_terminal(*_a, **_k):
+            raise storage.StorageError("injected load_failed persist failure")
+
+        core.store.commit_workflow_terminal = boom_terminal  # type: ignore[method-assign]
+        load_req = _rid("load_dual_fail")
+        with pytest.raises(BridgeError, match="recovery_required|load_failed"):
+            await core.rpc(
+                "coffee.load",
+                _with_ids({"recipe": str(recipe)}, request_id=load_req),
+            )
+        FakeBridgeClient.connect = real_connect  # type: ignore[method-assign]
+        core.store.commit_workflow_terminal = real_commit  # type: ignore[method-assign]
+        status = core.status()
+        assert status["active_workflow_id"] is not None
+        assert status["phase"] == "recovery_required"
+        assert status["recovery"]["required"] is True
+        # Durable active row still present -- ownership retained.
+        active = core.store.get_active_workflow()
+        assert active is not None
+        assert active["workflow_id"] == status["active_workflow_id"]
+        assert active["terminal_at"] is None
+        idem = core.store.get_idempotency(load_req)
+        assert idem is not None
+        assert idem["status"] == storage.IDEM_PENDING
+        # No silent clear + pretend gone.
+        assert ("load_recipe", "Bridge test") not in fake.calls
+        await core.shutdown(force=True)
 
     asyncio.run(go())
