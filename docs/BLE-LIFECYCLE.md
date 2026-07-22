@@ -2,16 +2,16 @@
 
 Status: implemented in `packages/core/xbloom_ble/bridge.py` + `client.py` + `xbloom_storage.StateStore` with fake-client tests.
 
-**Implemented Phase A core slice:** A1–A2, A3 (Skill CLI observation/client-exit does not touch daemon workflows), A4–A5, **A6** (unexpected BLE disconnect + `recovery.reconcile` + external busy), A7, A8, **A9 Skill CLI** (`TypedBridgeClient`, probe RPC, category wire, all active Skill hardware via daemon; only passive scan uses discovery), focused A10 tests.
+**Implemented Phase A core slice:** A1–A2, **A3 complete** (core + Skill + Web/MCP session/client exit: HTTP/page/client disconnect must not cancel or release the daemon-owned durable workflow; passive `status`/`events` never mutate BLE), A4–A5, **A6** (unexpected BLE disconnect + `recovery.reconcile` + external busy), A7, A8, **A9 complete** (core + Skill + Web + MCP via shared `TypedBridgeClient` after sibling Web commit `63d91a4`; Skill CLI all active hardware via daemon; Web typed routes/MCP same typed client contract; only passive scan uses discovery), **A10 complete** (core unit matrix + real JSON-line multi-client transport tests in `test_a10_transport_integration.py`: cross-client handoff/exit, concurrent start same/distinct `request_id`, daemon reconstruction over transport).
 
-**Still not full Phase A:** A3 Web/HTTP/MCP client disconnect cutover, A9 Web/MCP clients, A11 hardware validation.
+**Still not full Phase A:** only **A11** real-hardware validation remains (no A3 Web/MCP follow-up).
 
 ## Rules in force
 
 | Situation | BLE behavior |
 |---|---|
 | Daemon / `BridgeCore` construction, `status`, `events` | No connect; status/events never arm, reset, or extend the idle timer |
-| Skill CLI `TypedBridgeClient` | Explicit methods; mutating RPCs get `request_id` (caller may supply); workflow-bound methods require `workflow_id`; hardware ensures daemon; status/events never connect BLE; no auto-retry of uncertain ops |
+| Skill / Web / MCP `TypedBridgeClient` | Shared typed API; `client_name` is diagnostic/visibility only (not authorization; Web MCP adapter may share e.g. `xbloom-studio-web` with Web and does not uniquely distinguish Skill/Web/MCP); mutating RPCs get `request_id` (caller may supply); workflow-bound methods require `workflow_id`; hardware ensures daemon; status/events never connect or mutate BLE; no auto-retry of uncertain ops; HTTP/page/client process exit does not cancel or release daemon-owned durable workflows |
 | `probe` RPC | One-shot connect via BridgeCore; redacted machine info; prompt-release auto-owned; retain explicit debug link; never direct Bleak from CLI |
 | Explicit `connect` RPC | Connect; `connection_scope=explicit`; hold until explicit `disconnect`; **never** auto-released or idle-timed-out; upgrading an existing auto-owned orphan immediately clears idle timeout fields/task |
 | Coffee / tea `load` | Create durable workflow + snapshot **before** BLE load write; connect if needed (`workflow`); return `workflow_id`; reuse connection through start/pause/resume/events/terminal |
