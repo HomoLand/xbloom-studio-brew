@@ -88,6 +88,9 @@ class FakeBridgeClient:
         self.fail_coffee_start = False
         self.fail_coffee_load = False
         self.fail_tea_load = False
+        self.fail_settings_writes = 0  # fail next N set_machine_settings calls
+        self.fail_advanced_writes = 0
+        self.fail_save_slots = False
         self.coffee_terminal_on_pause = False
         self.coffee_terminal_on_resume = False
         self.coffee_terminal_on_start = False
@@ -155,6 +158,9 @@ class FakeBridgeClient:
 
     async def set_machine_settings(self, **requested):
         self.calls.append(("set_machine_settings", dict(requested)))
+        if self.fail_settings_writes > 0:
+            self.fail_settings_writes -= 1
+            raise RuntimeError("settings write acknowledgement lost")
         self.machine_info.update(requested)
         return dict(self.machine_info)
 
@@ -164,6 +170,9 @@ class FakeBridgeClient:
 
     async def write_advanced_settings(self, **requested):
         self.calls.append(("write_advanced_settings", dict(requested)))
+        if self.fail_advanced_writes > 0:
+            self.fail_advanced_writes -= 1
+            raise RuntimeError("advanced write acknowledgement lost")
         self.advanced.update(
             {key: value for key, value in requested.items() if value is not None}
         )
@@ -284,10 +293,15 @@ class FakeBridgeClient:
 
     async def save_slots(self, recipes, *, scale=True):
         self.calls.append(("save_slots", [recipe.name for recipe in recipes], scale))
+        if self.fail_save_slots:
+            raise RuntimeError("slot write acknowledgement lost")
 
 
 def _environment(
-    *, live_adjust: bool = False, settings_write: bool = False
+    *,
+    live_adjust: bool = False,
+    settings_write: bool = False,
+    idle_disconnect_s: float | None = None,
 ) -> dict[str, str]:
     values = {
         REMOTE_START_ENV: REMOTE_START_SENTINEL,
@@ -297,11 +311,17 @@ def _environment(
         values[LIVE_ADJUST_ENV] = LIVE_ADJUST_SENTINEL
     if settings_write:
         values[SETTINGS_WRITE_ENV] = SETTINGS_WRITE_SENTINEL
+    if idle_disconnect_s is not None:
+        values["XBLOOM_BRIDGE_IDLE_DISCONNECT_S"] = str(idle_disconnect_s)
     return values
 
 
 def _core(
-    tmp_path: Path, *, live_adjust: bool = False, settings_write: bool = False
+    tmp_path: Path,
+    *,
+    live_adjust: bool = False,
+    settings_write: bool = False,
+    idle_disconnect_s: float | None = None,
 ):
     fake = FakeBridgeClient("AA:BB")
     core = BridgeCore(
@@ -309,7 +329,9 @@ def _core(
         state_dir=tmp_path,
         client_factory=lambda _address: fake,
         environ=_environment(
-            live_adjust=live_adjust, settings_write=settings_write
+            live_adjust=live_adjust,
+            settings_write=settings_write,
+            idle_disconnect_s=idle_disconnect_s,
         ),
         machine_info_timeout=0.1,
     )
@@ -565,37 +587,53 @@ def test_settings_advanced_and_presets_share_bridge_owner(tmp_path):
     async def go():
         settings = await core.rpc("settings.read")
         assert settings["settings"]["display"] == "medium"
+        assert core.connected is False  # read-only one-shot released
         written = await core.rpc(
             "settings.write",
-            {
-                "display": "high",
-                "confirmation": SETTINGS_CONFIRM_SENTINEL,
-            },
+            _with_ids(
+                {
+                    "display": "high",
+                    "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                }
+            ),
         )
         assert written["readback"] == {"display": "high"}
+        assert written["workflow_id"]
+        await _drain_release(core)
+        assert core.connected is False
 
         advanced = await core.rpc("advanced.read")
         assert advanced["settings"]["pour_radius_level"] == 3
+        assert core.connected is False
         tuned = await core.rpc(
             "advanced.write",
-            {
-                "pour_radius_level": 4,
-                "vibration_level": 2,
-                "confirmation": ADVANCED_CONFIRM_SENTINEL,
-            },
+            _with_ids(
+                {
+                    "pour_radius_level": 4,
+                    "vibration_level": 2,
+                    "confirmation": ADVANCED_CONFIRM_SENTINEL,
+                }
+            ),
         )
         assert tuned["readback"]["pour_radius"] == 760
         assert tuned["readback"]["vibration_amplitude"] == 1100
+        await _drain_release(core)
+        assert core.connected is False
 
         saved = await core.rpc(
-            "presets.save", {"recipes": [str(path) for path in recipes]}
+            "presets.save",
+            _with_ids({"recipes": [str(path) for path in recipes]}),
         )
         assert saved["status"] == "saved"
         assert saved["brew_started"] is False
+        assert saved["workflow_id"]
+        await _drain_release(core)
+        assert core.connected is False
         await core.shutdown()
 
     asyncio.run(go())
-    assert fake.calls.count("connect") == 1
+    # Each one-shot releases, so each hardware op reconnects.
+    assert fake.calls.count("connect") >= 5
     assert any(call[0] == "set_machine_settings" for call in fake.calls if isinstance(call, tuple))
     assert any(call[0] == "write_advanced_settings" for call in fake.calls if isinstance(call, tuple))
     assert any(call[0] == "save_slots" for call in fake.calls if isinstance(call, tuple))
@@ -608,10 +646,12 @@ def test_bridge_persistent_writes_keep_their_independent_gate(tmp_path):
         with pytest.raises(BridgeError, match="persistent machine writes disabled"):
             await core.rpc(
                 "settings.write",
-                {
-                    "display": "high",
-                    "confirmation": SETTINGS_CONFIRM_SENTINEL,
-                },
+                _with_ids(
+                    {
+                        "display": "high",
+                        "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                    }
+                ),
             )
 
     asyncio.run(go())
@@ -2283,15 +2323,18 @@ def test_terminal_during_start_durable_fail_no_running_resurrection(tmp_path):
     asyncio.run(go())
 
 
-def test_mutating_methods_do_not_advertise_unenforced_settings(tmp_path):
-    # Protocol honesty: constants must not list methods without v3 idempotency.
-    assert "settings.write" not in bridge_mod.MUTATING_METHODS
-    assert "advanced.write" not in bridge_mod.MUTATING_METHODS
-    assert "presets.save" not in bridge_mod.MUTATING_METHODS
+def test_mutating_methods_cover_settings_and_exclude_connect(tmp_path):
+    # Protocol honesty: every machine-mutating bridge method is listed; connect
+    # / disconnect are intentionally not machine-action idempotent.
+    assert "settings.write" in bridge_mod.MUTATING_METHODS
+    assert "advanced.write" in bridge_mod.MUTATING_METHODS
+    assert "presets.save" in bridge_mod.MUTATING_METHODS
     assert "connect" not in bridge_mod.MUTATING_METHODS
     assert "disconnect" not in bridge_mod.MUTATING_METHODS
     assert "coffee.load" in bridge_mod.MUTATING_METHODS
     assert "cancel" in bridge_mod.MUTATING_METHODS
+    assert "settings.read" not in bridge_mod.MUTATING_METHODS
+    assert "advanced.read" not in bridge_mod.MUTATING_METHODS
 
 
 # ---------------------------------------------------------------------------
@@ -2928,5 +2971,769 @@ def test_load_failed_persist_failure_retains_ownership(tmp_path):
         # No silent clear + pretend gone.
         assert ("load_recipe", "Bridge test") not in fake.calls
         await core.shutdown(force=True)
+
+    asyncio.run(go())
+
+# ---------------------------------------------------------------------------
+# Phase A2/A5/A7: settings, advanced, presets, orphan idle release
+# ---------------------------------------------------------------------------
+
+
+def test_settings_write_duplicate_after_terminal_single_ble_write(tmp_path):
+    core, fake = _core(tmp_path, settings_write=True)
+    req = _rid("settings_dup")
+
+    async def go():
+        first = await core.rpc(
+            "settings.write",
+            _with_ids(
+                {
+                    "display": "high",
+                    "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                },
+                request_id=req,
+            ),
+        )
+        await _drain_release(core)
+        assert core.connected is False
+        assert first["status"] == "written_and_read_back"
+        before = list(fake.calls)
+        second = await core.rpc(
+            "settings.write",
+            _with_ids(
+                {
+                    "display": "high",
+                    "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                },
+                request_id=req,
+            ),
+        )
+        assert second["status"] == first["status"]
+        assert second["workflow_id"] == first["workflow_id"]
+        assert fake.calls == before
+        writes = [
+            c for c in fake.calls if isinstance(c, tuple) and c[0] == "set_machine_settings"
+        ]
+        # One intentional write only (no second attempt on exact duplicate).
+        assert len(writes) == 1
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_settings_write_params_and_method_conflict(tmp_path):
+    core, fake = _core(tmp_path, settings_write=True)
+    req = _rid("settings_conflict")
+
+    async def go():
+        await core.rpc(
+            "settings.write",
+            _with_ids(
+                {
+                    "display": "high",
+                    "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                },
+                request_id=req,
+            ),
+        )
+        await _drain_release(core)
+        with pytest.raises(BridgeError, match="params hash mismatch|idempotency conflict"):
+            await core.rpc(
+                "settings.write",
+                _with_ids(
+                    {
+                        "display": "low",
+                        "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                    },
+                    request_id=req,
+                ),
+            )
+        with pytest.raises(BridgeError, match="method mismatch|idempotency conflict"):
+            await core.rpc(
+                "advanced.write",
+                _with_ids(
+                    {
+                        "pour_radius_level": 4,
+                        "confirmation": ADVANCED_CONFIRM_SENTINEL,
+                    },
+                    request_id=req,
+                ),
+            )
+        await core.shutdown()
+
+    asyncio.run(go())
+    writes = [
+        c for c in fake.calls if isinstance(c, tuple) and c[0] == "set_machine_settings"
+    ]
+    assert len(writes) == 1
+
+
+def test_settings_write_pending_ack_loss_no_retry_no_release(tmp_path):
+    core, fake = _core(tmp_path, settings_write=True)
+    # First write fails; rollback also fails => unconfirmed, pending.
+    fake.fail_settings_writes = 2
+    req = _rid("settings_pending")
+
+    async def go():
+        with pytest.raises(BridgeError, match="rollback_confirmed=False|recovery_required"):
+            await core.rpc(
+                "settings.write",
+                _with_ids(
+                    {
+                        "display": "high",
+                        "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                    },
+                    request_id=req,
+                ),
+            )
+        status = core.status()
+        assert status["connected"] is True
+        assert status["activity"] == "settings"
+        assert status["phase"] == "control_unconfirmed"
+        assert status["active_workflow_id"]
+        assert status["recovery"]["required"] is True
+        idem = core.store.get_idempotency(req)
+        assert idem["status"] == storage.IDEM_PENDING
+        write_count = sum(
+            1
+            for c in fake.calls
+            if isinstance(c, tuple) and c[0] == "set_machine_settings"
+        )
+        with pytest.raises(BridgeError, match="recovery_required|pending"):
+            await core.rpc(
+                "settings.write",
+                _with_ids(
+                    {
+                        "display": "high",
+                        "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                    },
+                    request_id=req,
+                ),
+            )
+        write_count_after = sum(
+            1
+            for c in fake.calls
+            if isinstance(c, tuple) and c[0] == "set_machine_settings"
+        )
+        assert write_count_after == write_count
+        assert core.connected is True
+        await core.shutdown(force=True)
+
+    asyncio.run(go())
+
+
+def test_settings_write_confirmed_rollback_fails_retryable_and_releases(tmp_path):
+    core, fake = _core(tmp_path, settings_write=True)
+    # First write fails; rollback succeeds => terminal failed, auto-release.
+    fake.fail_settings_writes = 1
+    req = _rid("settings_rollback_ok")
+
+    async def go():
+        with pytest.raises(BridgeError, match="rollback_confirmed=True"):
+            await core.rpc(
+                "settings.write",
+                _with_ids(
+                    {
+                        "display": "high",
+                        "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                    },
+                    request_id=req,
+                ),
+            )
+        await _drain_release(core)
+        status = core.status()
+        assert status["connected"] is False
+        assert status["activity"] is None
+        idem = core.store.get_idempotency(req)
+        assert idem["status"] == storage.IDEM_FAILED
+        # Retry with same identity is allowed after clear failed (re-reserve).
+        ok = await core.rpc(
+            "settings.write",
+            _with_ids(
+                {
+                    "display": "high",
+                    "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                },
+                request_id=req,
+            ),
+        )
+        assert ok["status"] == "written_and_read_back"
+        await _drain_release(core)
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_presets_save_partial_failure_keeps_recovery_and_link(tmp_path):
+    core, fake = _core(tmp_path, settings_write=True)
+    recipes = [_recipe(tmp_path / f"recipe-{slot}.yaml") for slot in "abc"]
+    fake.fail_save_slots = True
+    req = _rid("presets_partial")
+
+    async def go():
+        with pytest.raises(BridgeError, match="unconfirmed|recovery_required"):
+            await core.rpc(
+                "presets.save",
+                _with_ids(
+                    {"recipes": [str(path) for path in recipes]},
+                    request_id=req,
+                ),
+            )
+        status = core.status()
+        assert status["connected"] is True
+        assert status["activity"] == "presets"
+        assert status["phase"] == "control_unconfirmed"
+        assert status["active_workflow_id"]
+        assert status["recovery"]["required"] is True
+        idem = core.store.get_idempotency(req)
+        assert idem["status"] == storage.IDEM_PENDING
+        assert sum(1 for c in fake.calls if isinstance(c, tuple) and c[0] == "save_slots") == 1
+        with pytest.raises(BridgeError, match="recovery_required|pending"):
+            await core.rpc(
+                "presets.save",
+                _with_ids(
+                    {"recipes": [str(path) for path in recipes]},
+                    request_id=req,
+                ),
+            )
+        assert sum(1 for c in fake.calls if isinstance(c, tuple) and c[0] == "save_slots") == 1
+        await core.shutdown(force=True)
+
+    asyncio.run(go())
+
+
+def test_settings_read_write_release_and_explicit_scope_retention(tmp_path):
+    core, fake = _core(tmp_path, settings_write=True)
+
+    async def go():
+        # Successful read releases one-shot auto-owned connection.
+        await core.rpc("settings.read")
+        assert core.connected is False
+        assert core.connection_scope is None
+        assert core.last_disconnect_reason == "settings_read_done"
+
+        # Successful write releases after terminal.
+        written = await core.rpc(
+            "settings.write",
+            _with_ids(
+                {
+                    "display": "high",
+                    "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                }
+            ),
+        )
+        assert written["workflow_id"]
+        await _drain_release(core)
+        assert core.connected is False
+        assert core.last_disconnect_reason == "settings_write_complete"
+
+        # Explicit debug connection is retained across read/write.
+        await core.rpc("connect", {})
+        assert core.connection_scope == "explicit"
+        assert core.connected is True
+        await core.rpc("settings.read")
+        assert core.connected is True
+        assert core.connection_scope == "explicit"
+        await core.rpc(
+            "settings.write",
+            _with_ids(
+                {
+                    "display": "medium",
+                    "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                }
+            ),
+        )
+        await _drain_release(core)
+        assert core.connected is True
+        assert core.connection_scope == "explicit"
+        await core.rpc("disconnect")
+        assert core.connected is False
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_idle_orphan_disconnect_and_disabled(tmp_path):
+    core, fake = _core(tmp_path, settings_write=True, idle_disconnect_s=0.05)
+
+    async def go():
+        # Create a leftover one-shot link by completing a write then cancelling
+        # the prompt release so only the idle fallback can clean it up.
+        await core.rpc(
+            "settings.write",
+            _with_ids(
+                {
+                    "display": "high",
+                    "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                }
+            ),
+        )
+        core._cancel_pending_release()
+        assert core.connected is True
+        assert core.activity is None
+        assert core.connection_scope == "one-shot"
+        # Arm fallback (lifecycle helper; status must not arm/extend).
+        core._arm_or_clear_idle_orphan_watch()
+        deadline = core.status()["idle_orphan_deadline"]
+        assert deadline is not None
+        # status/events must neither create/reset/extend the timer.
+        for _ in range(5):
+            core.status()
+            core.events_since(0)
+        assert core.status()["idle_orphan_deadline"] == deadline
+        await asyncio.sleep(0.12)
+        # Idle task acquires op_lock then disconnects.
+        deadline_wait = asyncio.get_event_loop().time() + 1.0
+        while core.connected and asyncio.get_event_loop().time() < deadline_wait:
+            await asyncio.sleep(0.02)
+        assert core.connected is False
+        assert core.last_disconnect_reason == "idle_orphan_disconnect"
+        await core.shutdown()
+
+    asyncio.run(go())
+
+    core2, fake2 = _core(tmp_path / "idle0", settings_write=True, idle_disconnect_s=0)
+
+    async def go_disabled():
+        await core2.rpc(
+            "settings.write",
+            _with_ids(
+                {
+                    "display": "high",
+                    "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                }
+            ),
+        )
+        core2._cancel_pending_release()
+        core2._arm_or_clear_idle_orphan_watch()
+        assert core2.status()["idle_disconnect_s"] == 0.0
+        assert core2.status()["idle_orphan_deadline"] is None
+        await asyncio.sleep(0.12)
+        assert core2.connected is True
+        await core2.shutdown(force=True)
+
+    asyncio.run(go_disabled())
+
+
+def test_loaded_workflow_held_beyond_tiny_idle_timeout(tmp_path):
+    core, fake = _core(tmp_path, idle_disconnect_s=0.05)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        assert core.connected is True
+        assert core.phase == "loaded"
+        assert core.activity == "coffee"
+        # status must not arm/reset idle; loaded must never be timed out.
+        for _ in range(3):
+            core.status()
+        await asyncio.sleep(0.15)
+        assert core.connected is True
+        assert core.phase == "loaded"
+        assert core.active_workflow_id == loaded["workflow_id"]
+        assert core.status()["idle_orphan_deadline"] is None
+        await core.rpc("cancel", _with_ids(workflow_id=loaded["workflow_id"]))
+        await _drain_release(core)
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_presets_save_success_releases_and_duplicate_cached(tmp_path):
+    core, fake = _core(tmp_path, settings_write=True)
+    recipes = [_recipe(tmp_path / f"recipe-{slot}.yaml") for slot in "abc"]
+    req = _rid("presets_ok")
+
+    async def go():
+        first = await core.rpc(
+            "presets.save",
+            _with_ids(
+                {"recipes": [str(path) for path in recipes]},
+                request_id=req,
+            ),
+        )
+        assert first["status"] == "saved"
+        assert first["workflow_id"]
+        await _drain_release(core)
+        assert core.connected is False
+        before = list(fake.calls)
+        second = await core.rpc(
+            "presets.save",
+            _with_ids(
+                {"recipes": [str(path) for path in recipes]},
+                request_id=req,
+            ),
+        )
+        assert second["status"] == "saved"
+        assert second["workflow_id"] == first["workflow_id"]
+        assert fake.calls == before
+        assert sum(1 for c in fake.calls if isinstance(c, tuple) and c[0] == "save_slots") == 1
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "method,params_builder,write_call",
+    [
+        (
+            "settings.write",
+            lambda _tmp: {
+                "display": "high",
+                "confirmation": SETTINGS_CONFIRM_SENTINEL,
+            },
+            "set_machine_settings",
+        ),
+        (
+            "advanced.write",
+            lambda _tmp: {
+                "pour_radius_level": 4,
+                "confirmation": ADVANCED_CONFIRM_SENTINEL,
+            },
+            "write_advanced_settings",
+        ),
+        (
+            "presets.save",
+            lambda tmp: {
+                "recipes": [
+                    str(_recipe(tmp / f"slot-{slot}.yaml")) for slot in "abc"
+                ]
+            },
+            "save_slots",
+        ),
+    ],
+)
+def test_one_shot_write_durable_terminal_fail_no_false_success(
+    tmp_path, method, params_builder, write_call
+):
+    """Machine write may succeed, but durable terminal rollback must never claim success."""
+
+    core, fake = _core(tmp_path, settings_write=True)
+    req = _rid(f"{method}_term_fail")
+    params = params_builder(tmp_path)
+
+    async def go():
+        real = core.store.commit_workflow_terminal
+
+        def boom(*_a, **_k):
+            raise storage.StorageError("injected one-shot terminal failure")
+
+        core.store.commit_workflow_terminal = boom  # type: ignore[method-assign]
+        with pytest.raises(BridgeError, match="durable|recovery_required|terminal"):
+            await core.rpc(method, _with_ids(params, request_id=req))
+        core.store.commit_workflow_terminal = real  # type: ignore[method-assign]
+
+        status = core.status()
+        assert status["connected"] is True
+        assert status["phase"] == "recovery_required"
+        assert status["activity"] in {"settings", "advanced", "presets"}
+        assert status["active_workflow_id"]
+        assert status["release_pending"] is False
+        assert status["recovery"]["required"] is True
+
+        active = core.store.get_active_workflow()
+        assert active is not None
+        assert active["workflow_id"] == status["active_workflow_id"]
+        assert active["terminal_at"] is None
+
+        idem = core.store.get_idempotency(req)
+        assert idem is not None
+        assert idem["status"] == storage.IDEM_PENDING
+
+        # No success cache: exact duplicate remains blocked as pending.
+        with pytest.raises(BridgeError, match="recovery_required|pending"):
+            await core.rpc(method, _with_ids(params, request_id=req))
+        write_count = sum(
+            1
+            for c in fake.calls
+            if isinstance(c, tuple) and c[0] == write_call
+        )
+        assert write_count >= 1
+        # No second machine write on the blocked duplicate.
+        write_count_after = sum(
+            1
+            for c in fake.calls
+            if isinstance(c, tuple) and c[0] == write_call
+        )
+        assert write_count_after == write_count
+        assert core.connected is True
+        await core.shutdown(force=True)
+
+    asyncio.run(go())
+
+
+def test_settings_write_connect_failure_marks_failed_and_is_retryable(tmp_path):
+    core, fake = _core(tmp_path, settings_write=True)
+    req = _rid("settings_connect_fail")
+    real_connect = FakeBridgeClient.connect
+
+    async def boom_connect(self):
+        self.calls.append("connect")
+        raise RuntimeError("simulated settings connect failure")
+
+    FakeBridgeClient.connect = boom_connect  # type: ignore[method-assign]
+
+    async def go():
+        with pytest.raises(Exception, match="connect failure"):
+            await core.rpc(
+                "settings.write",
+                _with_ids(
+                    {
+                        "display": "high",
+                        "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                    },
+                    request_id=req,
+                ),
+            )
+        FakeBridgeClient.connect = real_connect  # type: ignore[method-assign]
+        idem = core.store.get_idempotency(req)
+        assert idem is not None
+        assert idem["status"] == storage.IDEM_FAILED
+        assert core.connected is False
+        assert core.activity is None
+        assert core.store.get_active_workflow() is None
+        # Same request_id may retry: no machine write occurred.
+        ok = await core.rpc(
+            "settings.write",
+            _with_ids(
+                {
+                    "display": "high",
+                    "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                },
+                request_id=req,
+            ),
+        )
+        assert ok["status"] == "written_and_read_back"
+        await _drain_release(core)
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_settings_write_workflow_create_failure_marks_failed_and_releases_orphan(
+    tmp_path,
+):
+    core, fake = _core(tmp_path, settings_write=True)
+    req = _rid("settings_wf_create_fail")
+
+    async def go():
+        # Pre-existing auto-owned orphan (e.g. leftover one-shot after cancelled release).
+        await core.rpc(
+            "settings.write",
+            _with_ids(
+                {
+                    "display": "medium",
+                    "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                }
+            ),
+        )
+        core._cancel_pending_release()
+        assert core.connected is True
+        assert core.connection_scope == "one-shot"
+        assert core.activity is None
+
+        real_create = core.store.create_workflow_with_event
+
+        def boom_create(*_a, **_k):
+            raise storage.StorageError("injected workflow create failure")
+
+        core.store.create_workflow_with_event = boom_create  # type: ignore[method-assign]
+        with pytest.raises(BridgeError, match="failed to create durable workflow"):
+            await core.rpc(
+                "settings.write",
+                _with_ids(
+                    {
+                        "display": "high",
+                        "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                    },
+                    request_id=req,
+                ),
+            )
+        core.store.create_workflow_with_event = real_create  # type: ignore[method-assign]
+
+        idem = core.store.get_idempotency(req)
+        assert idem is not None
+        assert idem["status"] == storage.IDEM_FAILED
+        # Pre-existing auto-owned orphan must be prompt-released (not wedged).
+        await _drain_release(core)
+        assert core.connected is False
+        assert core.connection_scope is None
+        assert core.last_disconnect_reason == "settings_write_preflight_failed"
+        # Retry same request_id after clear failed (no machine write on the fail).
+        ok = await core.rpc(
+            "settings.write",
+            _with_ids(
+                {
+                    "display": "high",
+                    "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                },
+                request_id=req,
+            ),
+        )
+        assert ok["status"] == "written_and_read_back"
+        await _drain_release(core)
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_settings_write_preflight_retains_explicit_debug_connection(tmp_path):
+    core, fake = _core(tmp_path, settings_write=True)
+    req = _rid("settings_preflight_explicit")
+
+    async def go():
+        await core.rpc("connect", {})
+        assert core.connection_scope == "explicit"
+        real_create = core.store.create_workflow_with_event
+
+        def boom_create(*_a, **_k):
+            raise storage.StorageError("injected create fail on explicit")
+
+        core.store.create_workflow_with_event = boom_create  # type: ignore[method-assign]
+        with pytest.raises(BridgeError, match="failed to create durable workflow"):
+            await core.rpc(
+                "settings.write",
+                _with_ids(
+                    {
+                        "display": "high",
+                        "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                    },
+                    request_id=req,
+                ),
+            )
+        core.store.create_workflow_with_event = real_create  # type: ignore[method-assign]
+        assert core.store.get_idempotency(req)["status"] == storage.IDEM_FAILED
+        assert core.connected is True
+        assert core.connection_scope == "explicit"
+        await core.rpc("disconnect")
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_settings_control_unconfirmed_recovery_release_truthful(tmp_path):
+    core, fake = _core(tmp_path, settings_write=True)
+    write_req = _rid("settings_unconf_write")
+    cancel_req = _rid("settings_unconf_cancel")
+    fake.fail_settings_writes = 2  # write + rollback both fail
+
+    async def go():
+        with pytest.raises(
+            BridgeError, match="rollback_confirmed=False|recovery_required"
+        ):
+            await core.rpc(
+                "settings.write",
+                _with_ids(
+                    {
+                        "display": "high",
+                        "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                    },
+                    request_id=write_req,
+                ),
+            )
+        status = core.status()
+        assert status["phase"] == "control_unconfirmed"
+        assert status["activity"] == "settings"
+        wid = status["active_workflow_id"]
+        assert wid
+        assert core.store.get_idempotency(write_req)["status"] == storage.IDEM_PENDING
+
+        released = await core.rpc(
+            "cancel", _with_ids(workflow_id=wid, request_id=cancel_req)
+        )
+        assert released["status"] == "recovery_released"
+        assert released["result"] == "ownership_released_unconfirmed"
+        assert released["machine_cancel"] is False
+        assert released["machine_effect_unknown"] is True
+        assert released.get("status") != "cancel_sent"
+        assert released.get("result") != "cancel_sent"
+        assert released.get("result") != "rollback"
+
+        await _drain_release(core)
+        status2 = core.status()
+        assert status2["activity"] is None
+        assert status2["connected"] is False
+        assert status2["last_disconnect_reason"] == "recovery_released"
+        assert status2["last_operation"]["result"] == "ownership_released_unconfirmed"
+        assert status2["last_operation"].get("machine_cancel") is False
+
+        wf = core.store.get_workflow(wid)
+        assert wf is not None
+        assert wf["terminal_at"] is not None
+        assert wf["state"] == "ownership_released_unconfirmed"
+        # Durable terminal event must not claim machine cancel.
+        events = core.store.list_workflow_events(wid)
+        terminal_events = [e for e in events if e.get("event_type") == "terminal"]
+        assert terminal_events
+        payload = terminal_events[-1].get("payload") or {}
+        assert payload.get("result") == "ownership_released_unconfirmed"
+        assert payload.get("machine_cancel") is False
+
+        cancel_idem = core.store.get_idempotency(cancel_req)
+        assert cancel_idem["status"] == storage.IDEM_COMPLETED
+        assert cancel_idem["result"]["status"] == "recovery_released"
+
+        # Original write stays pending forever; duplicate still blocked.
+        write_idem = core.store.get_idempotency(write_req)
+        assert write_idem["status"] == storage.IDEM_PENDING
+        before_writes = sum(
+            1
+            for c in fake.calls
+            if isinstance(c, tuple) and c[0] == "set_machine_settings"
+        )
+        with pytest.raises(BridgeError, match="recovery_required|pending"):
+            await core.rpc(
+                "settings.write",
+                _with_ids(
+                    {
+                        "display": "high",
+                        "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                    },
+                    request_id=write_req,
+                ),
+            )
+        after_writes = sum(
+            1
+            for c in fake.calls
+            if isinstance(c, tuple) and c[0] == "set_machine_settings"
+        )
+        assert after_writes == before_writes
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_explicit_connect_upgrades_orphan_clears_idle_timeout(tmp_path):
+    core, fake = _core(tmp_path, settings_write=True, idle_disconnect_s=30.0)
+
+    async def go():
+        await core.rpc(
+            "settings.write",
+            _with_ids(
+                {
+                    "display": "high",
+                    "confirmation": SETTINGS_CONFIRM_SENTINEL,
+                }
+            ),
+        )
+        core._cancel_pending_release()
+        assert core.connected is True
+        assert core.connection_scope == "one-shot"
+        core._arm_or_clear_idle_orphan_watch()
+        status = core.status()
+        assert status["idle_orphan_since"] is not None
+        assert status["idle_orphan_deadline"] is not None
+        assert core._idle_orphan_task is not None
+
+        await core.rpc("connect", {})
+        assert core.connection_scope == "explicit"
+        status2 = core.status()
+        assert status2["idle_orphan_since"] is None
+        assert status2["idle_orphan_deadline"] is None
+        assert core._idle_orphan_task is None
+        await core.rpc("disconnect")
+        await core.shutdown()
 
     asyncio.run(go())

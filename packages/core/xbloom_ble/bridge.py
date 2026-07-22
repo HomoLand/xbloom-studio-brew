@@ -58,11 +58,9 @@ LEGACY_RPC_PROTOCOL_MAX = 1
 # Discovery record schema version (independent of the RPC wire version).
 BRIDGE_RECORD_FORMAT_VERSION = 2
 
-# Methods that enforce protocol-v3 request_id + SQLite idempotency in this core
-# slice. settings.write / advanced.write / presets.save are intentionally
-# excluded: they remain gated machine writes but do not yet implement durable
-# request_id idempotency (Phase A2/A5 follow-up). connect/disconnect are not
-# machine-action idempotent.
+# Methods that enforce protocol-v3 request_id + SQLite idempotency.
+# connect/disconnect are intentionally excluded: they are not machine-action
+# idempotent and do not participate in this contract.
 MUTATING_METHODS = frozenset(
     {
         "coffee.load",
@@ -79,6 +77,9 @@ MUTATING_METHODS = frozenset(
         "scale.tare",
         "water.set_temperature",
         "water.set_pattern",
+        "settings.write",
+        "advanced.write",
+        "presets.save",
     }
 )
 # Control methods that require a matching active workflow_id (unless emergency)
@@ -571,6 +572,12 @@ class BridgeCore:
         self.last_disconnect_error: str | None = None
         self._pending_release_reason: str | None = None
         self._release_task: asyncio.Task[Any] | None = None
+        # Orphan idle disconnect (A7): safety-net only for leftover auto-owned
+        # links with no activity and no active/recovery workflow. Never armed by
+        # status/events; never applies to explicit debug connections.
+        self._idle_orphan_since: float | None = None
+        self._idle_orphan_deadline: float | None = None
+        self._idle_orphan_task: asyncio.Task[Any] | None = None
         # Reconstruct durable workflow identity without auto-connect / start.
         self._reconstruct_from_store()
 
@@ -614,6 +621,8 @@ class BridgeCore:
             self.activity = "water"
         elif kind == "scale":
             self.activity = "scale"
+        elif kind in {"settings", "advanced", "presets"}:
+            self.activity = kind
         else:
             self.activity = kind or None
         # Never auto-start; surface recovery when prior start may be outstanding.
@@ -724,6 +733,16 @@ class BridgeCore:
                 )
             except OSError:
                 semantic["recipe"] = str(semantic["recipe"])
+        if "recipes" in semantic and isinstance(semantic["recipes"], list):
+            normalized_recipes: list[str] = []
+            for item in semantic["recipes"]:
+                try:
+                    normalized_recipes.append(
+                        str(Path(str(item)).expanduser().resolve())
+                    )
+                except OSError:
+                    normalized_recipes.append(str(item))
+            semantic["recipes"] = normalized_recipes
         semantic["workflow_id"] = workflow_id
         semantic["method"] = method
         return semantic
@@ -1613,6 +1632,8 @@ class BridgeCore:
         # Prompt release only after fully durable terminal commit succeeds.
         if release_reason is not None and durable_ok:
             self._schedule_auto_release(release_reason)
+        # Arm/clear orphan idle fallback after activity settles (lifecycle only).
+        self._arm_or_clear_idle_orphan_watch()
 
     def _reset_liquid_telemetry(self) -> None:
         for key in (
@@ -1738,6 +1759,10 @@ class BridgeCore:
             "last_disconnect_reason": self.last_disconnect_reason,
             "last_disconnect_time": self.last_disconnect_time,
             "last_disconnect_error": self.last_disconnect_error,
+            # Idle orphan fallback observability (read-only; does not arm/reset).
+            "idle_disconnect_s": self._idle_disconnect_seconds(),
+            "idle_orphan_since": self._idle_orphan_since,
+            "idle_orphan_deadline": self._idle_orphan_deadline,
             "activity": self.activity,
             "phase": self.phase,
             "machine_state": self.machine_state,
@@ -1826,6 +1851,119 @@ class BridgeCore:
     def _auto_release_scopes(self) -> frozenset[str]:
         return frozenset({"workflow", "one-shot"})
 
+    def _idle_disconnect_seconds(self) -> float:
+        """Configured orphan idle fallback seconds; 0 disables. Default 300."""
+
+        raw = self.environ.get("XBLOOM_BRIDGE_IDLE_DISCONNECT_S")
+        if raw is None or str(raw).strip() == "":
+            return 300.0
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 300.0
+
+    def _orphan_idle_eligible(self) -> bool:
+        """True only for leftover auto-owned links with no activity/workflow.
+
+        Explicit debug connections, any in-flight activity, active/recovery
+        durable workflows, and unconfirmed control phases are never eligible.
+        """
+
+        if not self.connected:
+            return False
+        if self.connection_scope not in self._auto_release_scopes():
+            return False
+        if self.release_pending:
+            return False
+        if self.activity is not None:
+            return False
+        if self.active_workflow_id is not None:
+            return False
+        if self._recovery_required:
+            return False
+        # Loaded/running/paused/recovery/unconfirmed phases must never time out
+        # even if activity were cleared incorrectly.
+        protected_phases = {
+            "loaded",
+            "loading",
+            "running",
+            "paused",
+            "soaking",
+            "starting",
+            "stopping",
+            "writing",
+            "recovery",
+            "recovering",
+            "recovery_required",
+            "control_unconfirmed",
+            "stop_unconfirmed",
+            "load_unconfirmed",
+            "write_unconfirmed",
+        }
+        if self.phase in protected_phases:
+            return False
+        try:
+            if self.store.get_active_workflow() is not None:
+                return False
+        except StorageError:
+            # Conservative: do not orphan-timeout when durable state is unreadable.
+            return False
+        return True
+
+    def _cancel_idle_orphan_task(self) -> None:
+        task = self._idle_orphan_task
+        self._idle_orphan_task = None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
+    def _arm_or_clear_idle_orphan_watch(self) -> None:
+        """Arm or clear the orphan idle timer from lifecycle transitions only.
+
+        Must never be called from ``status`` / ``events`` (those must not
+        create, reset, or extend the timer).
+        """
+
+        timeout = self._idle_disconnect_seconds()
+        if timeout <= 0 or not self._orphan_idle_eligible():
+            self._idle_orphan_since = None
+            self._idle_orphan_deadline = None
+            self._cancel_idle_orphan_task()
+            return
+        if self._idle_orphan_since is not None:
+            # Already armed for this leftover episode; do not extend.
+            return
+        now = time.time()
+        self._idle_orphan_since = now
+        self._idle_orphan_deadline = now + timeout
+        self._cancel_idle_orphan_task()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def _run() -> None:
+            try:
+                await asyncio.sleep(timeout)
+                async with self._op_lock:
+                    if not self._orphan_idle_eligible():
+                        self._idle_orphan_since = None
+                        self._idle_orphan_deadline = None
+                        return
+                    await self._disconnect_unlocked(
+                        reason="idle_orphan_disconnect",
+                        require_idle_activity=True,
+                        record_failure=True,
+                    )
+                    self._idle_orphan_since = None
+                    self._idle_orphan_deadline = None
+            except asyncio.CancelledError:
+                return
+            finally:
+                if asyncio.current_task() is self._idle_orphan_task:
+                    self._idle_orphan_task = None
+
+        self._idle_orphan_task = loop.create_task(_run())
+
     def _cancel_pending_release(self) -> None:
         self.release_pending = False
         self._pending_release_reason = None
@@ -1840,7 +1978,8 @@ class BridgeCore:
         Safe to call from the BLE event path while a control RPC holds the lock:
         the task only disconnects after the in-flight write finishes. Explicit
         debug connections (``connection_scope == "explicit"``) are never
-        auto-released.
+        auto-released. Prompt terminal release is immediate; the idle timer is
+        only an orphan fallback.
         """
 
         if self.connection_scope not in self._auto_release_scopes():
@@ -1851,6 +1990,10 @@ class BridgeCore:
             # Keep the first pending reason; a later natural terminal during
             # cancel cleanup is still a single release.
             return
+        # Prompt release owns the link; clear any orphan idle arm.
+        self._idle_orphan_since = None
+        self._idle_orphan_deadline = None
+        self._cancel_idle_orphan_task()
         self.release_pending = True
         self._pending_release_reason = reason
         try:
@@ -1868,6 +2011,7 @@ class BridgeCore:
                 if self.activity is not None:
                     self.release_pending = False
                     self._pending_release_reason = None
+                    self._arm_or_clear_idle_orphan_watch()
                     return
                 reason = self._pending_release_reason or "auto_release"
                 await self._disconnect_unlocked(
@@ -1885,6 +2029,8 @@ class BridgeCore:
                 self.last_disconnect_reason = self._pending_release_reason
             self.release_pending = False
             self._pending_release_reason = None
+            # Disconnect failed while ownership may still be held: arm fallback.
+            self._arm_or_clear_idle_orphan_watch()
         finally:
             if asyncio.current_task() is self._release_task:
                 self._release_task = None
@@ -1903,6 +2049,11 @@ class BridgeCore:
             if scope == "explicit":
                 self.connection_scope = "explicit"
                 self._cancel_pending_release()
+                # Upgrading an orphan auto-owned link must clear idle timeout so
+                # status truthfully shows no disconnect deadline under explicit.
+                self._idle_orphan_since = None
+                self._idle_orphan_deadline = None
+                self._cancel_idle_orphan_task()
             return self.status()
         self._cancel_pending_release()
         self.phase = "connecting"
@@ -1938,7 +2089,10 @@ class BridgeCore:
             self.client = None
             self.connection_scope = None
             self.phase = "disconnected"
+            self._arm_or_clear_idle_orphan_watch()
             raise
+        # Lifecycle transition only (not status/events): arm if already orphan.
+        self._arm_or_clear_idle_orphan_watch()
         return self.status()
 
     async def _disconnect_unlocked(
@@ -1956,6 +2110,9 @@ class BridgeCore:
             self.release_pending = False
             self._pending_release_reason = None
             self.phase = "disconnected"
+            self._idle_orphan_since = None
+            self._idle_orphan_deadline = None
+            self._cancel_idle_orphan_task()
             return self.status()
         client.remove_event_listener(self._on_event)
         disconnect_error: str | None = None
@@ -1974,6 +2131,7 @@ class BridgeCore:
         finally:
             # Always drop ownership after a release attempt so the next workflow
             # can reconnect. Physical retry of machine actions is never done here.
+            # Release never auto-reconnects.
             self.client = None
             self.address = None
             self.machine_name = None
@@ -1984,6 +2142,9 @@ class BridgeCore:
             self.machine_state = None
             self.release_pending = False
             self._pending_release_reason = None
+            self._idle_orphan_since = None
+            self._idle_orphan_deadline = None
+            self._cancel_idle_orphan_task()
             self.last_disconnect_reason = reason
             self.last_disconnect_time = round(time.time(), 3)
             if disconnect_error and record_failure:
@@ -2021,6 +2182,27 @@ class BridgeCore:
             return
         await self._disconnect_unlocked(
             reason="preflight_or_load_failed",
+            require_idle_activity=True,
+            record_failure=True,
+        )
+
+    async def _prompt_release_auto_owned(self, reason: str) -> None:
+        """Prompt-release one-shot/workflow auto-owned links under ``_op_lock``.
+
+        Used by read-only one-shots after success or failure. Never releases an
+        explicit debug connection, an active activity, or a durable workflow.
+        """
+
+        if self.activity is not None:
+            return
+        if self.active_workflow_id is not None:
+            return
+        if self.connection_scope not in self._auto_release_scopes():
+            return
+        if not self.connected:
+            return
+        await self._disconnect_unlocked(
+            reason=reason,
             require_idle_activity=True,
             record_failure=True,
         )
@@ -2125,22 +2307,31 @@ class BridgeCore:
         }
 
     async def _settings_read(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        """Read-only one-shot: no durable workflow; prompt-release auto-owned link."""
+
         self._ensure_no_loaded_record()
-        newly_connected = await self._ensure_connected(params, scope="one-shot")
+        await self._ensure_connected(params, scope="one-shot")
         try:
             self._require_idle_operation()
             info = _public_machine_info(await self.client.read_machine_info())
-        except BaseException:
-            await self._release_auto_connect_on_preflight_failure(newly_connected)
-            raise
-        self.machine_info.update(info)
-        return {
-            "settings": self._settings_view(info),
-            "read_only": True,
-            "firmware": info.get("firmware"),
-        }
+            self.machine_info.update(info)
+            return {
+                "settings": self._settings_view(info),
+                "read_only": True,
+                "firmware": info.get("firmware"),
+            }
+        finally:
+            # Success or failure: drop one-shot/workflow auto-owned links only.
+            # Explicit debug connections are retained.
+            await self._prompt_release_auto_owned("settings_read_done")
 
     async def _settings_write(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        request_id = self._require_request_id(params)
+        cached = self._idempotency_preflight(
+            "settings.write", params, workflow_id=None
+        )
+        if cached is not None:
+            return cached
         self._require_settings_write(
             params.get("confirmation"), SETTINGS_CONFIRM_SENTINEL
         )
@@ -2165,18 +2356,55 @@ class BridgeCore:
         if invalid:
             raise BridgeError(f"invalid machine settings: {invalid}")
         self._ensure_no_loaded_record()
-        newly_connected = await self._ensure_connected(params, scope="one-shot")
-        try:
-            firmware = self._require_idle_write_preflight()
-        except BaseException:
-            await self._release_auto_connect_on_preflight_failure(newly_connected)
-            raise
-        before_info = _public_machine_info(await self.client.read_machine_info())
-        before = self._settings_view(before_info)
-        if any(before.get(key) is None for key in requested):
+        if self.active_workflow_id is not None and self.activity is not None:
             raise BridgeError(
-                "cannot safely write settings without a complete 40521 baseline"
+                f"active workflow {self.active_workflow_id} still owns the bridge"
             )
+        reserved = self._reserve_request(
+            "settings.write", params, workflow_id=None
+        )
+        if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
+            return dict(reserved.get("result") or {})
+        # Pre-write zone: connect / baseline / durable create. No machine write yet.
+        # Failures are retryable (IDEM_FAILED) and must prompt-release auto-owned
+        # links (including pre-existing orphans), never wedge request_id pending.
+        before: dict[str, Any] = {}
+        firmware = ""
+        wf: dict[str, Any]
+        try:
+            await self._ensure_connected(params, scope="one-shot")
+            firmware = self._require_idle_write_preflight()
+            before_info = _public_machine_info(await self.client.read_machine_info())
+            before = self._settings_view(before_info)
+            if any(before.get(key) is None for key in requested):
+                raise BridgeError(
+                    "cannot safely write settings without a complete 40521 baseline"
+                )
+            snapshot = {
+                "kind": "settings",
+                "requested": dict(requested),
+                "before": {key: before[key] for key in requested},
+            }
+            wf = self._create_durable_workflow(
+                kind="settings",
+                snapshot=snapshot,
+                state="writing",
+                source=str(params.get("source") or "bridge"),
+                metadata={
+                    "requested": dict(requested),
+                    "machine_address": self.address,
+                },
+            )
+        except BaseException as exc:
+            self._fail_request(request_id, str(exc), keep_pending=False)
+            await self._prompt_release_auto_owned("settings_write_preflight_failed")
+            raise
+        workflow_id = str(wf["workflow_id"])
+        self.active_workflow_id = workflow_id
+        self.activity = "settings"
+        self.phase = "writing"
+        if self.connection_scope != "explicit":
+            self.connection_scope = "one-shot"
         try:
             readback_info = _public_machine_info(
                 await self.client.set_machine_settings(**requested)
@@ -2197,11 +2425,47 @@ class BridgeCore:
                 )
             except Exception:
                 rollback_ok = False
-            raise BridgeError(
+            error = (
                 f"settings write failed; rollback_confirmed={rollback_ok}: {exc}"
+            )
+            if rollback_ok:
+                self._fail_request(request_id, error, keep_pending=False)
+                self._finish_activity(
+                    "write_failed_rolled_back",
+                    release_reason="settings_write_failed_rollback",
+                    rollback_confirmed=True,
+                    error=str(exc),
+                )
+                raise BridgeError(error) from exc
+            self.phase = "control_unconfirmed"
+            self.last_error = error
+            self._set_workflow_state(
+                "control_unconfirmed",
+                workflow_id=workflow_id,
+                recovery={
+                    "reason": "control_unconfirmed",
+                    "request_id": request_id,
+                    "error": str(exc),
+                    "rollback_confirmed": False,
+                },
+                event_type="control_unconfirmed",
+                event_payload={
+                    "error": str(exc),
+                    "rollback_confirmed": False,
+                },
+            )
+            self._fail_request(request_id, error, keep_pending=True)
+            self._recovery_required = True
+            self._recovery_detail = {
+                "reason": "control_unconfirmed",
+                "request_id": request_id,
+                "workflow_id": workflow_id,
+            }
+            raise BridgeError(
+                f"{error}; recovery_required; do not retry the machine write"
             ) from exc
         self.machine_info.update(readback_info)
-        return {
+        result = {
             "status": "written_and_read_back",
             "firmware": firmware,
             "before": {key: before[key] for key in requested},
@@ -2209,26 +2473,53 @@ class BridgeCore:
             "readback": {key: readback_info[key] for key in requested},
             "protocol_source": "Android APK commands 8005/8010/4508/8103",
             "hardware_write_tested_by_project": False,
+            "workflow_id": workflow_id,
+            "kind": "settings",
+            "snapshot_sha256": wf.get("snapshot_sha256"),
         }
+        self._finish_activity(
+            "written_and_read_back",
+            release_reason="settings_write_complete",
+            request_id=request_id,
+            idempotency_result=result,
+        )
+        # Durable terminal/idempotency commit may roll back after a confirmed
+        # machine write: never claim success or release; keep pending + ownership.
+        if self.phase == "recovery_required" or self._recovery_required:
+            raise BridgeError(
+                self.last_error
+                or (
+                    "settings write confirmed on machine but durable terminal "
+                    "commit failed; recovery_required; do not retry the write"
+                )
+            )
+        return result
 
     async def _advanced_read(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        """Read-only one-shot: no durable workflow; prompt-release auto-owned link."""
+
         self._ensure_no_loaded_record()
-        newly_connected = await self._ensure_connected(params, scope="one-shot")
+        await self._ensure_connected(params, scope="one-shot")
         try:
             self._require_idle_operation()
             info = _public_machine_info(await self.client.read_machine_info())
             values = await self.client.read_advanced_settings()
-        except BaseException:
-            await self._release_auto_connect_on_preflight_failure(newly_connected)
-            raise
-        self.machine_info.update(info)
-        return {
-            "settings": self._advanced_levels(values, info),
-            "read_only": True,
-            "firmware": info.get("firmware"),
-        }
+            self.machine_info.update(info)
+            return {
+                "settings": self._advanced_levels(values, info),
+                "read_only": True,
+                "firmware": info.get("firmware"),
+            }
+        finally:
+            await self._prompt_release_auto_owned("advanced_read_done")
 
     async def _advanced_write(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        request_id = self._require_request_id(params)
+        cached = self._idempotency_preflight(
+            "advanced.write", params, workflow_id=None
+        )
+        if cached is not None:
+            return cached
         self._require_settings_write(
             params.get("confirmation"), ADVANCED_CONFIRM_SENTINEL
         )
@@ -2241,35 +2532,88 @@ class BridgeCore:
         if vibration_level is not None and int(vibration_level) not in range(1, 7):
             raise BridgeError("vibration level must be 1-6")
         self._ensure_no_loaded_record()
-        newly_connected = await self._ensure_connected(params, scope="one-shot")
+        if self.active_workflow_id is not None and self.activity is not None:
+            raise BridgeError(
+                f"active workflow {self.active_workflow_id} still owns the bridge"
+            )
+        reserved = self._reserve_request(
+            "advanced.write", params, workflow_id=None
+        )
+        if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
+            return dict(reserved.get("result") or {})
+        # Pre-write zone: connect / baseline / durable create. Retryable on failure.
+        info: dict[str, Any] = {}
+        before: dict[str, Any] = {}
+        radius_target: int | None = None
+        vibration_target: int | None = None
+        expected: dict[str, Any] = {}
+        firmware = ""
+        wf: dict[str, Any]
         try:
+            await self._ensure_connected(params, scope="one-shot")
             firmware = self._require_idle_write_preflight()
             info = _public_machine_info(await self.client.read_machine_info())
-        except BaseException:
-            await self._release_auto_connect_on_preflight_failure(newly_connected)
+            before = await self.client.read_advanced_settings()
+            if radius_level is not None:
+                baseline = info.get("pouring_radius_init")
+                if not isinstance(baseline, int) or not 560 <= baseline <= 840:
+                    raise BridgeError(
+                        "machine did not expose a safe pour-radius baseline "
+                        "(expected 560-840)"
+                    )
+                radius_target = baseline + (int(radius_level) - 3) * 80
+            vibration_target = (
+                1000 + (int(vibration_level) - 1) * 100
+                if vibration_level is not None
+                else None
+            )
+            expected = {
+                key: value
+                for key, value in {
+                    "pour_radius": radius_target,
+                    "vibration_amplitude": vibration_target,
+                }.items()
+                if value is not None
+            }
+            snapshot = {
+                "kind": "advanced",
+                "requested_levels": {
+                    key: value
+                    for key, value in {
+                        "pour_radius_level": (
+                            int(radius_level) if radius_level is not None else None
+                        ),
+                        "vibration_level": (
+                            int(vibration_level)
+                            if vibration_level is not None
+                            else None
+                        ),
+                    }.items()
+                    if value is not None
+                },
+                "expected": dict(expected),
+                "before": dict(before),
+            }
+            wf = self._create_durable_workflow(
+                kind="advanced",
+                snapshot=snapshot,
+                state="writing",
+                source=str(params.get("source") or "bridge"),
+                metadata={
+                    "expected": dict(expected),
+                    "machine_address": self.address,
+                },
+            )
+        except BaseException as exc:
+            self._fail_request(request_id, str(exc), keep_pending=False)
+            await self._prompt_release_auto_owned("advanced_write_preflight_failed")
             raise
-        before = await self.client.read_advanced_settings()
-        radius_target: int | None = None
-        if radius_level is not None:
-            baseline = info.get("pouring_radius_init")
-            if not isinstance(baseline, int) or not 560 <= baseline <= 840:
-                raise BridgeError(
-                    "machine did not expose a safe pour-radius baseline (expected 560-840)"
-                )
-            radius_target = baseline + (int(radius_level) - 3) * 80
-        vibration_target = (
-            1000 + (int(vibration_level) - 1) * 100
-            if vibration_level is not None
-            else None
-        )
-        expected = {
-            key: value
-            for key, value in {
-                "pour_radius": radius_target,
-                "vibration_amplitude": vibration_target,
-            }.items()
-            if value is not None
-        }
+        workflow_id = str(wf["workflow_id"])
+        self.active_workflow_id = workflow_id
+        self.activity = "advanced"
+        self.phase = "writing"
+        if self.connection_scope != "explicit":
+            self.connection_scope = "one-shot"
         try:
             readback = await self.client.write_advanced_settings(
                 pour_radius=radius_target,
@@ -2281,7 +2625,9 @@ class BridgeCore:
                 if readback.get(key) != value
             }
             if mismatches:
-                raise BridgeError(f"advanced-settings readback mismatch: {mismatches}")
+                raise BridgeError(
+                    f"advanced-settings readback mismatch: {mismatches}"
+                )
         except Exception as exc:
             try:
                 restored = await self.client.write_advanced_settings(
@@ -2299,18 +2645,73 @@ class BridgeCore:
                 )
             except Exception:
                 rollback_ok = False
+            error = (
+                f"advanced-settings write failed; "
+                f"rollback_confirmed={rollback_ok}: {exc}"
+            )
+            if rollback_ok:
+                self._fail_request(request_id, error, keep_pending=False)
+                self._finish_activity(
+                    "write_failed_rolled_back",
+                    release_reason="advanced_write_failed_rollback",
+                    rollback_confirmed=True,
+                    error=str(exc),
+                )
+                raise BridgeError(error) from exc
+            self.phase = "control_unconfirmed"
+            self.last_error = error
+            self._set_workflow_state(
+                "control_unconfirmed",
+                workflow_id=workflow_id,
+                recovery={
+                    "reason": "control_unconfirmed",
+                    "request_id": request_id,
+                    "error": str(exc),
+                    "rollback_confirmed": False,
+                },
+                event_type="control_unconfirmed",
+                event_payload={
+                    "error": str(exc),
+                    "rollback_confirmed": False,
+                },
+            )
+            self._fail_request(request_id, error, keep_pending=True)
+            self._recovery_required = True
+            self._recovery_detail = {
+                "reason": "control_unconfirmed",
+                "request_id": request_id,
+                "workflow_id": workflow_id,
+            }
             raise BridgeError(
-                f"advanced-settings write failed; rollback_confirmed={rollback_ok}: {exc}"
+                f"{error}; recovery_required; do not retry the machine write"
             ) from exc
         self.machine_info.update(info)
-        return {
+        result = {
             "status": "written_and_read_back",
             "firmware": firmware,
             "before": self._advanced_levels(before, info),
             "readback": self._advanced_levels(readback, info),
             "protocol_source": "Android APK CodeModule2 commands 11506-11509",
             "hardware_write_tested_by_project": False,
+            "workflow_id": workflow_id,
+            "kind": "advanced",
+            "snapshot_sha256": wf.get("snapshot_sha256"),
         }
+        self._finish_activity(
+            "written_and_read_back",
+            release_reason="advanced_write_complete",
+            request_id=request_id,
+            idempotency_result=result,
+        )
+        if self.phase == "recovery_required" or self._recovery_required:
+            raise BridgeError(
+                self.last_error
+                or (
+                    "advanced write confirmed on machine but durable terminal "
+                    "commit failed; recovery_required; do not retry the write"
+                )
+            )
+        return result
 
     async def _coffee_load(self, params: Mapping[str, Any]) -> dict[str, Any]:
         request_id = self._require_request_id(params)
@@ -3175,13 +3576,28 @@ class BridgeCore:
             self._scale_stop_in_progress = False
 
     async def _save_presets(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        request_id = self._require_request_id(params)
+        cached = self._idempotency_preflight(
+            "presets.save", params, workflow_id=None
+        )
+        if cached is not None:
+            return cached
         raw_recipes = params.get("recipes")
         if not isinstance(raw_recipes, list) or len(raw_recipes) != 3:
-            raise BridgeError("presets.save requires exactly three recipe paths (A/B/C)")
+            raise BridgeError(
+                "presets.save requires exactly three recipe paths (A/B/C)"
+            )
         self._ensure_no_loaded_record()
+        if self.active_workflow_id is not None and self.activity is not None:
+            raise BridgeError(
+                f"active workflow {self.active_workflow_id} still owns the bridge"
+            )
         from xbloom_safety import load_strict_recipe, validate_slot_compatible
 
-        paths = [Path(str(item)).expanduser().resolve(strict=True) for item in raw_recipes]
+        # Validate all three recipes before durable workflow or any BLE write.
+        paths = [
+            Path(str(item)).expanduser().resolve(strict=True) for item in raw_recipes
+        ]
         recipes = [load_strict_recipe(path) for path in paths]
         for recipe in recipes:
             validate_slot_compatible(recipe)
@@ -3190,34 +3606,108 @@ class BridgeCore:
             raise BridgeError("presets scale must be a boolean or three booleans")
         if isinstance(scale, list) and len(scale) != 3:
             raise BridgeError("presets scale list must have exactly three values")
-        if isinstance(scale, list) and not all(isinstance(value, bool) for value in scale):
+        if isinstance(scale, list) and not all(
+            isinstance(value, bool) for value in scale
+        ):
             raise BridgeError("presets scale list values must be booleans")
-        newly_connected = await self._ensure_connected(params, scope="one-shot")
+        reserved = self._reserve_request(
+            "presets.save", params, workflow_id=None
+        )
+        if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
+            return dict(reserved.get("result") or {})
+        # Pre-write zone: connect / preflight / durable create. Retryable on failure.
+        firmware = ""
+        wf: dict[str, Any]
         try:
+            await self._ensure_connected(params, scope="one-shot")
             firmware = self._require_idle_write_preflight()
-        except BaseException:
-            await self._release_auto_connect_on_preflight_failure(newly_connected)
+            slot_snapshots = [
+                self._snapshot_coffee_recipe(recipe, path)
+                for path, recipe in zip(paths, recipes)
+            ]
+            snapshot = {
+                "kind": "presets",
+                "slots": slot_snapshots,
+                "slot_sha256": [content_sha256(item) for item in slot_snapshots],
+                "scale": scale if isinstance(scale, bool) else list(scale),
+                "names": [recipe.name for recipe in recipes],
+            }
+            wf = self._create_durable_workflow(
+                kind="presets",
+                snapshot=snapshot,
+                state="writing",
+                source=str(params.get("source") or "bridge"),
+                metadata={
+                    "slots": [recipe.name for recipe in recipes],
+                    "machine_address": self.address,
+                },
+            )
+        except BaseException as exc:
+            self._fail_request(request_id, str(exc), keep_pending=False)
+            await self._prompt_release_auto_owned("presets_save_preflight_failed")
             raise
+        workflow_id = str(wf["workflow_id"])
+        self.active_workflow_id = workflow_id
         self.activity = "presets"
         self.phase = "writing"
         self.targets = {"slots": [recipe.name for recipe in recipes]}
+        if self.connection_scope != "explicit":
+            self.connection_scope = "one-shot"
         try:
             await self.client.save_slots(recipes, scale=scale)
         except Exception as exc:
-            # Unconfirmed write: keep connection for recovery/debug; do not release.
-            self._finish_activity("write_unconfirmed")
-            self.last_error = f"A/B/C preset write outcome is unconfirmed: {exc}"
-            raise BridgeError(self.last_error) from exc
+            # Client contract: exception means partial/unconfirmed unless proven
+            # otherwise. Keep pending idempotency, durable ownership, and BLE.
+            error = f"A/B/C preset write outcome is unconfirmed: {exc}"
+            self.phase = "control_unconfirmed"
+            self.last_error = error
+            self._set_workflow_state(
+                "control_unconfirmed",
+                workflow_id=workflow_id,
+                recovery={
+                    "reason": "control_unconfirmed",
+                    "request_id": request_id,
+                    "error": str(exc),
+                },
+                event_type="control_unconfirmed",
+                event_payload={"error": str(exc)},
+            )
+            self._fail_request(request_id, error, keep_pending=True)
+            self._recovery_required = True
+            self._recovery_detail = {
+                "reason": "control_unconfirmed",
+                "request_id": request_id,
+                "workflow_id": workflow_id,
+            }
+            raise BridgeError(
+                f"{error}; recovery_required; do not retry the machine write"
+            ) from exc
         names = [recipe.name for recipe in recipes]
-        # Narrow scope: presets remain a held one-shot; no prompt release here.
-        self._finish_activity("saved")
-        self.last_error = None
-        return {
+        result = {
             "status": "saved",
             "firmware": firmware,
             "slots": names,
             "brew_started": False,
+            "workflow_id": workflow_id,
+            "kind": "presets",
+            "snapshot_sha256": wf.get("snapshot_sha256"),
         }
+        self.last_error = None
+        self._finish_activity(
+            "saved",
+            release_reason="presets_save_complete",
+            request_id=request_id,
+            idempotency_result=result,
+        )
+        if self.phase == "recovery_required" or self._recovery_required:
+            raise BridgeError(
+                self.last_error
+                or (
+                    "presets save confirmed on machine but durable terminal "
+                    "commit failed; recovery_required; do not retry the write"
+                )
+            )
+        return result
 
     def _check_grinder_rest(self) -> None:
         if not self.grinder_state_file.exists():
@@ -3991,6 +4481,45 @@ class BridgeCore:
                 workflow_id=workflow_id or None,
             )
             return result
+        if self.activity in {"settings", "advanced", "presets"}:
+            # One-shot writes have no machine cancel opcode. stop/cancel may
+            # explicitly abandon bridge ownership, but must not claim a machine
+            # cancel or rollback. Original write request_id stays pending forever
+            # (never reissued); machine effect remains unknown.
+            activity = self.activity
+            result = {
+                "status": "recovery_released",
+                "result": "ownership_released_unconfirmed",
+                "activity": activity,
+                "workflow_id": workflow_id or self.active_workflow_id,
+                "machine_cancel": False,
+                "machine_effect_unknown": True,
+                "note": (
+                    "no machine cancel opcode for settings/advanced/presets; "
+                    "bridge ownership released without confirming machine state; "
+                    "original write request_id remains pending and must not be reissued"
+                ),
+            }
+            if used_emergency:
+                result["emergency"] = True
+            self._finish_activity(
+                "ownership_released_unconfirmed",
+                release_reason="recovery_released",
+                emergency=used_emergency,
+                request_id=request_id,
+                idempotency_result=result,
+                machine_cancel=False,
+                machine_effect_unknown=True,
+            )
+            if self.phase == "recovery_required":
+                raise BridgeError(
+                    self.last_error
+                    or (
+                        "recovery release durable terminal commit failed; "
+                        "recovery_required"
+                    )
+                )
+            return result
         raise BridgeError(f"stop is not implemented for activity {self.activity}")
 
     async def _set_water_temperature(self, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -4165,6 +4694,9 @@ class BridgeCore:
                     }
                 )
             self._cancel_pending_release()
+            self._cancel_idle_orphan_task()
+            self._idle_orphan_since = None
+            self._idle_orphan_deadline = None
             if self.connected:
                 # Force shutdown may still own a recovery activity; drop the
                 # link without requiring idle (durable recovery is retained).
