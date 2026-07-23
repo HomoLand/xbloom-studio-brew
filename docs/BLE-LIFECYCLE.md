@@ -4,7 +4,7 @@ Status: implemented in `packages/core/xbloom_ble/bridge.py` + `client.py` + `xbl
 
 **Implemented Phase A core slice:** A1–A2, **A3 complete** (core + Skill + Web/MCP session/client exit: HTTP/page/client disconnect must not cancel or release the daemon-owned durable workflow; passive `status`/`events` never mutate BLE), A4–A5, **A6** (unexpected BLE disconnect + `recovery.reconcile` + external busy), A7, A8, **A9 complete** (core + Skill + Web + MCP via shared `TypedBridgeClient` after sibling Web commit `63d91a4`; Skill CLI all active hardware via daemon; Web typed routes/MCP same typed client contract; only passive scan uses discovery), **A10 complete** (core unit matrix + real JSON-line multi-client transport tests in `test_a10_transport_integration.py`: cross-client handoff/exit, concurrent start same/distinct `request_id`, daemon reconstruction over transport).
 
-**Still not full Phase A:** only **A11** real-hardware validation remains (no A3 Web/MCP follow-up).
+**Still not full Phase A:** only **A11** real-hardware validation remains (see also `skills/xbloom-studio-brew/references/hardware-validation.md` H00–H08). Code/tests for A1–A10 are complete on `codex/roadmap-completion` / core v1.2.0.
 
 ## Rules in force
 

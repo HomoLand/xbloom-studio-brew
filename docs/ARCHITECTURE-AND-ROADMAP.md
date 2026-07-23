@@ -1,8 +1,9 @@
 # xBloom Studio 平台：需求书、架构设计与开发路线
 
-> 状态：已确认 v1.0（开发基线）
-> 最后更新：2026-07-22
+> 状态：已确认 v1.0（开发基线）；实现进度跟踪见 §5
+> 最后更新：2026-07-23
 > 适用范围：`xbloom-studio-brew`（core + skill）与 `xbloom-studio-web`（backend + frontend）两个仓库
+> 当前发布：GitHub Release **v1.2.0**（core wheel + knowledge zip + skill zip）
 
 ---
 
@@ -391,17 +392,21 @@ LAN 模式规则：
 
 **任务**：
 - 0.1 完善 `xbloom-studio-core` 包元数据、版本策略和 `xbloom-bridge` console entry；开发依赖可 editable，release 依赖必须固定版本与 hash。
-  - **已完成（本仓库代码）**：core 元数据 + console entry；开发 `-e packages/core`；release 用 vendored wheel（`core_wheel_sha256`）+ 单一 universal `requirements-runtime.lock`（`--require-hashes`，排除 core；uv 0.11.28 生成；`tools/update_runtime_lock.py` update/check）。不代表远端已跑 CI 或已有 GitHub Release 资产。
+  - **已完成**：core 元数据 + console entry；开发 `-e packages/core`；release 用 vendored wheel（`core_wheel_sha256`）+ 单一 universal `requirements-runtime.lock`（`--require-hashes`，排除 core；uv 0.11.28 生成；`tools/update_runtime_lock.py` update/check）。
 - 0.2 release build 从唯一 knowledge 源生成 self-contained Skill bundle 与 versioned knowledge bundle，写入 manifest、knowledge version 和内容 hash。
-  - **已完成（本仓库代码）**：`tools/build_release.py` 产出 core wheel、knowledge zip（manifest/hash）、Skill zip（含 lock + `vendor/release.json`）、`release-manifest.json`；可复现 ZIP；tag 驱动的 `.github/workflows/release.yml` 已写入（校验 tag=`v`+core version、check lock、构建、smoke bootstrap、上传封闭产物集）。**未**声称已有已发布 Release。
+  - **已完成**：`tools/build_release.py` + tag 驱动 `.github/workflows/release.yml`；**GitHub Release v1.2.0** 已发布 core wheel、knowledge zip、skill zip、`release-manifest.json`。
 - 0.3 引入 `XBLOOM_STATE_DIR` 与 `state.db`；为 catalog、recipe revisions、workflows、events、idempotency、migrations 建 schema。
+  - **已完成（core）**：`xbloom_storage.StateStore` + WAL schema/migrations。
 - 0.4 编写一次性迁移：导入现有 `catalog.json`、`brew-history.jsonl` 和恢复记录；迁移前备份，失败可回滚且不删除原文件。
+  - **已完成（core）**：`xbloom-state migrate`；遗留 JSON 仅 import-only。
 - 0.5 daemon 使用 OS 生命周期锁；`bridge.json` 写 instance/core/protocol/config 信息，实现 `hello` 兼容握手与 stale record 清理。
+  - **已完成（core）**。
 - 0.6 core 提供受控 bridge 启动/停止/空闲重启 API；Web 不再查找 Skill 的 `xbloom.py` 来启动 daemon。
+  - **已完成（core + Web）**：`ensure_bridge_daemon()`；Web 不依赖 Skill 脚本路径。
 - 0.7 Skill bootstrap 不在安装 core 前导入 core；分别验证仓库 checkout、仅 Skill 发布包、仅 Web 发布包三种 clean install。
-  - **已完成（本仓库 Skill 侧）**：stdlib-only bootstrap；release 严格校验 wheel+lock 后再 pip；extracted Skill ZIP 无 sibling checkout。Web 侧 clean install 仍在 sibling Web 仓库范围。
+  - **已完成（Skill）**：stdlib-only bootstrap + release integrity；Web pin 已发布 wheel（v1.2.0）。主干合入后做一次 trunk clean-install 再确认。
 - 0.8 建立跨平台 CI：Windows、macOS、Linux 执行 build、安装、迁移、单实例竞争和协议兼容测试。
-  - **已完成（workflow 定义）**：`.github/workflows/test.yml` 含三 OS 全量测试与 release-artifacts（uv lock check、offline core + hashed lock install、extracted Skill bootstrap）。**未**声称远端 CI 已实际跑通本次变更。
+  - **已完成**：`.github/workflows/test.yml` + release workflow；`codex/roadmap-completion` 与 `v1.2.0` tag 上 CI 已通过。
 
 **验收**：仅拿 Skill 发布包即可 bootstrap/doctor/validate；Web 只安装固定 core + knowledge 产物即可启动；两个并发启动者最终只有一个 bridge；旧 JSON/JSONL 数据无损进入 SQLite；不兼容客户端在任何 BLE 写之前被拒绝。
 
@@ -433,6 +438,7 @@ LAN 模式规则：
 - A10 单元/集成测试覆盖并发 start、重复 request ID、错误 workflow ID、客户端退出、daemon restart、BLE drop、loaded 保持连接直至 start 或显式 cancel（无时间驱动自动动作）、确认终态后断连、未确认 control/cancel 保持 recovery 与连接，以及 external busy。
   - **已完成**：core fake-client 单元矩阵（错误 workflow ID、重复 request_id 幂等、BLE drop + `recovery.reconcile`、loaded 保持/无时间驱动动作、未确认 control/recovery、确认终态 release、external busy）见 `test_bridge.py` / `test_bridge_client.py` / A6；**真实 JSON-line 传输 + 多 TypedBridgeClient** 集成见 `skills/xbloom-studio-brew/tests/test_a10_transport_integration.py`：跨客户端 handoff（Skill load → 客户端退出 → Web status/events 观察 → MCP start → 确认终态 release，load→start 一次 connect/一次 load/一次 start）；并发同 `request_id` 缓存单次写；并发异 `request_id` 仅一次 start 成功；daemon 进程丢失后同 state root 重建（status/events 不建联；`recovery.reconcile` 仅 connect+query；start 不 re-load）。Phase A 仅剩 A11 真实硬件验收。
 - A11 真实硬件测试记录一次完整 load/start/pause/resume/complete 的连接次数；完成后从手机官方 App 连接，再从 Web/Skill 发起下一工作流。
+  - **未完成（真机）**：fake/集成测试已覆盖 A1–A10；A11 与 `references/hardware-validation.md`（H00–H08）仍待 supervised 验收。
 
 **实现落点（已落地）**：`packages/core/xbloom_ble/bridge.py` + `bridge_client.py` + `client.py` + `packages/core/xbloom_storage.py`；fake 测试见 `skills/xbloom-studio-brew/tests/test_bridge.py`、`test_bridge_client.py`、`test_a10_transport_integration.py`、`test_client.py` 与 `test_storage.py`。显式 `connect` 保持到显式 `disconnect`；coffee/tea 从 load 保持连接至确认终态或确认 cancel；workflow/one-shot 在确认终态后释放；settings/advanced/presets 写为 durable one-shot；读-only 设置立即释放 auto-owned；遗留 auto-owned 链路可由 idle 兜底；daemon 进程不退出。loaded 无时间驱动的自动 cancel/unload/断连，**无**五分钟 loaded 过期。意外 BLE 掉线进入 recovery；`recovery.reconcile` 仅 connect+query。RPC protocol **v3**（破坏性：变更 RPC 需 `request_id` / workflow-bound 控制需 `workflow_id`）。
 
@@ -445,49 +451,40 @@ LAN 模式规则：
 **目标**：拍照/文字 → provider adapter → 结构化候选 → schema/core 校验 → recipe revision。
 
 **任务**：
-- B1 新增 `backend/design/` 与类型化 `POST /api/design`：multipart 接收图片+文字，JSON 接收纯文字；限制 MIME、字节数、像素与处理超时。
-- B2 从已安装 knowledge bundle 读取 recipe design/schema/tea 文档并校验 manifest/hash；开发期才允许目录覆盖。
-- B3 定义 provider interface 与 OpenAI-compatible/Anthropic/Gemini adapter 边界；provider/model/base URL/key 分别配置，能力不支持时启动即报错。
-- B4 `vision` 模式移除 EXIF 后发送图片；`text` 模式对图片做本地 OCR，只发送文字；所有临时文件在请求结束后清理。
-- B5 使用版本化 JSON Schema structured output；把 OCR/图片文字当不可信数据，非法或越权字段不能进入候选。
-- B6 candidate 经过单位归一和 core 校验；最多一次受约束的结构修复，仍非法则返回字段级错误和可编辑候选。
-- B7 返回 `recipe_candidate`、简短设计依据、evidence、校验结果和 provenance；不请求或保存原始思维过程。
-- B8 保存/编辑通过 core storage API 创建 recipe/revision；记录 knowledge/provider/model/prompt template/hash 与父 revision，原始图片不落库。
-- B9 提供 typed recipe CRUD API；禁止把任意本地文件路径暴露给浏览器，也不提供通用 bridge RPC 转发。
-- B10 单元/contract/eval 测试覆盖 provider mock、图片限制、prompt injection、schema 修复、core 安全拒绝、provenance 和并发 revision 创建。
+- B1–B10：**已完成（`xbloom-studio-web` feature 分支）** — `backend/design/`、`POST /api/design`、knowledge 校验、provider adapter、revision CRUD、路径边界、mock 合同测试。真 LLM 固定 fixture 准确率评测仍为可选加强项。
 
-**验收**：固定图片/文字 fixtures 在已选 provider 上达到约定提取准确率和合法配方率；非法输出不会进入 catalog 或 bridge；切换 provider 只更换 adapter/config；仅文字模式不发送图片；保存与并发编辑产生稳定 revision，不丢数据；日志/数据库/临时目录均无 API key 和原始图片残留。
-
-**影响文件**：Web backend design/providers/routes/auth、core recipe/storage API、knowledge loader、requirements 与 backend tests/eval fixtures。
+**验收（代码层）**：非法输出不进 catalog/bridge；text 模式不送图；并发 revision 稳定；密钥/原图不落库。  
+**仍待**：合入 `master`；可选真 provider eval。
 
 ### Phase C — WebUI 设计前端（frontend）
 
 **目标**：把 Phase B/A 能力做成桌面和已配对手机均可用的“拍照→配方→冲煮→释放 BLE”闭环。
 
 **任务**：
-- C1 backend/frontend 支持 `loopback` 与 `lan` 模式；实现 HTTPS 配置、一次性配对码/QR、会话撤销、CSRF 和精确 CORS。
-- C2 新增 Design 页：移动端 `capture` 拍照、桌面端选文件、文字提问；上传前显示缩略图和数据去向。
-- C3 展示规范化参数、evidence、设计依据、校验状态与来源；编辑使用领域控件并在每次变更后重新 core 校验。
-- C4 保存创建 recipe revision；一键冲煮先展示最终 snapshot，确认后调用 `load` 获取 workflow ID，再用该 ID 执行 start。
-- C5 Dashboard/Monitor 按 workflow ID 展示阶段、遥测和事件；刷新页面后从持久 workflow 恢复，instance 改变或 event gap 时自动重新同步。
-- C6 显示连接作用域、活动来源、恢复态、外部设备占用和最近 BLE 释放原因；不把自动重连伪装成持续 loading。
-- C7 完成/取消/停止后保留最终摘要与历史链接，同时明确显示“BLE 已释放”；无需用户额外点击 disconnect。
-- C8 错误体验覆盖 provider 超时、非法候选、认证过期、错误 workflow、bridge 不兼容、device busy external 和 recovery-required。
-- C9 Playwright 覆盖 desktop/mobile 视口、配对、上传、编辑、刷新恢复、并发旧页面和完整生成→冲煮→终态流程；硬件动作使用 fake bridge，真实机器另做受控验收。
+- C1–C9：**已完成（`xbloom-studio-web` feature 分支）** — loopback/LAN 安全、Design/Dashboard/Pair/Recipes、workflow 监控与恢复 UX、Playwright（fake bridge）。真机/真手机闭环仍待 A11 与 supervised 验收。
 
-**验收**：默认 loopback 不可从 LAN 访问；LAN 未配对请求被拒绝；已配对手机可拍照生成并完成冲配；旧页面不能控制新 workflow；页面关闭/刷新不影响 bridge 完成任务；确认终态后 UI 与 bridge 均显示 BLE 已释放，手机官方 App 可连接；桌面同流程可用。
+**验收（代码层）**：loopback 默认；LAN 需配对；页面关闭不影响 bridge。  
+**仍待**：合入 `master`；真人/真机冒烟。
 
-**影响文件**：Web backend auth/network/routes、frontend pages/api/state、Playwright fixtures/tests 与部署文档。
+### 合入与收尾（主线剩余）
+
+| 项 | 状态 |
+|----|------|
+| brew `codex/roadmap-completion` → `main` | 待合入（领先 ~14 commit） |
+| web 同名分支 → `master` | 待合入（本地仓库；无 GitHub remote 时本地 merge） |
+| A11 真机 workflow 生命周期 | 未做 |
+| hardware-validation H00–H08 | 未做 |
+| 社区 xBloom 开源取经 | **明确延后** |
 
 ---
 
 ## 6. 已确认实施选择
 
 - **Phase 顺序**：`0 → (A 与 B 可并行) → C`。
-- **发布渠道**：初期使用 GitHub Release 发布 core wheel 与 knowledge bundle；self-contained Skill 发布包携带固定版本的 core wheel。暂不要求 PyPI。
+- **发布渠道**：初期使用 GitHub Release 发布 core wheel 与 knowledge bundle；self-contained Skill 发布包携带固定版本的 core wheel。暂不要求 PyPI。**当前：v1.2.0 已发布。**
 - **Vision provider**：使用本地 CLP 反代提供的 OpenAI-compatible 接口，主模型为 `grok-4.5`；provider adapter 边界仍保留，便于未来切换。
 - **LAN HTTPS**：复用已有本地域名与可信反向代理终止 TLS；Web backend 校验固定 public origin 和 trusted proxy，不自行承担证书签发。
 
 ---
 
-（本文件已确认为 v1.0 开发基线；需求或 ADR 变化须先更新本文档，再进入实现。）
+（本文件已确认为 v1.0 开发基线；需求或 ADR 变化须先更新本文档，再进入实现。实现进度旁注以本节为准，合入主干后同步更新。）
