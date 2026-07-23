@@ -22,7 +22,7 @@ pip install -e packages/core
 
 Under the state root:
 
-- `state.db` - SQLite/WAL catalog, recipe revisions, workflows, events, idempotency
+- `state.db` - SQLite/WAL workflows, history, idempotency, recipe revisions schema; catalog cutover pending
 - `bridge.json` - discovery record (instance, port, token, versions); not a lock
 - `bridge.lock` - lifecycle OS lock (fcntl / msvcrt); one daemon per state root
 - legacy JSON/JSONL files can be imported **explicitly** via `xbloom-state migrate`
@@ -36,10 +36,12 @@ Under the state root:
 | `xbloom-state migrate` | Timestamped backup of legacy files, import into `state.db` (idempotent) |
 | `xbloom-state backup` | Online SQLite backup of `state.db` only |
 
-**Runtime cutover is deferred.** Catalog and brew-history writers remain JSON/JSONL-backed.
-A completed migration receipt means an imported snapshot exists in `state.db`; it does **not**
-mean SQLite is the active runtime source of truth. Do not auto-migrate on bridge daemon start
-while that is true (a stale DB would look “complete”).
+**Partial runtime cutover (history complete; catalog pending).** SQLite/WAL is the
+authoritative runtime store for workflow, brew history (`history_events`), and
+idempotency. Catalog writers remain JSON-backed until catalog cutover. A completed
+migration receipt means legacy snapshots (including brew-history lines) were imported
+into `state.db`; it is **not** full catalog cutover. Do not auto-migrate on bridge
+daemon start. Runtime history never rewrites `brew-history.jsonl`.
 
 Skill mirror: `python scripts/xbloom.py state status|migrate|backup`.
 

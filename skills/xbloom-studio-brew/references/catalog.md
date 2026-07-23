@@ -261,11 +261,13 @@ python <skill-dir>/scripts/xbloom.py catalog history-sync --region china
 
 Imported rows are marked `source: app-cloud` and are coarser than local BLE telemetry: recipe name,
 dose, brew time, cup type, and create timestamp are preserved; full stage telemetry is not. Local
-Skill-driven runs are written separately by the CLI into:
+bridge-owned terminal history is written once into SQLite:
 
 ```text
-~/.xbloom-studio-brew/brew-history.jsonl
+~/.xbloom-studio-brew/state.db   # history_events table (authoritative)
 ```
+
+Legacy `brew-history.jsonl` is import-only after migration; runtime never appends it.
 
 Inspect or annotate the journal without BLE:
 

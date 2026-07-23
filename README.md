@@ -119,8 +119,9 @@ never accepted as command arguments. `catalog push` is preview-only unless the u
 adds both `--apply` and `--confirm-write own-account-cloud-recipe`. `catalog delete` is also
 preview-only unless the user adds both `--apply` and
 `--confirm-delete own-account-cloud-recipe-delete`, and it only accepts a currently created
-`tableId`. The local brew journal defaults to `~/.xbloom-studio-brew/brew-history.jsonl`. Live
-cloud write/delete endpoints are not used by release tests. See the
+`tableId`. The local brew journal lives in `~/.xbloom-studio-brew/state.db` (`history_events`);
+legacy `brew-history.jsonl` is import-only. Live cloud write/delete endpoints are not used by
+release tests. See the
 [catalog and A/B/C guide](skills/xbloom-studio-brew/references/catalog.md).
 
 ## Install

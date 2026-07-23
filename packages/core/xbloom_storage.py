@@ -1,10 +1,12 @@
-"""Transactional SQLite storage for catalog, workflows, and idempotency.
+"""Transactional SQLite storage for workflows, history, and catalog schema.
 
 Phase 0 baseline: schema, primitives, integrity, online backup, and a one-time
-lossless import of legacy JSON/JSONL state. Phase B B8 adds typed recipe/
-revision APIs (create/edit/list/archive) with optimistic concurrency, domain
-validation, and safe provenance. SQLite/WAL is the authoritative revision
-store for Web B9. Physical BLE workflow semantics remain in the bridge.
+lossless import of legacy JSON/JSONL state. Phase 0.3/0.4 history cutover makes
+``history_events`` the authoritative append-only brew journal (JSONL is
+import-only). Phase B B8 adds typed recipe/revision APIs with optimistic
+concurrency, domain validation, and safe provenance. Catalog *runtime* writers
+remain JSON-backed until catalog cutover. Physical BLE workflow semantics remain
+in the bridge.
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ from xbloom_ble.tea import TeaRecipe, TeaRecipeError
 from xbloom_paths import normalize_state_root, state_dir as resolve_state_dir
 from xbloom_safety import SafetyError, strict_validate
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DB_FILE_NAME = "state.db"
 BUSY_TIMEOUT_MS = 5000
 # Cross-connection fresh-DB bootstrap: exclusive lock + busy retries (not a
@@ -37,8 +39,33 @@ SCHEMA_INIT_MAX_ATTEMPTS = 40
 SCHEMA_INIT_BASE_DELAY_S = 0.01
 DEFAULT_BACKUP_DIRNAME = "backups"
 LEGACY_MIGRATION_NAME = "legacy_json_v1"
+# Independent of legacy_json_v1: backfills history_events from legacy_imports
+# (or from the same import transaction on first cutover). Required so schema-v3
+# installs that already hold a legacy_json_v1 receipt still populate the v4
+# journal on a normal migrate without --force.
+LEGACY_HISTORY_CUTOVER_NAME = "legacy_history_sqlite_v1"
 DEFAULT_RECIPE_LIST_LIMIT = 50
 MAX_RECIPE_LIST_LIMIT = 500
+DEFAULT_HISTORY_LIST_LIMIT = 20
+MAX_HISTORY_LIST_LIMIT = 200
+MAX_HISTORY_NOTE_CHARS = 500
+HISTORY_SOURCE_LOCAL = "local-skill"
+HISTORY_SOURCE_APP = "app-cloud"
+HISTORY_VALID_OUTCOMES = frozenset(
+    {
+        "loaded",
+        "started",
+        "completed",
+        "completion_unconfirmed",
+        "cancelled",
+        "failed",
+        "imported",
+    }
+)
+# Strip accidental secrets from public history event shapes.
+_HISTORY_STRIP_KEYS = frozenset(
+    {"password", "token", "clientSecretStr", "session"}
+)
 
 # Non-terminal workflow states that may still own recovery / connection scope.
 ACTIVE_WORKFLOW_STATES = frozenset(
@@ -257,6 +284,192 @@ def sha256_file(path: Path) -> str:
 
 def content_sha256(value: Any) -> str:
     return sha256_text(canonical_json(value))
+
+
+def new_history_event_id() -> str:
+    return f"bh_{uuid4().hex}"
+
+
+def history_event_dedupe_key(event_id: str) -> str:
+    """Runtime / retry dedupe key for a public event_id."""
+
+    return f"event:{event_id}"
+
+
+def workflow_terminal_history_dedupe_key(workflow_id: str) -> str:
+    """Idempotent key for the one final history row per workflow terminal."""
+
+    return f"workflow:{workflow_id}:terminal"
+
+
+def legacy_history_line_dedupe_key(line_no: int, line_digest: str) -> str:
+    """Preserve each JSONL source line as its own row (even duplicate event_id)."""
+
+    return legacy_history_record_dedupe_key(f"line:{line_no}:{line_digest}")
+
+
+def legacy_history_record_dedupe_key(record_key: str) -> str:
+    """Dedupe key for a legacy_imports history row (source identity / record_key)."""
+
+    return f"legacy:{record_key}"
+
+
+def public_history_event(event: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a public history event dict with accidental secrets stripped."""
+
+    data = dict(event)
+    for key in _HISTORY_STRIP_KEYS:
+        data.pop(key, None)
+    return data
+
+
+def _history_clean_text(
+    value: Any, *, field: str, max_chars: int = 240
+) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if len(text) > max_chars:
+        raise StorageError(f"{field} must be at most {max_chars} characters")
+    return text
+
+
+def map_terminal_history_outcome(
+    state: str, payload: Mapping[str, Any] | None = None
+) -> str:
+    """Map a durable workflow terminal state to a public history outcome."""
+
+    payload = dict(payload or {})
+    raw = str(state or "").strip()
+    lowered = raw.casefold()
+    if raw in HISTORY_VALID_OUTCOMES:
+        return raw
+    if lowered in HISTORY_VALID_OUTCOMES:
+        return lowered
+    if lowered in {
+        "ready",
+        "completed",
+        "done",
+        "exited",
+        "finished",
+        "complete",
+        "saved",
+        "written_and_read_back",
+    }:
+        return "completed"
+    if lowered in {"cancelled", "canceled", "cancel", "cancel_sent", "stopped"}:
+        return "cancelled"
+    if lowered in {"failed", "error", "load_failed", "fault"}:
+        return "failed"
+    if "unconfirmed" in lowered:
+        return "completion_unconfirmed"
+    if payload.get("emergency"):
+        return "cancelled"
+    if "cancel" in lowered or "stop" in lowered:
+        return "cancelled"
+    if "fail" in lowered or "error" in lowered:
+        return "failed"
+    # Machine natural terminal names (ready/etc.) already handled; default failed.
+    return "failed"
+
+
+def history_event_from_workflow_terminal(
+    workflow_row: Mapping[str, Any],
+    *,
+    state: str,
+    event_payload: Mapping[str, Any] | None = None,
+    terminal_at: str,
+) -> dict[str, Any]:
+    """Build one public history event from an immutable workflow terminal commit."""
+
+    payload = dict(event_payload or {})
+    snapshot = workflow_row.get("snapshot")
+    if snapshot is None and workflow_row.get("snapshot_json"):
+        try:
+            snapshot = json.loads(workflow_row["snapshot_json"])
+        except (TypeError, json.JSONDecodeError):
+            snapshot = {}
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    metadata = workflow_row.get("metadata")
+    if metadata is None and workflow_row.get("metadata_json") is not None:
+        try:
+            metadata = json.loads(workflow_row["metadata_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    workflow_id = str(workflow_row.get("workflow_id") or "")
+    kind = workflow_row.get("kind")
+    outcome = map_terminal_history_outcome(state, payload)
+    source = str(workflow_row.get("source") or HISTORY_SOURCE_LOCAL).strip() or (
+        HISTORY_SOURCE_LOCAL
+    )
+    # snapshot_sha256 is the content hash of the workflow snapshot row.
+    # recipe_sha256 is the recipe/source content hash when known; revision-only
+    # recipes may omit it while snapshot_sha256 remains present. Never mislabel
+    # the snapshot digest as recipe_sha256.
+    snapshot_sha = workflow_row.get("snapshot_sha256")
+    recipe_sha = (
+        snapshot.get("_source_sha256")
+        or snapshot.get("recipe_sha256")
+        or metadata.get("recipe_sha256")
+        or metadata.get("_source_sha256")
+    )
+    event: dict[str, Any] = {
+        "event_kind": "workflow",
+        "outcome": outcome,
+        "source": source,
+        "workflow_id": workflow_id,
+        "recipe_revision_id": workflow_row.get("recipe_revision_id"),
+        "snapshot_sha256": snapshot_sha,
+        "recipe_sha256": recipe_sha,
+        "recipe_name": (
+            snapshot.get("name")
+            or metadata.get("recipe_name")
+            or snapshot.get("recipe_name")
+        ),
+        "recipe_path": metadata.get("recipe_path") or snapshot.get("recipe_path"),
+        "kind": kind,
+        "serving_kind": (
+            snapshot.get("kind")
+            or snapshot.get("serving_kind")
+            or metadata.get("serving_kind")
+            or kind
+        ),
+        "machine_program": (
+            snapshot.get("machine_program") or metadata.get("machine_program")
+        ),
+        "result": payload.get("result", state),
+        "terminal_at": terminal_at,
+        "recorded_at": terminal_at,
+        "machine": payload.get("machine") or metadata.get("machine"),
+        "address": payload.get("address") or metadata.get("address"),
+        "firmware": payload.get("firmware") or metadata.get("firmware"),
+        "activity": payload.get("activity"),
+        "release_reason": payload.get("release_reason"),
+        "dose_g": snapshot.get("dose_g") or snapshot.get("leaf_g"),
+        "grind": snapshot.get("grind"),
+        "pours": snapshot.get("pours") or snapshot.get("steeps"),
+        "target_dispensed_water_ml": (
+            payload.get("target_dispensed_water_ml")
+            or snapshot.get("target_dispensed_water_ml")
+            or snapshot.get("programmed_water_ml")
+        ),
+        "dispensed_water_ml": payload.get("dispensed_water_ml"),
+        "cup_delta_g": payload.get("cup_delta_g"),
+        "emergency": payload.get("emergency"),
+        "error": payload.get("error"),
+    }
+    # Drop empty optional fields for a compact public journal row.
+    return {
+        key: value
+        for key, value in event.items()
+        if value not in (None, "", [], {})
+    }
 
 
 def default_db_path(state_root: Path | None = None) -> Path:
@@ -583,10 +796,40 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         stats_json TEXT NOT NULL DEFAULT '{}'
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS history_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        dedupe_key TEXT NOT NULL UNIQUE,
+        event_id TEXT NOT NULL,
+        recorded_at TEXT,
+        outcome TEXT,
+        source TEXT,
+        event_kind TEXT,
+        recipe_sha256 TEXT,
+        recipe_name TEXT,
+        recipe_path TEXT,
+        machine TEXT,
+        serving_kind TEXT,
+        machine_program TEXT,
+        note TEXT,
+        related_event_id TEXT,
+        remote_table_id TEXT,
+        workflow_id TEXT,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_recipe_revisions_recipe ON recipe_revisions(recipe_id)",
     "CREATE INDEX IF NOT EXISTS idx_workflow_events_workflow ON workflow_events(workflow_id, seq)",
     "CREATE INDEX IF NOT EXISTS idx_idempotency_expires ON idempotency(expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_legacy_imports_kind ON legacy_imports(source_kind)",
+    "CREATE INDEX IF NOT EXISTS idx_history_events_recorded ON history_events(recorded_at)",
+    "CREATE INDEX IF NOT EXISTS idx_history_events_outcome ON history_events(outcome)",
+    "CREATE INDEX IF NOT EXISTS idx_history_events_source ON history_events(source)",
+    "CREATE INDEX IF NOT EXISTS idx_history_events_event_id ON history_events(event_id)",
+    "CREATE INDEX IF NOT EXISTS idx_history_events_recipe_sha ON history_events(recipe_sha256)",
+    "CREATE INDEX IF NOT EXISTS idx_history_events_workflow ON history_events(workflow_id)",
+    "CREATE INDEX IF NOT EXISTS idx_history_events_remote ON history_events(remote_table_id)",
 )
 
 # Incremental migrations applied when opening a database created at an older
@@ -594,9 +837,11 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
 # Version 1 was create-only baseline (SCHEMA_STATEMENTS). Version 2 adds
 # active-workflow and idempotency-status indexes used by Phase A bridge APIs.
 # Version 3 adds non-destructive recipe archive + listing indexes (Phase B B8).
+# Version 4 adds append-only history_events journal (Phase 0.3/0.4 history cutover).
 # Do not fold v3 columns into SCHEMA_STATEMENTS CREATE: fresh DBs apply CREATE
 # then run migrations once; putting archived_at in CREATE would make ALTER fail
-# or require dual-path schema init.
+# or require dual-path schema init. New tables may appear in both CREATE (IF NOT
+# EXISTS) and the versioned migration for upgrade paths.
 SCHEMA_MIGRATIONS: tuple[tuple[int, str, tuple[str, ...]], ...] = (
     (
         2,
@@ -623,6 +868,49 @@ SCHEMA_MIGRATIONS: tuple[tuple[int, str, tuple[str, ...]], ...] = (
             "ON recipes(archived_at, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_recipe_revisions_recipe_number "
             "ON recipe_revisions(recipe_id, revision_number)",
+        ),
+    ),
+    (
+        4,
+        "phase_0_history_events_journal_v4",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS history_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dedupe_key TEXT NOT NULL UNIQUE,
+                event_id TEXT NOT NULL,
+                recorded_at TEXT,
+                outcome TEXT,
+                source TEXT,
+                event_kind TEXT,
+                recipe_sha256 TEXT,
+                recipe_name TEXT,
+                recipe_path TEXT,
+                machine TEXT,
+                serving_kind TEXT,
+                machine_program TEXT,
+                note TEXT,
+                related_event_id TEXT,
+                remote_table_id TEXT,
+                workflow_id TEXT,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_history_events_recorded "
+            "ON history_events(recorded_at)",
+            "CREATE INDEX IF NOT EXISTS idx_history_events_outcome "
+            "ON history_events(outcome)",
+            "CREATE INDEX IF NOT EXISTS idx_history_events_source "
+            "ON history_events(source)",
+            "CREATE INDEX IF NOT EXISTS idx_history_events_event_id "
+            "ON history_events(event_id)",
+            "CREATE INDEX IF NOT EXISTS idx_history_events_recipe_sha "
+            "ON history_events(recipe_sha256)",
+            "CREATE INDEX IF NOT EXISTS idx_history_events_workflow "
+            "ON history_events(workflow_id)",
+            "CREATE INDEX IF NOT EXISTS idx_history_events_remote "
+            "ON history_events(remote_table_id)",
         ),
     ),
 )
@@ -2212,10 +2500,17 @@ class StateStore:
         request_id: str | None = None,
         idempotency_result: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Atomically finalize workflow state, append final event, complete idempotency.
+        """Atomically finalize workflow, workflow event, history, and idempotency.
 
-        All three steps share one SQLite transaction. On any failure the whole
-        commit rolls back so callers must not claim BLE release succeeded.
+        One ``BEGIN IMMEDIATE`` transaction covers:
+        - workflow terminal row update
+        - final workflow_events row
+        - exactly one final history_events row (dedupe ``workflow:<id>:terminal``)
+        - optional idempotency completion
+
+        Any history insert fault rolls the whole commit back so callers must not
+        claim BLE release succeeded. Terminal re-entry is idempotent for the
+        history row (same dedupe key) while preserving first ``terminal_at``.
 
         Terminal commits default to clearing ``recovery_json`` (``CLEAR_RECOVERY``).
         Pass ``recovery=None`` to preserve an existing recovery payload, or a
@@ -2231,6 +2526,102 @@ class StateStore:
             ).fetchone()
             if row is None:
                 raise StorageError(f"unknown workflow_id {workflow_id!r}")
+
+            # Terminal re-entry: preserve first durable terminal state/event/
+            # history. Identical state returns without new workflow_events;
+            # conflicting state must fail rather than rewrite the workflow
+            # while leaving the first history row in place.
+            if row["terminal_at"] is not None:
+                if str(row["state"]) != str(state):
+                    raise StorageConflictError(
+                        f"workflow {workflow_id!r} already terminal in state "
+                        f"{row['state']!r}; cannot re-enter with {state!r}"
+                    )
+                hist_key = workflow_terminal_history_dedupe_key(workflow_id)
+                hist_row = conn.execute(
+                    "SELECT payload_json FROM history_events WHERE dedupe_key = ?",
+                    (hist_key,),
+                ).fetchone()
+                history_event = (
+                    self._history_row_to_public(hist_row)
+                    if hist_row is not None
+                    else None
+                )
+                # If history is missing (pre-cutover terminal), append once
+                # under the terminal dedupe key without rewriting workflow.
+                if history_event is None:
+                    row_dict = _row_to_dict(row) or {}
+                    history_payload = history_event_from_workflow_terminal(
+                        row_dict,
+                        state=str(row["state"]),
+                        event_payload=payload,
+                        terminal_at=str(row["terminal_at"]),
+                    )
+                    history_event, _ = self._append_history_event_in_tx(
+                        conn,
+                        history_payload,
+                        dedupe_key=hist_key,
+                        created_at=now,
+                    )
+                last_ev = conn.execute(
+                    """
+                    SELECT id, seq, event_type, payload_json, created_at
+                    FROM workflow_events
+                    WHERE workflow_id = ?
+                    ORDER BY seq DESC LIMIT 1
+                    """,
+                    (workflow_id,),
+                ).fetchone()
+                event_out: dict[str, Any]
+                if last_ev is not None:
+                    try:
+                        last_payload = json.loads(last_ev["payload_json"] or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        last_payload = {}
+                    event_out = {
+                        "id": int(last_ev["id"]),
+                        "workflow_id": workflow_id,
+                        "seq": int(last_ev["seq"]),
+                        "event_type": last_ev["event_type"],
+                        "payload": last_payload if isinstance(last_payload, dict) else {},
+                        "created_at": last_ev["created_at"],
+                    }
+                else:
+                    event_out = {
+                        "id": None,
+                        "workflow_id": workflow_id,
+                        "seq": 0,
+                        "event_type": event_type,
+                        "payload": payload,
+                        "created_at": row["terminal_at"],
+                    }
+                idem: dict[str, Any] | None = None
+                if request_id is not None and idempotency_result is not None:
+                    idem = self.complete_idempotency(
+                        request_id, idempotency_result, conn=conn
+                    )
+                elif request_id is not None:
+                    idem = self.complete_idempotency(
+                        request_id,
+                        {
+                            "status": state,
+                            "workflow_id": workflow_id,
+                            "terminal": True,
+                            **payload,
+                        },
+                        conn=conn,
+                    )
+                return {
+                    "workflow_id": workflow_id,
+                    "state": str(row["state"]),
+                    "terminal_at": row["terminal_at"],
+                    "updated_at": row["updated_at"],
+                    "event": event_out,
+                    "history_event": history_event,
+                    "idempotency": idem,
+                    "reentered": True,
+                }
+
             new_phase = (
                 machine_phase if machine_phase is not None else row["machine_phase"]
             )
@@ -2242,8 +2633,7 @@ class StateStore:
                 if metadata is not None
                 else row["metadata_json"]
             )
-            # Preserve first terminal_at if already set (idempotent re-entry).
-            terminal_at = row["terminal_at"] or now
+            terminal_at = now
             conn.execute(
                 """
                 UPDATE workflows SET
@@ -2276,7 +2666,23 @@ class StateStore:
                 (workflow_id, seq, event_type, payload_json, now),
             )
             event_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
-            idem: dict[str, Any] | None = None
+            # Build history from the immutable snapshot row + terminal payload.
+            row_dict = _row_to_dict(row) or {}
+            if metadata is not None:
+                row_dict["metadata"] = dict(metadata)
+            history_payload = history_event_from_workflow_terminal(
+                row_dict,
+                state=state,
+                event_payload=payload,
+                terminal_at=terminal_at,
+            )
+            history_event, _ = self._append_history_event_in_tx(
+                conn,
+                history_payload,
+                dedupe_key=workflow_terminal_history_dedupe_key(workflow_id),
+                created_at=now,
+            )
+            idem = None
             if request_id is not None and idempotency_result is not None:
                 idem = self.complete_idempotency(
                     request_id, idempotency_result, conn=conn
@@ -2306,6 +2712,7 @@ class StateStore:
                 "payload": payload,
                 "created_at": now,
             },
+            "history_event": history_event,
             "idempotency": idem,
         }
 
@@ -2404,6 +2811,461 @@ class StateStore:
             "updated_at": now,
             "terminal_at": terminal_at,
         }
+
+    # ------------------------------------------------------------------
+    # History journal (append-only; authoritative runtime store)
+    # ------------------------------------------------------------------
+
+    def _prepare_history_payload(
+        self,
+        event: Mapping[str, Any],
+        *,
+        require_outcome: bool = True,
+    ) -> dict[str, Any]:
+        """Validate and normalise a public history event payload."""
+
+        payload = public_history_event(event)
+        if "event_id" not in payload or not str(payload.get("event_id") or "").strip():
+            payload["event_id"] = new_history_event_id()
+        else:
+            payload["event_id"] = str(payload["event_id"]).strip()
+        if "recorded_at" not in payload or not payload.get("recorded_at"):
+            payload["recorded_at"] = utc_now()
+        if "schema_version" not in payload:
+            payload["schema_version"] = 1
+        outcome = str(payload.get("outcome") or "").strip()
+        if require_outcome and outcome not in HISTORY_VALID_OUTCOMES:
+            raise StorageError(
+                f"history outcome must be one of {sorted(HISTORY_VALID_OUTCOMES)}; "
+                f"got {outcome!r}"
+            )
+        if outcome:
+            payload["outcome"] = outcome
+        source = str(payload.get("source") or HISTORY_SOURCE_LOCAL).strip() or (
+            HISTORY_SOURCE_LOCAL
+        )
+        payload["source"] = source
+        # Bound free-text note if present.
+        if "note" in payload and payload["note"] is not None:
+            cleaned = _history_clean_text(
+                payload["note"], field="note", max_chars=MAX_HISTORY_NOTE_CHARS
+            )
+            if cleaned is None:
+                payload.pop("note", None)
+            else:
+                payload["note"] = cleaned
+        return payload
+
+    def _history_row_to_public(self, row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
+        if isinstance(row, sqlite3.Row):
+            payload_json = row["payload_json"]
+        else:
+            payload_json = row.get("payload_json")
+        try:
+            payload = json.loads(payload_json)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise StorageError(f"corrupt history payload_json: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise StorageError("history payload_json must be a JSON object")
+        return public_history_event(payload)
+
+    def _history_payloads_conflict(
+        self,
+        existing: Mapping[str, Any],
+        candidate: Mapping[str, Any],
+        *,
+        original_event: Mapping[str, Any],
+    ) -> bool:
+        """True when a retry carries a materially different public payload.
+
+        Auto-filled fields (``recorded_at``, ``schema_version``) are aligned from
+        the existing row when the caller did not supply them, so pure retries
+        remain idempotent.
+        """
+
+        left = public_history_event(existing)
+        right = public_history_event(candidate)
+        # Align store-assigned fields the caller did not supply so pure retries
+        # and concurrent same-key inserts (e.g. app remote) stay idempotent.
+        if not str(original_event.get("event_id") or "").strip():
+            right["event_id"] = left.get("event_id")
+        if not original_event.get("recorded_at"):
+            right["recorded_at"] = left.get("recorded_at")
+        if "schema_version" not in original_event:
+            right["schema_version"] = left.get("schema_version", 1)
+        return canonical_json(left) != canonical_json(right)
+
+    def _assert_history_compatible(
+        self,
+        existing_row: sqlite3.Row | Mapping[str, Any],
+        candidate: Mapping[str, Any],
+        *,
+        original_event: Mapping[str, Any],
+        dedupe_key: str,
+    ) -> dict[str, Any]:
+        existing_public = self._history_row_to_public(existing_row)
+        if self._history_payloads_conflict(
+            existing_public, candidate, original_event=original_event
+        ):
+            raise StorageConflictError(
+                f"history dedupe conflict for {dedupe_key!r}: "
+                "retry payload differs from the durable event"
+            )
+        return existing_public
+
+    def _append_history_event_in_tx(
+        self,
+        conn: sqlite3.Connection,
+        event: Mapping[str, Any],
+        *,
+        dedupe_key: str | None = None,
+        created_at: str | None = None,
+        require_outcome: bool = True,
+    ) -> tuple[dict[str, Any], bool]:
+        """Insert one history row inside an open transaction.
+
+        Returns ``(public_event, created)``. Identical retries are idempotent;
+        a materially different public payload for the same dedupe key raises
+        :class:`StorageConflictError`.
+        """
+
+        original_event = dict(event)
+        payload = self._prepare_history_payload(
+            event, require_outcome=require_outcome
+        )
+        key = dedupe_key or history_event_dedupe_key(str(payload["event_id"]))
+        now = created_at or utc_now()
+        existing = conn.execute(
+            "SELECT payload_json FROM history_events WHERE dedupe_key = ?",
+            (key,),
+        ).fetchone()
+        if existing is not None:
+            public = self._assert_history_compatible(
+                existing,
+                payload,
+                original_event=original_event,
+                dedupe_key=key,
+            )
+            return public, False
+
+        remote_id = payload.get("remote_table_id")
+        remote_s = None if remote_id is None else str(remote_id)
+        try:
+            conn.execute(
+                """
+                INSERT INTO history_events (
+                    dedupe_key, event_id, recorded_at, outcome, source, event_kind,
+                    recipe_sha256, recipe_name, recipe_path, machine, serving_kind,
+                    machine_program, note, related_event_id, remote_table_id,
+                    workflow_id, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    key,
+                    str(payload["event_id"]),
+                    payload.get("recorded_at"),
+                    payload.get("outcome"),
+                    payload.get("source"),
+                    payload.get("event_kind"),
+                    payload.get("recipe_sha256"),
+                    payload.get("recipe_name"),
+                    payload.get("recipe_path"),
+                    payload.get("machine"),
+                    payload.get("serving_kind"),
+                    payload.get("machine_program"),
+                    payload.get("note"),
+                    payload.get("related_event_id"),
+                    remote_s,
+                    payload.get("workflow_id"),
+                    canonical_json(payload),
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            # Concurrent insert of the same dedupe key: return winner if compatible.
+            raced = conn.execute(
+                "SELECT payload_json FROM history_events WHERE dedupe_key = ?",
+                (key,),
+            ).fetchone()
+            if raced is not None:
+                public = self._assert_history_compatible(
+                    raced,
+                    payload,
+                    original_event=original_event,
+                    dedupe_key=key,
+                )
+                return public, False
+            raise StorageError(f"history insert integrity failure: {exc}") from exc
+        return public_history_event(payload), True
+
+    def append_history_event(
+        self,
+        event: Mapping[str, Any],
+        *,
+        dedupe_key: str | None = None,
+        conn: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
+        """Append one public history event. Idempotent on ``dedupe_key`` / event_id."""
+
+        if conn is not None:
+            public, _ = self._append_history_event_in_tx(
+                conn, event, dedupe_key=dedupe_key
+            )
+            return public
+        with self.transaction() as active:
+            public, _ = self._append_history_event_in_tx(
+                active, event, dedupe_key=dedupe_key
+            )
+            return public
+
+    def load_history_events(self) -> list[dict[str, Any]]:
+        """Return all history events in append order (oldest first)."""
+
+        self.ensure_schema()
+        rows = self._connect().execute(
+            "SELECT payload_json FROM history_events ORDER BY id ASC"
+        ).fetchall()
+        return [self._history_row_to_public(row) for row in rows]
+
+    def list_history_events(
+        self,
+        *,
+        limit: int = DEFAULT_HISTORY_LIST_LIMIT,
+        source: str | None = None,
+        outcome: str | None = None,
+        query: str | None = None,
+        recipe_sha256: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Filter history newest-first with the public list contract.
+
+        Free-text ``query`` is applied as SQL ``LIKE`` over public text columns
+        across the full matching journal (no newest-window cutoff), then limited.
+        """
+
+        if not 1 <= int(limit) <= MAX_HISTORY_LIST_LIMIT:
+            raise StorageError(
+                f"history list limit must be 1-{MAX_HISTORY_LIST_LIMIT}"
+            )
+        needle = (query or "").strip()
+        wanted_source = (source or "").strip() or None
+        wanted_outcome = (outcome or "").strip() or None
+        wanted_sha = (recipe_sha256 or "").strip() or None
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if wanted_source is not None:
+            clauses.append("source = ?")
+            params.append(wanted_source)
+        if wanted_outcome is not None:
+            clauses.append("outcome = ?")
+            params.append(wanted_outcome)
+        if wanted_sha is not None:
+            clauses.append("recipe_sha256 = ?")
+            params.append(wanted_sha)
+        if needle:
+            # Escape LIKE metacharacters so the needle is a literal substring.
+            like_raw = (
+                needle.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            like = f"%{like_raw}%"
+            text_cols = (
+                "event_id",
+                "recipe_name",
+                "recipe_path",
+                "machine",
+                "note",
+                "serving_kind",
+                "machine_program",
+                "outcome",
+                "source",
+            )
+            like_parts = [
+                f"LOWER(IFNULL({col}, '')) LIKE LOWER(?) ESCAPE '\\'"
+                for col in text_cols
+            ]
+            clauses.append(f"({' OR '.join(like_parts)})")
+            params.extend([like] * len(text_cols))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        self.ensure_schema()
+        rows = self._connect().execute(
+            f"""
+            SELECT payload_json FROM history_events
+            {where}
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (*params, int(limit)),
+        ).fetchall()
+        return [self._history_row_to_public(row) for row in rows]
+
+    def history_summary(self) -> dict[str, Any]:
+        """Aggregate counts; path/source declare SQLite state.db as authoritative."""
+
+        events = self.load_history_events()
+        by_outcome: dict[str, int] = {}
+        by_source: dict[str, int] = {}
+        for event in events:
+            outcome = str(event.get("outcome") or "unknown")
+            source = str(event.get("source") or "unknown")
+            by_outcome[outcome] = by_outcome.get(outcome, 0) + 1
+            by_source[source] = by_source.get(source, 0) + 1
+        return {
+            "path": str(self.db_path),
+            "db_path": str(self.db_path),
+            "state_root": str(self.state_root),
+            "source": "state.db",
+            "authoritative": "sqlite",
+            "exists": self.db_path.is_file(),
+            "total": len(events),
+            "by_outcome": by_outcome,
+            "by_source": by_source,
+            "latest_recorded_at": events[-1].get("recorded_at") if events else None,
+        }
+
+    def add_history_note(self, event_id: str, note: str) -> dict[str, Any]:
+        """Append a linked tasting note without rewriting earlier rows."""
+
+        cleaned = _history_clean_text(
+            note, field="note", max_chars=MAX_HISTORY_NOTE_CHARS
+        )
+        if not cleaned:
+            raise StorageError("note must be non-empty")
+        target_id = str(event_id or "").strip()
+        if not target_id:
+            raise StorageError("event_id is required")
+        matches = [
+            event
+            for event in self.load_history_events()
+            if event.get("event_id") == target_id
+        ]
+        if not matches:
+            raise StorageError(f"history event {target_id!r} was not found")
+        target = matches[-1]
+        return self.append_history_event(
+            {
+                "outcome": target.get("outcome") or "imported",
+                "source": HISTORY_SOURCE_LOCAL,
+                "event_kind": "note",
+                "related_event_id": target_id,
+                "recipe_name": target.get("recipe_name"),
+                "recipe_path": target.get("recipe_path"),
+                "recipe_sha256": target.get("recipe_sha256"),
+                "machine": target.get("machine"),
+                "serving_kind": target.get("serving_kind"),
+                "machine_program": target.get("machine_program"),
+                "note": cleaned,
+            }
+        )
+
+    def import_app_history_records(
+        self,
+        records: Sequence[Mapping[str, Any]],
+        *,
+        region: str | None = None,
+    ) -> dict[str, Any]:
+        """Import App brew-record dicts; skip known remote_table_id values.
+
+        Concurrent losers that race on the same remote dedupe key count as
+        ``skipped_existing`` (one durable row only), not as ``imported``.
+        """
+
+        existing = self.load_history_events()
+        known_remote_ids = {
+            str(event.get("remote_table_id"))
+            for event in existing
+            if event.get("source") == HISTORY_SOURCE_APP
+            and event.get("remote_table_id") is not None
+        }
+        imported = 0
+        skipped = 0
+        written: list[dict[str, Any]] = []
+        with self.transaction() as conn:
+            for raw in records:
+                remote_id = raw.get("remote_table_id")
+                if remote_id is not None and str(remote_id) in known_remote_ids:
+                    skipped += 1
+                    continue
+                event = {
+                    "event_kind": "app_brew_record",
+                    "outcome": "imported",
+                    "source": HISTORY_SOURCE_APP,
+                    "region": region,
+                    "remote_table_id": remote_id,
+                    "recipe_name": raw.get("recipe_name"),
+                    "serving_kind": raw.get("serving_kind"),
+                    "machine_program": raw.get("machine_program"),
+                    "cup_type": raw.get("cup_type"),
+                    "dose_g": raw.get("dose_g"),
+                    "brew_time_s": raw.get("brew_time_s"),
+                    "create_time_stamp": raw.get("create_time_stamp"),
+                    # Leave recorded_at unset when absent so prepare() fills it
+                    # and concurrent same-remote races can align for comparison.
+                    "recorded_at": raw.get("recorded_at"),
+                    "has_line_chart": bool(raw.get("has_line_chart")),
+                    "is_pod": raw.get("is_pod"),
+                    "machine_id": raw.get("machine_id"),
+                    "member_used_recipes_id": raw.get("member_used_recipes_id"),
+                    "group_name": raw.get("group_name"),
+                    "recipe_sha256": raw.get("recipe_sha256"),
+                }
+                event = {
+                    key: value
+                    for key, value in event.items()
+                    if value not in (None, "", [], {})
+                }
+                # Prefer stable remote dedupe when a table id is present.
+                dedupe: str | None = None
+                if remote_id is not None:
+                    dedupe = f"app:remote:{remote_id}"
+                    # Re-check under the write transaction so concurrent losers
+                    # observe the winner before counting as imported.
+                    present = conn.execute(
+                        "SELECT 1 FROM history_events WHERE dedupe_key = ?",
+                        (dedupe,),
+                    ).fetchone()
+                    if present is not None:
+                        known_remote_ids.add(str(remote_id))
+                        skipped += 1
+                        continue
+                written_event, created = self._append_history_event_in_tx(
+                    conn, event, dedupe_key=dedupe
+                )
+                if not created:
+                    # Race: peer already inserted the same remote key.
+                    if remote_id is not None:
+                        known_remote_ids.add(str(remote_id))
+                    skipped += 1
+                    continue
+                written.append(written_event)
+                if remote_id is not None:
+                    known_remote_ids.add(str(remote_id))
+                imported += 1
+        return {
+            "imported": imported,
+            "skipped_existing": skipped,
+            "written_event_ids": [item["event_id"] for item in written],
+        }
+
+    def count_history_events(self) -> int:
+        self.ensure_schema()
+        row = self._connect().execute(
+            "SELECT COUNT(*) AS n FROM history_events"
+        ).fetchone()
+        return int(row["n"])
+
+    def get_history_event_by_dedupe_key(
+        self, dedupe_key: str
+    ) -> dict[str, Any] | None:
+        self.ensure_schema()
+        row = self._connect().execute(
+            "SELECT payload_json FROM history_events WHERE dedupe_key = ?",
+            (dedupe_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._history_row_to_public(row)
 
     # ------------------------------------------------------------------
     # Integrity and backup
@@ -2728,7 +3590,13 @@ def _import_history(
     file_sha: str,
     imported_at: str,
 ) -> dict[str, int]:
-    stats = {"events": 0, "skipped": 0, "lines": 0}
+    stats = {
+        "events": 0,
+        "skipped": 0,
+        "lines": 0,
+        "history_events": 0,
+        "history_events_skipped": 0,
+    }
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -2762,7 +3630,7 @@ def _import_history(
         line_digest = sha256_text(stripped)
         record_key = f"line:{line_no}:{line_digest}"
         # Preserve event_id as data; do not use it as the import uniqueness key.
-        if "event_id" not in event:
+        if "event_id" not in event or not str(event.get("event_id") or "").strip():
             event = {
                 **event,
                 "event_id": f"line:{line_no}:{line_digest[:16]}",
@@ -2780,7 +3648,104 @@ def _import_history(
             stats["events"] += 1
         else:
             stats["skipped"] += 1
+
+        # Runtime journal: same all-or-nothing migration transaction. Dedupe is
+        # record_key-based so duplicate event_id lines remain distinct history rows.
+        dedupe = legacy_history_record_dedupe_key(record_key)
+        _event, created = store._append_history_event_in_tx(
+            conn,
+            event,
+            dedupe_key=dedupe,
+            created_at=imported_at,
+            require_outcome=False,
+        )
+        if created:
+            stats["history_events"] += 1
+        else:
+            stats["history_events_skipped"] += 1
     return stats
+
+
+def _backfill_history_from_legacy_imports(
+    store: StateStore,
+    conn: sqlite3.Connection,
+    *,
+    imported_at: str,
+) -> dict[str, int]:
+    """Populate history_events from already-imported legacy history rows.
+
+    Does not read or modify original JSONL. Preserves each legacy_imports
+    ``record_key`` as a distinct journal row (duplicate event_id lines survive).
+    """
+
+    stats = {
+        "history_events": 0,
+        "history_events_skipped": 0,
+        "source_rows": 0,
+        "source": "legacy_imports",
+    }
+    rows = conn.execute(
+        """
+        SELECT record_key, payload_json
+        FROM legacy_imports
+        WHERE source_kind = 'history'
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    for row in rows:
+        stats["source_rows"] += 1
+        record_key = str(row["record_key"])
+        try:
+            event = json.loads(row["payload_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise StorageError(
+                f"corrupt legacy_imports history payload for {record_key!r}: {exc}"
+            ) from exc
+        if not isinstance(event, dict):
+            raise StorageError(
+                f"legacy_imports history payload for {record_key!r} is not an object"
+            )
+        if "event_id" not in event or not str(event.get("event_id") or "").strip():
+            digest = sha256_text(row["payload_json"] or "")
+            event = {**event, "event_id": f"legacy:{record_key}:{digest[:16]}"}
+        dedupe = legacy_history_record_dedupe_key(record_key)
+        _event, created = store._append_history_event_in_tx(
+            conn,
+            event,
+            dedupe_key=dedupe,
+            created_at=imported_at,
+            require_outcome=False,
+        )
+        if created:
+            stats["history_events"] += 1
+        else:
+            stats["history_events_skipped"] += 1
+    return stats
+
+
+def _write_migration_receipt(
+    conn: sqlite3.Connection,
+    *,
+    name: str,
+    completed_at: str,
+    backup_dir: Any,
+    manifest: Any,
+    stats: Any,
+) -> None:
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO migration_receipts (
+            name, completed_at, backup_dir, manifest_json, stats_json
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            name,
+            completed_at,
+            backup_dir,
+            canonical_json(manifest if manifest is not None else {}),
+            canonical_json(stats if stats is not None else {}),
+        ),
+    )
 
 
 def _import_recovery(
@@ -2866,10 +3831,18 @@ def migrate_legacy_state(
       do not mark the migration complete.
     - Reruns after success are idempotent (no duplicate data).
 
-    This does **not** switch runtime catalog/history writers to SQLite. While
-    those remain JSON-backed, a completed migration receipt means the import
-    snapshot is available in ``state.db`` -- not that SQLite is the active
-    runtime source of truth.
+    Two independent receipts:
+    - ``legacy_json_v1``: raw legacy import into ``legacy_imports`` (+ catalog/
+      recovery side effects).
+    - ``legacy_history_sqlite_v1``: history journal cutover into
+      ``history_events``. On a fresh migrate both commit atomically. On an
+      already-completed v3-era import, a normal migrate (no ``--force``)
+      backfills ``history_events`` from ``legacy_imports`` without rereading
+      JSONL.
+
+    History runtime is SQLite (``history_events``). Catalog runtime remains
+    JSON-backed until a later cutover. A completed legacy import receipt is
+    not full catalog cutover.
     """
 
     root = normalize_state_root(state_root)
@@ -2881,17 +3854,89 @@ def migrate_legacy_state(
     try:
         db.ensure_schema()
 
-        if db.migration_completed() and not force:
-            receipt = db.get_migration_receipt() or {}
+        legacy_done = db.migration_completed(LEGACY_MIGRATION_NAME)
+        history_done = db.migration_completed(LEGACY_HISTORY_CUTOVER_NAME)
+        runtime_truth = {
+            "workflow": "sqlite",
+            "history": "sqlite",
+            "idempotency": "sqlite",
+            "catalog": "json_legacy",
+        }
+
+        if legacy_done and history_done and not force:
+            receipt = db.get_migration_receipt(LEGACY_MIGRATION_NAME) or {}
+            history_receipt = (
+                db.get_migration_receipt(LEGACY_HISTORY_CUTOVER_NAME) or {}
+            )
             return {
                 "status": "already_completed",
                 "state_root": str(root),
                 "receipt": receipt,
+                "history_cutover_receipt": history_receipt,
+                "migration_name": LEGACY_MIGRATION_NAME,
+                "history_cutover_name": LEGACY_HISTORY_CUTOVER_NAME,
+                "migration_completed": True,
+                "history_cutover_completed": True,
                 "imported": False,
-                "runtime_source_of_truth": "json_legacy",
+                "runtime_source_of_truth": runtime_truth,
+                "sqlite_active_for": ["workflow", "history", "idempotency"],
+                "catalog_runtime": "json_legacy",
                 "message": (
-                    "legacy import already completed; catalog/history runtime writers "
-                    "remain JSON-backed until a later cutover"
+                    "legacy import and history cutover already completed; SQLite "
+                    "is active for workflow/history/idempotency; catalog runtime "
+                    "remains JSON-backed"
+                ),
+            }
+
+        # Pre-v4 / old-receipt path: legacy_json_v1 done but history journal
+        # cutover missing. Backfill from legacy_imports only; never reread JSONL.
+        if legacy_done and not history_done and not force:
+            imported_at = utc_now()
+            cutover_stats: dict[str, Any] = {}
+            try:
+                with db.transaction() as conn:
+                    _maybe_fault("in_history_cutover_start")
+                    cutover_stats = _backfill_history_from_legacy_imports(
+                        db, conn, imported_at=imported_at
+                    )
+                    _write_migration_receipt(
+                        conn,
+                        name=LEGACY_HISTORY_CUTOVER_NAME,
+                        completed_at=imported_at,
+                        backup_dir=None,
+                        manifest={
+                            "kind": "history_cutover",
+                            "source": "legacy_imports",
+                            "from_migration": LEGACY_MIGRATION_NAME,
+                        },
+                        stats=cutover_stats,
+                    )
+                    _maybe_fault("before_commit")
+            except Exception:
+                raise
+            receipt = db.get_migration_receipt(LEGACY_MIGRATION_NAME) or {}
+            history_receipt = (
+                db.get_migration_receipt(LEGACY_HISTORY_CUTOVER_NAME) or {}
+            )
+            return {
+                "status": "completed",
+                "state_root": str(root),
+                "receipt": receipt,
+                "history_cutover_receipt": history_receipt,
+                "migration_name": LEGACY_MIGRATION_NAME,
+                "history_cutover_name": LEGACY_HISTORY_CUTOVER_NAME,
+                "migration_completed": True,
+                "history_cutover_completed": True,
+                "imported": False,
+                "history_backfilled": True,
+                "stats": {"history_cutover": cutover_stats},
+                "completed_at": imported_at,
+                "runtime_source_of_truth": runtime_truth,
+                "sqlite_active_for": ["workflow", "history", "idempotency"],
+                "catalog_runtime": "json_legacy",
+                "message": (
+                    "history_events backfilled from legacy_imports; history "
+                    "cutover receipt recorded; catalog runtime remains JSON-backed"
                 ),
             }
 
@@ -2984,21 +4029,39 @@ def migrate_legacy_state(
                         )
                     _maybe_fault(f"after_{kind}")
 
-                # Mark complete only inside the same transaction.
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO migration_receipts (
-                        name, completed_at, backup_dir, manifest_json, stats_json
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        LEGACY_MIGRATION_NAME,
-                        imported_at,
-                        backup_manifest.get("backup_dir"),
-                        canonical_json(backup_manifest),
-                        canonical_json(stats),
-                    ),
+                # Both receipts + imported rows commit atomically.
+                _write_migration_receipt(
+                    conn,
+                    name=LEGACY_MIGRATION_NAME,
+                    completed_at=imported_at,
+                    backup_dir=backup_manifest.get("backup_dir"),
+                    manifest=backup_manifest,
+                    stats=stats,
                 )
+                history_cutover_stats = {
+                    "history_events": int(
+                        (stats.get("history") or {}).get("history_events") or 0
+                    ),
+                    "history_events_skipped": int(
+                        (stats.get("history") or {}).get("history_events_skipped")
+                        or 0
+                    ),
+                    "source": "legacy_import_transaction",
+                    "files_seen": list(seen_kinds),
+                }
+                _write_migration_receipt(
+                    conn,
+                    name=LEGACY_HISTORY_CUTOVER_NAME,
+                    completed_at=imported_at,
+                    backup_dir=backup_manifest.get("backup_dir"),
+                    manifest={
+                        "kind": "history_cutover",
+                        "source": "legacy_import_transaction",
+                        "paired_with": LEGACY_MIGRATION_NAME,
+                    },
+                    stats=history_cutover_stats,
+                )
+                stats["history_cutover"] = history_cutover_stats
                 _maybe_fault("before_commit")
         except Exception:
             # Transaction rolled back by context manager; originals untouched.
@@ -3011,10 +4074,17 @@ def migrate_legacy_state(
             "stats": stats,
             "imported": True,
             "completed_at": imported_at,
-            "runtime_source_of_truth": "json_legacy",
+            "migration_name": LEGACY_MIGRATION_NAME,
+            "history_cutover_name": LEGACY_HISTORY_CUTOVER_NAME,
+            "migration_completed": True,
+            "history_cutover_completed": True,
+            "runtime_source_of_truth": runtime_truth,
+            "sqlite_active_for": ["workflow", "history", "idempotency"],
+            "catalog_runtime": "json_legacy",
             "message": (
-                "legacy JSON/JSONL imported into state.db; runtime catalog/history "
-                "writers remain JSON-backed until a later cutover"
+                "legacy JSON/JSONL imported into state.db with history cutover; "
+                "SQLite is active for workflow/history/idempotency; catalog "
+                "runtime remains JSON-backed"
             ),
         }
     finally:
@@ -3033,8 +4103,16 @@ def migration_status(state_root: Path | str | None = None) -> dict[str, Any]:
     store = StateStore(root)
     try:
         store.ensure_schema()
-        completed = store.migration_completed()
-        receipt = store.get_migration_receipt() if completed else None
+        completed = store.migration_completed(LEGACY_MIGRATION_NAME)
+        history_cutover = store.migration_completed(LEGACY_HISTORY_CUTOVER_NAME)
+        receipt = (
+            store.get_migration_receipt(LEGACY_MIGRATION_NAME) if completed else None
+        )
+        history_receipt = (
+            store.get_migration_receipt(LEGACY_HISTORY_CUTOVER_NAME)
+            if history_cutover
+            else None
+        )
         present = [
             {"kind": kind, "path": str(root / rel), "exists": (root / rel).is_file()}
             for kind, rel in LEGACY_SOURCES
@@ -3045,13 +4123,26 @@ def migration_status(state_root: Path | str | None = None) -> dict[str, Any]:
             "migration_name": LEGACY_MIGRATION_NAME,
             "migration_completed": completed,
             "receipt": receipt,
+            "history_cutover_name": LEGACY_HISTORY_CUTOVER_NAME,
+            "history_cutover_completed": history_cutover,
+            "history_cutover_receipt": history_receipt,
             "legacy_sources": present,
-            "runtime_source_of_truth": "json_legacy",
-            "sqlite_active_runtime": False,
+            "runtime_source_of_truth": {
+                "workflow": "sqlite",
+                "history": "sqlite",
+                "idempotency": "sqlite",
+                "catalog": "json_legacy",
+            },
+            "sqlite_active_runtime": True,
+            "sqlite_active_for": ["workflow", "history", "idempotency"],
+            "catalog_runtime": "json_legacy",
+            "history_runtime": "sqlite",
             "message": (
-                "state.db holds schema, optional imported snapshots, and future workflow "
-                "rows; catalog/history runtime writers are still JSON/JSONL-backed. "
-                "Do not treat a completed migration receipt as SQLite cutover."
+                "state.db is the authoritative runtime store for workflow, history, "
+                "and idempotency. Catalog remains JSON-backed until catalog cutover. "
+                "Do not treat a completed migration receipt as full catalog cutover. "
+                f"History cutover ({LEGACY_HISTORY_CUTOVER_NAME}) "
+                f"{'is complete' if history_cutover else 'is pending'}."
             ),
         }
     finally:
@@ -3066,7 +4157,8 @@ def open_store(
     """Open (and optionally migrate) the store for a state root.
 
     ``migrate=True`` runs the explicit one-shot import helper. Daemon startup
-    must not pass ``migrate=True`` while runtime writers remain JSON-backed.
+    should not pass ``migrate=True`` (migration remains an explicit operator
+    action). History/workflow/idempotency runtime already uses SQLite.
 
     On success the open store is returned for the caller to manage. On any
     exception before return the store is closed (Windows holds SQLite locks
@@ -3092,8 +4184,8 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="xbloom-state",
         description=(
-            "Explicit state.db maintenance. Migration is idempotent and does not "
-            "switch runtime catalog/history writers to SQLite (still JSON-backed)."
+            "Explicit state.db maintenance. Migration is idempotent. SQLite is "
+            "active for workflow/history/idempotency; catalog remains JSON-backed."
         ),
     )
     parser.add_argument(
@@ -3152,7 +4244,12 @@ def main(argv: list[str] | None = None) -> None:
                 "status": "backed_up",
                 "destination": str(dest),
                 "state_root": str(store.state_root),
-                "runtime_source_of_truth": "json_legacy",
+                "runtime_source_of_truth": {
+                    "workflow": "sqlite",
+                    "history": "sqlite",
+                    "idempotency": "sqlite",
+                    "catalog": "json_legacy",
+                },
             }
         finally:
             store.close()
@@ -3166,11 +4263,18 @@ __all__ = [
     "BUSY_TIMEOUT_MS",
     "CLEAR_RECOVERY",
     "DB_FILE_NAME",
+    "DEFAULT_HISTORY_LIST_LIMIT",
     "DEFAULT_RECIPE_LIST_LIMIT",
+    "HISTORY_SOURCE_APP",
+    "HISTORY_SOURCE_LOCAL",
+    "HISTORY_VALID_OUTCOMES",
     "IDEM_COMPLETED",
     "IDEM_FAILED",
     "IDEM_PENDING",
+    "LEGACY_HISTORY_CUTOVER_NAME",
     "LEGACY_MIGRATION_NAME",
+    "MAX_HISTORY_LIST_LIMIT",
+    "MAX_HISTORY_NOTE_CHARS",
     "MAX_RECIPE_LIST_LIMIT",
     "SCHEMA_VERSION",
     "StateStore",
@@ -3180,15 +4284,23 @@ __all__ = [
     "canonical_json",
     "content_sha256",
     "default_db_path",
+    "history_event_dedupe_key",
+    "history_event_from_workflow_terminal",
+    "legacy_history_line_dedupe_key",
+    "legacy_history_record_dedupe_key",
+    "map_terminal_history_outcome",
     "migrate_legacy_state",
     "migration_status",
+    "new_history_event_id",
     "open_store",
+    "public_history_event",
     "reject_forbidden_provenance",
     "sanitize_recipe_provenance",
     "sha256_bytes",
     "sha256_file",
     "sha256_text",
     "utc_now",
+    "workflow_terminal_history_dedupe_key",
 ]
 
 

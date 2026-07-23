@@ -258,49 +258,27 @@ def state_clear(path: Path | None = None) -> None:
 
 
 def history_path() -> Path:
+    """Deprecated state-root selector path (legacy JSONL location).
+
+    History runtime writes go to state.db via xbloom_history / StateStore.
+    ``XBLOOM_HISTORY_PATH`` only selects the associated state root.
+    """
+
+    from xbloom_history import default_history_path, resolve_history_state_root
+
     configured = environment_value(HISTORY_PATH_ENV)
     if configured:
-        return Path(configured).expanduser()
-    return HISTORY_FILE
+        return default_history_path(resolve_history_state_root(configured))
+    return default_history_path(STATE_DIR)
 
 
-def record_history_event(
-    *,
-    command: str,
-    outcome: str,
-    state: dict[str, Any] | None = None,
-    summary: dict[str, Any] | None = None,
-    monitor: dict[str, Any] | None = None,
-    error: str | None = None,
-    note: str | None = None,
-    extra: dict[str, Any] | None = None,
-) -> dict[str, Any] | None:
-    """Best-effort local journal write; never block machine control on logging."""
+def history_db_path() -> Path:
+    """Authoritative brew history store (SQLite state.db)."""
 
-    try:
-        from xbloom_history import append_event, event_from_workflow
+    from xbloom_history import resolve_history_state_root
+    from xbloom_storage import DB_FILE_NAME
 
-        event = event_from_workflow(
-            command=command,
-            outcome=outcome,
-            state=state,
-            summary=summary,
-            monitor=monitor,
-            error=error,
-            note=note,
-            extra=extra,
-        )
-        return append_event(event, path=history_path())
-    except Exception as exc:  # pragma: no cover - logging must stay non-fatal
-        emit(
-            {
-                "command": "history",
-                "status": "write_failed",
-                "error": str(exc),
-                "type": type(exc).__name__,
-            }
-        )
-        return None
+    return resolve_history_state_root(history_path()) / DB_FILE_NAME
 
 
 def account_password_for_catalog(action: str) -> str:
@@ -499,7 +477,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "catalog_cloud_delete": "preview_default_created_tableid_only",
             "catalog_path": str(catalog_path),
             "brew_history": True,
-            "brew_history_path": str(history_path()),
+            "brew_history_path": str(history_db_path()),
+            "brew_history_source": "state.db",
             "app_brew_history_sync": "ephemeral_login_import_only",
             "catalog_cloud_configured": cloud_config_exists,
             "catalog_login_email_configured": account_email_configured,
@@ -962,7 +941,8 @@ def cmd_catalog(args: argparse.Namespace) -> int:
                 "status": "synced",
                 "region": fetched.get("region"),
                 "fetched": fetched.get("count"),
-                "history_path": str(history_path()),
+                "history_path": str(history_db_path()),
+                "history_source": "state.db",
                 **imported,
                 "authenticated": True,
                 "credentials_persisted": False,
@@ -980,6 +960,7 @@ def cmd_history(args: argparse.Namespace) -> int:
 
     action = args.history_action
     path = history_path()
+    db_path = history_db_path()
     try:
         if action == "status":
             emit({"command": "history", "action": action, **history_summary(path)})
@@ -997,7 +978,8 @@ def cmd_history(args: argparse.Namespace) -> int:
                 {
                     "command": "history",
                     "action": action,
-                    "path": str(path),
+                    "path": str(db_path),
+                    "source": "state.db",
                     "count": len(events),
                     "events": events,
                 }
@@ -1010,7 +992,8 @@ def cmd_history(args: argparse.Namespace) -> int:
                     "command": "history",
                     "action": action,
                     "status": "noted",
-                    "path": str(path),
+                    "path": str(db_path),
+                    "source": "state.db",
                     "event": event,
                 }
             )
@@ -1053,12 +1036,7 @@ async def async_load(args: argparse.Namespace) -> int:
         "workflow_id": workflow_id,
     }
     state_write(state)
-    history_event = record_history_event(
-        command="load",
-        outcome="loaded",
-        state=state,
-        summary=summary,
-    )
+    # Bridge owns durable terminal history; Skill does not journal load.
     payload = {
         "command": "load",
         "status": result.get("status") or "armed",
@@ -1068,8 +1046,6 @@ async def async_load(args: argparse.Namespace) -> int:
         **summary,
         **{k: v for k, v in result.items() if k not in {"status"}},
     }
-    if history_event:
-        payload["history_event_id"] = history_event["event_id"]
     emit(payload)
     return 0
 
@@ -1719,12 +1695,7 @@ async def async_tea_load(args: argparse.Namespace) -> int:
         "workflow_id": workflow_id,
     }
     state_write(state, TEA_STATE_FILE)
-    history_event = record_history_event(
-        command="tea-load",
-        outcome="loaded",
-        state=state,
-        summary=summary,
-    )
+    # Bridge owns durable terminal history; Skill does not journal tea-load.
     payload = {
         "command": "tea-load",
         "status": result.get("status") or "tea_loaded",
@@ -1733,8 +1704,6 @@ async def async_tea_load(args: argparse.Namespace) -> int:
         **summary,
         **result,
     }
-    if history_event:
-        payload["history_event_id"] = history_event["event_id"]
     emit(payload)
     return 0
 
@@ -1880,12 +1849,7 @@ async def async_cancel(args: argparse.Namespace) -> int:
     )
     state_clear()
     state_clear(TEA_STATE_FILE)
-    history_event = record_history_event(
-        command="cancel",
-        outcome="cancelled",
-        state=prior_state or {},
-        extra={"workflow_id": workflow_id, "emergency": emergency},
-    )
+    # Bridge commit_workflow_terminal owns the one final history row for cancel.
     payload = {
         "command": "cancel",
         "status": result.get("status") or "cancel_sent",
@@ -1895,8 +1859,6 @@ async def async_cancel(args: argparse.Namespace) -> int:
         "tea_state_cleared": True,
         **result,
     }
-    if history_event:
-        payload["history_event_id"] = history_event["event_id"]
     emit(payload)
     return 0
 
@@ -2018,9 +1980,15 @@ def cmd_state(args: argparse.Namespace) -> int:
             "status": "backed_up",
             "destination": str(dest),
             "state_root": str(store.state_root),
-            "runtime_source_of_truth": "json_legacy",
+            "runtime_source_of_truth": {
+                "workflow": "sqlite",
+                "history": "sqlite",
+                "idempotency": "sqlite",
+                "catalog": "json_legacy",
+            },
             "message": (
-                "online SQLite backup only; catalog/history runtime writers remain JSON-backed"
+                "online SQLite backup only; workflow/history/idempotency use state.db; "
+                "catalog remains JSON-backed"
             ),
         }
         store.close()
@@ -2740,13 +2708,16 @@ def build_parser() -> argparse.ArgumentParser:
         "state",
         help=(
             "explicit state.db migration/status/backup; does not auto-migrate on "
-            "daemon start; SQLite is not yet the runtime source of truth for catalog/history"
+            "daemon start; SQLite active for workflow/history/idempotency, catalog pending"
         ),
     )
     state_sub = state.add_subparsers(dest="state_action", required=True)
     state_sub.add_parser(
         "status",
-        help="migration receipt + runtime source-of-truth contract (JSON still active)",
+        help=(
+            "migration receipt + runtime source-of-truth "
+            "(SQLite workflow/history/idempotency; catalog still JSON)"
+        ),
     )
     state_migrate = state_sub.add_parser(
         "migrate",

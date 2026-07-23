@@ -239,11 +239,13 @@ State layout under `~/.xbloom-studio-brew/` (or `XBLOOM_STATE_DIR` / legacy
 
 | Path | Role |
 | --- | --- |
-| `state.db` | SQLite/WAL schema for recipes/workflows/events/idempotency + optional legacy import; **not** yet the active runtime source of truth for catalog/history |
+| `state.db` | SQLite/WAL authoritative runtime for workflows, history, and idempotency; recipe schema present; **catalog runtime still JSON** until catalog cutover |
 | `bridge.json` | Discovery only: instance id, pid, loopback host/port, token, core/protocol/record-format versions, config fingerprint |
 | `bridge.lock` | Lifecycle OS lock (one daemon per state root); not discovery |
 | `bridge.log` | Daemon stdout/stderr |
-| legacy `catalog/`, `brew-history.jsonl`, `*-state.json` | Still written by runtime; optional explicit import via `state migrate` / `xbloom-state migrate` (originals kept) |
+| legacy `catalog/` | Still the catalog runtime writer until catalog cutover |
+| legacy `brew-history.jsonl` | Import-only after history cutover; runtime never appends/rewrites it |
+| legacy `*-state.json` | Compatibility armed/tea/grinder files; optional explicit import via `state migrate` |
 
 ### Explicit state migration (no auto-migrate on daemon start)
 
@@ -254,10 +256,11 @@ python scripts/xbloom.py state backup
 # core: xbloom-state status|migrate|backup
 ```
 
-Migration is idempotent and observable. While catalog/history remain JSON-backed, status
-always reports `runtime_source_of_truth: json_legacy` and `sqlite_active_runtime: false`.
-Do not treat a completed migration receipt as cutover. Bridge wire protocol is **v2**
-(required hello + envelope); config fingerprint includes the effective BLE address.
+Migration is idempotent and observable. Status reports SQLite active for
+`workflow` / `history` / `idempotency` and `catalog_runtime: json_legacy`. Do not
+treat a completed migration receipt as full catalog cutover. Bridge wire protocol is
+**v3** (required hello + envelope; mutating RPCs require `request_id`); config
+fingerprint includes the effective BLE address.
 
 Never publish tokens or private state. The server binds to loopback, requires the token on every
 JSON-line request, rejects incompatible clients before BLE writes (`hello` + protocol range),

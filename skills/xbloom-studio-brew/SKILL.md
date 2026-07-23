@@ -127,9 +127,10 @@ interaction. Never use a live account merely to test the write path; tests must 
 `--apply --confirm-delete own-account-cloud-recipe-delete`.
 
 `catalog history-sync` imports App brew-history records into the local journal so phone-only
-brews can still be reviewed. Local BLE runs are written automatically by `load`/`start`/
-`tea-start`/`tea-brew`/`monitor`/`cancel` into `~/.xbloom-studio-brew/brew-history.jsonl`.
-Use `history status|list|note` for dial-in review. App history is coarser than local telemetry.
+brews can still be reviewed. Confirmed terminal/cancel/stop history is written once by the
+bridge into `state.db` (`history_events`); Skill load/cancel/monitor paths do not duplicate
+that journal. Use `history status|list|note` for dial-in review. App history is coarser than
+local telemetry.
 
 ## Prepare local BLE
 

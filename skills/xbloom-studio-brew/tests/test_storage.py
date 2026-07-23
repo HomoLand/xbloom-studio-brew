@@ -25,6 +25,14 @@ def test_schema_init_wal_and_version(tmp_path):
     assert store.journal_mode() == "wal"
     names = {row["name"] for row in store.list_migrations()}
     assert "baseline_v1" in names
+    assert "phase_0_history_events_journal_v4" in names
+    tables = {
+        row["name"]
+        for row in store._connect().execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    assert "history_events" in tables
     check = store.integrity_check()
     assert check["ok"] is True
     store.close()
@@ -147,6 +155,7 @@ def test_legacy_migration_backup_hashes_and_idempotent(tmp_path):
     first = storage.migrate_legacy_state(tmp_path)
     assert first["status"] == "completed"
     assert first["imported"] is True
+    assert first["history_cutover_completed"] is True
     backup_dir = Path(first["backup"]["backup_dir"])
     assert backup_dir.is_dir()
     manifest = json.loads((backup_dir / "MANIFEST.json").read_text(encoding="utf-8"))
@@ -160,16 +169,24 @@ def test_legacy_migration_backup_hashes_and_idempotent(tmp_path):
         assert (tmp_path / rel).read_bytes() == originals[rel]
 
     store = storage.StateStore(tmp_path)
-    assert store.migration_completed()
+    assert store.migration_completed(storage.LEGACY_MIGRATION_NAME)
+    assert store.migration_completed(storage.LEGACY_HISTORY_CUTOVER_NAME)
     assert store.count_legacy_imports("catalog") >= 1
     assert store.count_legacy_imports("history") >= 1
     assert store.count_legacy_imports("recovery_armed") == 1
+    # History cutover: each JSONL line lands in history_events as well.
+    assert store.count_history_events() == 1
+    loaded = store.load_history_events()
+    assert loaded[0]["event_id"] == "bh_test1"
+    assert loaded[0]["outcome"] == "completed"
 
     second = storage.migrate_legacy_state(tmp_path)
     assert second["status"] == "already_completed"
     assert second["imported"] is False
+    assert second["history_cutover_completed"] is True
     # No duplicate catalog entries on rerun.
     assert store.count_legacy_imports("history") == 1
+    assert store.count_history_events() == 1
     store.close()
 
 
@@ -265,6 +282,15 @@ def test_history_duplicate_event_ids_both_survive(tmp_path):
     payloads = [json.loads(r["payload_json"]) for r in rows]
     assert {p["payload"] for p in payloads} == {"first", "second"}
     assert all(p["event_id"] == "dup-id" for p in payloads)
+    # Runtime journal also preserves both lines as distinct rows.
+    assert store.count_history_events() == 2
+    hist = store.load_history_events()
+    assert {e.get("payload") for e in hist} == {"first", "second"}
+    assert all(e["event_id"] == "dup-id" for e in hist)
+    # force re-run remains idempotent for history_events
+    forced = storage.migrate_legacy_state(tmp_path, force=True)
+    assert forced["status"] == "completed"
+    assert store.count_history_events() == 2
     store.close()
 
 
@@ -438,13 +464,18 @@ def test_foreign_key_and_parent_recipe_constraints(tmp_path):
     store.close()
 
 
-def test_migration_status_declares_json_runtime_truth(tmp_path):
+def test_migration_status_declares_partial_sqlite_runtime_truth(tmp_path):
     status = storage.migration_status(tmp_path)
-    assert status["runtime_source_of_truth"] == "json_legacy"
-    assert status["sqlite_active_runtime"] is False
+    assert status["runtime_source_of_truth"]["history"] == "sqlite"
+    assert status["runtime_source_of_truth"]["workflow"] == "sqlite"
+    assert status["runtime_source_of_truth"]["idempotency"] == "sqlite"
+    assert status["runtime_source_of_truth"]["catalog"] == "json_legacy"
+    assert status["sqlite_active_runtime"] is True
+    assert status["catalog_runtime"] == "json_legacy"
     assert status["migration_completed"] is False
+    assert status["history_cutover_completed"] is False
+    assert status["history_cutover_name"] == storage.LEGACY_HISTORY_CUTOVER_NAME
 
-    # Completing migration does not flip runtime source of truth.
     _write(
         tmp_path / "brew-history.jsonl",
         json.dumps(
@@ -453,12 +484,134 @@ def test_migration_status_declares_json_runtime_truth(tmp_path):
         + "\n",
     )
     result = storage.migrate_legacy_state(tmp_path)
-    assert result["runtime_source_of_truth"] == "json_legacy"
+    assert result["runtime_source_of_truth"]["history"] == "sqlite"
+    assert result["runtime_source_of_truth"]["catalog"] == "json_legacy"
     assert result["imported"] is True
+    assert result["history_cutover_completed"] is True
     status2 = storage.migration_status(tmp_path)
     assert status2["migration_completed"] is True
-    assert status2["runtime_source_of_truth"] == "json_legacy"
-    assert status2["sqlite_active_runtime"] is False
+    assert status2["history_cutover_completed"] is True
+    assert status2["history_cutover_receipt"] is not None
+    assert status2["runtime_source_of_truth"]["history"] == "sqlite"
+    assert status2["catalog_runtime"] == "json_legacy"
+    assert "workflow" in status2["sqlite_active_for"]
+    store = storage.StateStore(tmp_path)
+    assert store.count_history_events() == 1
+    store.close()
+
+
+def test_pre_v4_old_receipt_backfills_history_on_normal_migrate(tmp_path):
+    """Schema-v3-era state with only legacy_json_v1 must cut over without --force.
+
+    Constructs pre-v4 data: history rows live only in legacy_imports, legacy
+    import receipt is present, history_events is empty, no cutover receipt.
+    A normal migrate must backfill once and remain idempotent on rerun.
+    """
+
+    store = storage.StateStore(tmp_path)
+    store.ensure_schema()
+    imported_at = "2026-01-01T00:00:00+00:00"
+    lines = [
+        {
+            "event_id": "dup-id",
+            "outcome": "completed",
+            "source": "local-skill",
+            "payload": "first",
+        },
+        {
+            "event_id": "dup-id",
+            "outcome": "failed",
+            "source": "local-skill",
+            "payload": "second",
+        },
+        {
+            "event_id": "bh_unique",
+            "outcome": "completed",
+            "source": "local-skill",
+            "recipe_name": "Old Import",
+        },
+    ]
+    with store.transaction() as conn:
+        for idx, event in enumerate(lines, start=1):
+            body = storage.canonical_json(event)
+            digest = storage.sha256_text(body)
+            record_key = f"line:{idx}:{digest}"
+            conn.execute(
+                """
+                INSERT INTO legacy_imports (
+                    source_kind, source_path, source_sha256, record_key,
+                    payload_json, imported_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "history",
+                    str(tmp_path / "brew-history.jsonl"),
+                    "fake_file_sha",
+                    record_key,
+                    body,
+                    imported_at,
+                ),
+            )
+        conn.execute(
+            """
+            INSERT INTO migration_receipts (
+                name, completed_at, backup_dir, manifest_json, stats_json
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                storage.LEGACY_MIGRATION_NAME,
+                imported_at,
+                None,
+                storage.canonical_json({"kind": "pre_v4_fixture"}),
+                storage.canonical_json({"history": {"events": 3}}),
+            ),
+        )
+    assert store.migration_completed(storage.LEGACY_MIGRATION_NAME)
+    assert not store.migration_completed(storage.LEGACY_HISTORY_CUTOVER_NAME)
+    assert store.count_legacy_imports("history") == 3
+    assert store.count_history_events() == 0
+    store.close()
+
+    # Leave a JSONL that must NOT be reread for the cutover path.
+    _write(
+        tmp_path / "brew-history.jsonl",
+        json.dumps(
+            {
+                "event_id": "bh_must_not_import",
+                "outcome": "failed",
+                "source": "local-skill",
+            }
+        )
+        + "\n",
+    )
+
+    first = storage.migrate_legacy_state(tmp_path)
+    assert first["status"] == "completed"
+    assert first["imported"] is False
+    assert first.get("history_backfilled") is True
+    assert first["history_cutover_completed"] is True
+    assert first["stats"]["history_cutover"]["history_events"] == 3
+
+    store = storage.StateStore(tmp_path)
+    assert store.migration_completed(storage.LEGACY_MIGRATION_NAME)
+    assert store.migration_completed(storage.LEGACY_HISTORY_CUTOVER_NAME)
+    assert store.count_history_events() == 3
+    hist = store.load_history_events()
+    assert {e.get("payload") for e in hist if e.get("payload")} == {"first", "second"}
+    assert sum(1 for e in hist if e["event_id"] == "dup-id") == 2
+    assert any(e["event_id"] == "bh_unique" for e in hist)
+    assert not any(e["event_id"] == "bh_must_not_import" for e in hist)
+
+    status = storage.migration_status(tmp_path)
+    assert status["migration_completed"] is True
+    assert status["history_cutover_completed"] is True
+    assert status["history_cutover_receipt"] is not None
+
+    second = storage.migrate_legacy_state(tmp_path)
+    assert second["status"] == "already_completed"
+    assert second["imported"] is False
+    assert store.count_history_events() == 3
+    store.close()
 
 
 def test_online_backup_avoids_existing_destination_collision(tmp_path):
@@ -1120,15 +1273,16 @@ def _coffee_edit(**overrides):
     return data
 
 
-def test_schema_fresh_is_v3_with_archive_column_and_indexes(tmp_path):
+def test_schema_fresh_is_v4_with_archive_and_history(tmp_path):
     store = storage.StateStore(tmp_path)
     version = store.ensure_schema()
-    assert version == 3
-    assert storage.SCHEMA_VERSION == 3
+    assert version == 4
+    assert storage.SCHEMA_VERSION == 4
     names = {row["name"] for row in store.list_migrations()}
     assert "baseline_v1" in names
     assert any("v2" in n for n in names)
     assert any("v3" in n for n in names)
+    assert any("v4" in n for n in names)
     cols = {
         r[1]
         for r in store._connect().execute("PRAGMA table_info(recipes)").fetchall()
@@ -1144,24 +1298,42 @@ def test_schema_fresh_is_v3_with_archive_column_and_indexes(tmp_path):
     assert "idx_recipes_kind_updated" in index_names
     assert "idx_recipes_archived_updated" in index_names
     assert "idx_recipe_revisions_recipe_number" in index_names
-    # Fresh open must not re-apply ALTER (single v3 migration row).
+    assert "idx_history_events_recorded" in index_names
+    tables = {
+        r[0]
+        for r in store._connect()
+        .execute("SELECT name FROM sqlite_master WHERE type='table'")
+        .fetchall()
+    }
+    assert "history_events" in tables
+    # Fresh open must not re-apply migrations (single row per version).
     store.close()
     store2 = storage.StateStore(tmp_path)
-    assert store2.ensure_schema() == 3
+    assert store2.ensure_schema() == 4
     v3_rows = store2._connect().execute(
         "SELECT COUNT(*) AS n FROM schema_migrations WHERE version = 3"
     ).fetchone()
+    v4_rows = store2._connect().execute(
+        "SELECT COUNT(*) AS n FROM schema_migrations WHERE version = 4"
+    ).fetchone()
     assert v3_rows["n"] == 1
+    assert v4_rows["n"] == 1
     assert store2.integrity_check()["ok"] is True
     store2.close()
 
 
-def test_schema_migrates_v2_to_v3(tmp_path):
-    """v2-shaped DB (baseline + phase A indexes) upgrades to v3 once."""
+def test_schema_migrates_v2_to_current(tmp_path):
+    """v2-shaped DB (baseline + phase A indexes) upgrades through v3/v4 once."""
 
     db_path = tmp_path / "state.db"
     conn = __import__("sqlite3").connect(str(db_path))
-    for statement in storage.SCHEMA_STATEMENTS:
+    # v2 CREATE shape: no history_events table, no archived_at.
+    v2_statements = [
+        s
+        for s in storage.SCHEMA_STATEMENTS
+        if "history_events" not in s and "idx_history_events" not in s
+    ]
+    for statement in v2_statements:
         conn.execute(statement)
     for _target, name, statements in storage.SCHEMA_MIGRATIONS:
         if _target > 2:
@@ -1190,7 +1362,7 @@ def test_schema_migrates_v2_to_v3(tmp_path):
     conn.close()
 
     store = storage.StateStore(tmp_path)
-    assert store.ensure_schema() == 3
+    assert store.ensure_schema() == storage.SCHEMA_VERSION
     recipe = store.get_recipe("rcp_v2")
     assert recipe is not None
     assert recipe["name"] == "Legacy"
@@ -1200,6 +1372,13 @@ def test_schema_migrates_v2_to_v3(tmp_path):
         for r in store._connect().execute("PRAGMA table_info(recipes)").fetchall()
     }
     assert "archived_at" in cols
+    tables = {
+        r[0]
+        for r in store._connect()
+        .execute("SELECT name FROM sqlite_master WHERE type='table'")
+        .fetchall()
+    }
+    assert "history_events" in tables
     store.close()
 
 

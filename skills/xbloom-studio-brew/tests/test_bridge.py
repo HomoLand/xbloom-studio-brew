@@ -2304,8 +2304,15 @@ def test_terminal_idempotency_atomic_success_and_rollback(tmp_path):
         idem = core.store.get_idempotency(cancel_req)
         assert idem["status"] == storage.IDEM_COMPLETED
         assert idem["result"]["status"] == "cancel_sent"
+        # Exactly one final history row for cancel terminal.
+        hist_key = storage.workflow_terminal_history_dedupe_key(wid)
+        hist = core.store.get_history_event_by_dedupe_key(hist_key)
+        assert hist is not None
+        assert hist["workflow_id"] == wid
+        assert hist["outcome"] == "cancelled"
+        assert core.store.count_history_events() == 1
 
-        # Rollback: inject failure mid terminal+idempotency transaction.
+        # Rollback: inject failure mid terminal+idempotency+history transaction.
         loaded2 = await core.rpc(
             "coffee.load", _with_ids({"recipe": str(recipe)})
         )
@@ -2327,15 +2334,111 @@ def test_terminal_idempotency_atomic_success_and_rollback(tmp_path):
         assert status["phase"] == "recovery_required"
         assert status["release_pending"] is False
         # BLE must still be held; cancel write already happened but durable
-        # terminal+idempotency rolled back together.
+        # terminal+idempotency+history rolled back together.
         assert status["release_pending"] is False
         pending = core.store.get_idempotency(fail_req)
         assert pending is not None
         assert pending["status"] == storage.IDEM_PENDING
         rolled = core.store.get_workflow(wid2)
         assert rolled["terminal_at"] is None
+        assert (
+            core.store.get_history_event_by_dedupe_key(
+                storage.workflow_terminal_history_dedupe_key(wid2)
+            )
+            is None
+        )
         # Activity retained for recovery (terminal commit rolled back).
         assert status["connected"] is True
+        await core.shutdown(force=True)
+
+    asyncio.run(go())
+
+
+def test_terminal_history_exactly_one_row_on_retry_and_natural(tmp_path):
+    """Natural complete / cancel / re-commit yield exactly one history terminal row."""
+
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        # Natural completion.
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        await core.rpc(
+            "coffee.start",
+            _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+        )
+        fake.emit(_event(state=0x24, name="ready"))
+        await _drain_release(core)
+        key = storage.workflow_terminal_history_dedupe_key(wid)
+        first = core.store.get_history_event_by_dedupe_key(key)
+        assert first is not None
+        assert first["outcome"] == "completed"
+        assert first["workflow_id"] == wid
+        assert first.get("snapshot_sha256") or first.get("recipe_name")
+        # snapshot SHA must not be mislabeled as recipe_sha256 when only revision
+        # content is present; path loads may still carry both.
+        if first.get("recipe_sha256") and first.get("snapshot_sha256"):
+            # Distinct fields when both known (path loads typically set both).
+            assert isinstance(first["recipe_sha256"], str)
+            assert isinstance(first["snapshot_sha256"], str)
+        # Idempotent re-commit of the same terminal must not add a second history
+        # row or an extra workflow_events row.
+        events_before = core.store.list_workflow_events(wid)
+        reentry = core.store.commit_workflow_terminal(
+            wid,
+            state="ready",
+            event_type="terminal",
+            event_payload={"result": "ready", "activity": "coffee"},
+        )
+        assert reentry.get("reentered") is True
+        assert core.store.count_history_events() == 1
+        assert len(core.store.list_workflow_events(wid)) == len(events_before)
+        again = core.store.get_history_event_by_dedupe_key(key)
+        assert again is not None
+        assert again["event_id"] == first["event_id"]
+
+        # Cancel path also produces exactly one history row.
+        loaded2 = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid2 = loaded2["workflow_id"]
+        await core.rpc("cancel", _with_ids(workflow_id=wid2))
+        await _drain_release(core)
+        assert core.store.count_history_events() == 2
+        cancel_hist = core.store.get_history_event_by_dedupe_key(
+            storage.workflow_terminal_history_dedupe_key(wid2)
+        )
+        assert cancel_hist is not None
+        assert cancel_hist["outcome"] == "cancelled"
+        # History insert fault withholds release (via full terminal rollback).
+        loaded3 = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid3 = loaded3["workflow_id"]
+        real_append = core.store._append_history_event_in_tx
+
+        def boom_hist(*_a, **_k):
+            raise storage.StorageError("injected history insert failure")
+
+        core.store._append_history_event_in_tx = boom_hist  # type: ignore[method-assign]
+        with pytest.raises(BridgeError, match="durable|persist|recovery"):
+            await core.rpc("cancel", _with_ids(workflow_id=wid3))
+        core.store._append_history_event_in_tx = real_append  # type: ignore[method-assign]
+        status = core.status()
+        assert status["connected"] is True
+        assert status["release_pending"] is False
+        assert status["phase"] == "recovery_required"
+        assert core.store.get_workflow(wid3)["terminal_at"] is None
+        assert (
+            core.store.get_history_event_by_dedupe_key(
+                storage.workflow_terminal_history_dedupe_key(wid3)
+            )
+            is None
+        )
+        assert core.store.count_history_events() == 2
         await core.shutdown(force=True)
 
     asyncio.run(go())

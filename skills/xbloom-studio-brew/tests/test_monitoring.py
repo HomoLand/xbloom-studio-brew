@@ -12,9 +12,12 @@ from xbloom_ble.telemetry import StatusEvent
 
 
 def _isolate_history(monkeypatch, tmp_path):
+    """Point deprecated history path + state dir at tmp so no real state is used."""
+
     history_file = tmp_path / "brew-history.jsonl"
     monkeypatch.setenv(xbloom.HISTORY_PATH_ENV, str(history_file))
     monkeypatch.setenv(xbloom_history.HISTORY_PATH_ENV, str(history_file))
+    monkeypatch.setenv("XBLOOM_STATE_DIR", str(tmp_path))
     return history_file
 
 

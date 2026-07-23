@@ -7,6 +7,7 @@ import pytest
 
 import xbloom
 import xbloom_catalog
+import xbloom_storage as storage
 from xbloom_ble.recipe import Recipe
 from xbloom_ble.tea import TeaRecipe
 from xbloom_catalog import (
@@ -1253,6 +1254,7 @@ def test_fetch_cloud_brew_records_normalises_group_payload(monkeypatch):
 def test_catalog_history_sync_imports_into_local_journal(monkeypatch, tmp_path, capsys):
     history_file = tmp_path / "brew-history.jsonl"
     monkeypatch.setenv(xbloom.HISTORY_PATH_ENV, str(history_file))
+    monkeypatch.setenv("XBLOOM_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(xbloom, "reexec_in_local_runtime", lambda: None)
     monkeypatch.setenv(xbloom.ACCOUNT_EMAIL_ENV, "account@example.test")
     monkeypatch.setenv(xbloom.ACCOUNT_PASSWORD_ENV, "private-password")
@@ -1286,7 +1288,11 @@ def test_catalog_history_sync_imports_into_local_journal(monkeypatch, tmp_path, 
     output = json.loads(capsys.readouterr().out)
     assert output["status"] == "synced"
     assert output["imported"] == 1
-    assert history_file.exists()
-    rows = [json.loads(line) for line in history_file.read_text(encoding="utf-8").splitlines() if line.strip()]
-    assert rows[-1]["source"] == "app-cloud"
-    assert rows[-1]["recipe_name"] == "Phone Brew"
+    assert output["history_source"] == "state.db"
+    # Cutover: App import goes to state.db, never JSONL.
+    assert not history_file.exists()
+    store = storage.StateStore(tmp_path)
+    events = store.load_history_events()
+    store.close()
+    assert events[-1]["source"] == "app-cloud"
+    assert events[-1]["recipe_name"] == "Phone Brew"

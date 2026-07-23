@@ -100,7 +100,7 @@ python scripts/xbloom.py history list --limit 20
 临时登录、默认五类读取以及两次经所有者明确批准的只新增写入，已于 2026-07-14 在中国区
 现网验证，包括云端回读与零写入幂等复验；凭据和会话只存在于进程内。宿主通过
 `XBLOOM_ACCOUNT_EMAIL` 与 `XBLOOM_ACCOUNT_PASSWORD` 提供账号，密码不接受命令行参数。
-`catalog push` 默认只预览；只有同时给出 `--apply` 与 `--confirm-write own-account-cloud-recipe` 才会写远端。`catalog delete` 同样默认只预览；只有同时给出 `--apply` 与 `--confirm-delete own-account-cloud-recipe-delete` 才会删除，且只接受当前账号自建列表中的 `tableId`。本地冲泡日志默认写在 `~/.xbloom-studio-brew/brew-history.jsonl`。发布测试不会调用线上写/删接口。详见[目录与 A/B/C 说明](skills/xbloom-studio-brew/references/catalog.md)。
+`catalog push` 默认只预览；只有同时给出 `--apply` 与 `--confirm-write own-account-cloud-recipe` 才会写远端。`catalog delete` 同样默认只预览；只有同时给出 `--apply` 与 `--confirm-delete own-account-cloud-recipe-delete` 才会删除，且只接受当前账号自建列表中的 `tableId`。本地冲泡日志权威存储为 `~/.xbloom-studio-brew/state.db` 的 `history_events`；遗留 `brew-history.jsonl` 仅用于迁移导入。发布测试不会调用线上写/删接口。详见[目录与 A/B/C 说明](skills/xbloom-studio-brew/references/catalog.md)。
 
 ## 安装
 

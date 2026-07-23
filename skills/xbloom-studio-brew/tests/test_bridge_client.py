@@ -681,7 +681,6 @@ def test_cancel_does_not_silently_become_emergency(monkeypatch, tmp_path):
 
     monkeypatch.setattr(xbloom, "make_bridge_client", lambda _a: FakeTyped())
     monkeypatch.setattr(xbloom, "emit", lambda _d: None)
-    monkeypatch.setattr(xbloom, "record_history_event", lambda **k: None)
     args = xbloom.build_parser().parse_args(["cancel"])
     with pytest.raises(RuntimeError, match="--emergency|workflow"):
         asyncio.run(xbloom.async_cancel(args))
