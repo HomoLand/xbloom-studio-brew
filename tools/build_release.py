@@ -257,6 +257,37 @@ def require_runtime_lock() -> Path:
     return RUNTIME_LOCK_PATH
 
 
+def write_hub_pin(
+    skill_dir: Path, version: str, wheel: Path, runtime_lock: Path
+) -> Path:
+    """Write ``vendor/hub-pin.json`` for Hermes/skills.sh installs (no monorepo).
+
+    Does not ship the wheel in git; bootstrap downloads the GitHub Release asset
+    and verifies ``core_wheel_sha256``.
+    """
+
+    pin = {
+        "layout": "hub-pin",
+        "core_version": version,
+        "core_wheel": wheel.name,
+        "core_wheel_sha256": sha256_file(wheel),
+        "core_wheel_url": (
+            "https://github.com/HomoLand/xbloom-studio-brew/releases/download/"
+            f"v{version}/{wheel.name}"
+        ),
+        "runtime_lock": RUNTIME_LOCK_BASENAME,
+        "runtime_lock_sha256": sha256_file(runtime_lock),
+        "release_repo": "HomoLand/xbloom-studio-brew",
+    }
+    vendor = skill_dir / "vendor"
+    vendor.mkdir(parents=True, exist_ok=True)
+    path = vendor / "hub-pin.json"
+    path.write_text(
+        json.dumps(pin, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return path
+
+
 def build_skill_bundle(
     out_dir: Path, version: str, wheel: Path, *, epoch: int, runtime_lock: Path
 ) -> Path:
@@ -562,6 +593,11 @@ def write_release_notes(out_dir: Path, version: str, wheel: Path, knowledge_dir:
         "    vendor/release.json (Linux dbus-fast / macOS PyObjC / Windows WinRT",
         "    markers in one file). Non-core install needs network unless wheels",
         "    are pre-cached.",
+        "  - Hermes/skills.sh installs only the skill folder (no monorepo core).",
+        "    bootstrap uses vendor/hub-pin.json to download this release's core",
+        "    wheel by URL + sha256, then the same hashed runtime lock. The",
+        "    monorepo requirements.txt line '-e ../../packages/core' is ignored",
+        "    when packages/core is not present.",
         "",
     ]
     notes.write_text("\n".join(lines), encoding="utf-8")
@@ -596,6 +632,10 @@ def main(argv: list[str] | None = None) -> int:
 
     wheel = build_core_wheel(out_dir, epoch=epoch)
     print(f"  core wheel: {wheel.name}")
+
+    # Keep monorepo/Hermes hub installs pinned to this release's wheel hash.
+    hub_pin = write_hub_pin(SKILL_DIR, version, wheel, runtime_lock)
+    print(f"  hub-pin:    {hub_pin.relative_to(REPO_ROOT).as_posix()}")
 
     knowledge_dir = build_knowledge_bundle(out_dir, version, knowledge, epoch=epoch)
     print(f"  knowledge:  {knowledge_dir.name}/ and knowledge-{version}.zip")

@@ -26,9 +26,13 @@ DEFAULT_STATE_DIRNAME = ".xbloom-studio-brew"
 ROOT = Path(__file__).resolve().parents[1]
 VENDOR_WHEELS = ROOT / "vendor" / "wheels"
 RELEASE_META = ROOT / "vendor" / "release.json"
+# Committed pin for hub/skills.sh installs (no monorepo core, no vendored wheel).
+# Points at a published GitHub Release core wheel + sha256; updated each release.
+HUB_PIN_PATH = ROOT / "vendor" / "hub-pin.json"
 # Universal hashed non-core runtime lock (committed; copied into Skill releases).
 RUNTIME_LOCK_BASENAME = "requirements-runtime.lock"
 RUNTIME_LOCK_PATH = ROOT / RUNTIME_LOCK_BASENAME
+DEFAULT_RELEASE_REPO = "HomoLand/xbloom-studio-brew"
 
 # Basename-only wheel name: xbloom_studio_core-<version>-<tags>.whl
 _CORE_WHEEL_NAME_RE = re.compile(
@@ -434,6 +438,167 @@ def is_dev_requirements(skill_root: Path | None = None) -> bool:
     return False
 
 
+def monorepo_core_path(skill_root: Path | None = None) -> Path | None:
+    """Return sibling ``packages/core`` when this Skill lives in the brew monorepo.
+
+    Hermes/skills.sh installs only the skill folder (no ``../../packages/core``),
+    so a requirements line of ``-e ../../packages/core`` must not be treated as
+    a usable development layout unless that path actually exists.
+    """
+
+    root = ROOT if skill_root is None else Path(skill_root)
+    candidate = (root / ".." / ".." / "packages" / "core").resolve()
+    if (candidate / "pyproject.toml").is_file():
+        return candidate
+    return None
+
+
+def _load_hub_pin(skill_root: Path | None = None) -> dict[str, object] | None:
+    """Load ``vendor/hub-pin.json`` when present (Hermes/hub standalone install)."""
+
+    root = ROOT if skill_root is None else Path(skill_root)
+    path = root / "vendor" / "hub-pin.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ReleaseMetaError(f"malformed vendor/hub-pin.json: {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ReleaseMetaError("vendor/hub-pin.json must be a JSON object")
+    layout = data.get("layout")
+    if layout != "hub-pin":
+        raise ReleaseMetaError(
+            f"vendor/hub-pin.json layout must be 'hub-pin', got {layout!r}"
+        )
+    for key in (
+        "core_version",
+        "core_wheel",
+        "core_wheel_sha256",
+        "core_wheel_url",
+        "runtime_lock",
+        "runtime_lock_sha256",
+    ):
+        val = data.get(key)
+        if not isinstance(val, str) or not val.strip():
+            raise ReleaseMetaError(
+                f"vendor/hub-pin.json missing non-empty string {key!r}"
+            )
+    digest = str(data["core_wheel_sha256"]).strip().lower()
+    if not _SHA256_HEX_RE.match(digest):
+        raise ReleaseMetaError("vendor/hub-pin.json core_wheel_sha256 must be 64 hex chars")
+    lock_digest = str(data["runtime_lock_sha256"]).strip().lower()
+    if not _SHA256_HEX_RE.match(lock_digest):
+        raise ReleaseMetaError(
+            "vendor/hub-pin.json runtime_lock_sha256 must be 64 hex chars"
+        )
+    data = dict(data)
+    data["core_wheel_sha256"] = digest
+    data["runtime_lock_sha256"] = lock_digest
+    return data
+
+
+def _download_file(url: str, dest: Path) -> None:
+    """Download *url* to *dest* using stdlib only (no core import)."""
+
+    import urllib.error
+    import urllib.request
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    try:
+        with urllib.request.urlopen(url, timeout=120) as resp:  # noqa: S310 — pin URL from hub-pin
+            data = resp.read()
+        tmp.write_bytes(data)
+        tmp.replace(dest)
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        if tmp.is_file():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise SystemExit(f"failed to download {url}: {exc}") from exc
+
+
+def _install_hub_pin(python: str) -> None:
+    """Install core from a pinned GitHub Release wheel + hashed runtime lock.
+
+    Used when the Skill is installed outside the monorepo (Hermes/skills.sh)
+    without a full release bundle under ``vendor/wheels/``.
+    """
+
+    pin = _load_hub_pin()
+    if pin is None:
+        raise SystemExit("hub-pin install requires vendor/hub-pin.json")
+
+    core_version = str(pin["core_version"]).strip()
+    wheel_name = str(pin["core_wheel"]).strip()
+    wheel_url = str(pin["core_wheel_url"]).strip()
+    wheel_sha = str(pin["core_wheel_sha256"]).strip().lower()
+    lock_name = str(pin["runtime_lock"]).strip()
+    lock_sha = str(pin["runtime_lock_sha256"]).strip().lower()
+
+    if lock_name != RUNTIME_LOCK_BASENAME:
+        raise SystemExit(
+            f"hub-pin runtime_lock must be {RUNTIME_LOCK_BASENAME!r}, got {lock_name!r}"
+        )
+    lock = ROOT / RUNTIME_LOCK_BASENAME
+    if not lock.is_file():
+        raise SystemExit(f"hub-pin layout missing {RUNTIME_LOCK_BASENAME} under Skill root")
+    actual_lock = _sha256_file(lock).lower()
+    if actual_lock != lock_sha:
+        raise SystemExit(
+            f"requirements-runtime.lock hash mismatch: expected {lock_sha}, got {actual_lock}"
+        )
+
+    cache_dir = _skill_state_dir() / "cache" / "wheels"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    wheel_path = cache_dir / wheel_name
+    if wheel_path.is_file() and _sha256_file(wheel_path).lower() == wheel_sha:
+        print(f"Using cached core wheel {wheel_path.name}")
+    else:
+        print(f"Downloading core wheel from {wheel_url}")
+        _download_file(wheel_url, wheel_path)
+        got = _sha256_file(wheel_path).lower()
+        if got != wheel_sha:
+            try:
+                wheel_path.unlink()
+            except OSError:
+                pass
+            raise SystemExit(
+                f"downloaded wheel hash mismatch: expected {wheel_sha}, got {got}"
+            )
+
+    print(f"Installing core from {wheel_path.name} (xbloom-studio-core=={core_version})")
+    run(
+        [
+            python,
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--no-deps",
+            "--no-index",
+            str(wheel_path),
+        ]
+    )
+    print(f"Installing non-core runtime deps from {lock.name} (--require-hashes)")
+    run(
+        [
+            python,
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--only-binary",
+            ":all:",
+            "--require-hashes",
+            "-r",
+            str(lock),
+        ]
+    )
+
+
 def venv_python(runtime: Path | None = None) -> Path:
     target = _skill_runtime_dir() if runtime is None else runtime
     return _runtime_python_path(target)
@@ -552,6 +717,9 @@ def main() -> None:
 
     python = str(venv_python(runtime))
     release = is_release_layout()
+    monorepo = monorepo_core_path()
+    hub_pin = None if release or monorepo is not None else _load_hub_pin()
+
     if release:
         print(f"Release layout detected (vendor wheels at {VENDOR_WHEELS})")
         _install_release(python)
@@ -567,10 +735,43 @@ def main() -> None:
                     "pytest==9.1.1",
                 ]
             )
-    else:
-        if is_dev_requirements():
-            print("Development layout detected (editable packages/core)")
+        mode = "release"
+    elif monorepo is not None:
+        print(f"Development layout detected (editable core at {monorepo})")
         _install_dev(python, dev=args.dev)
+        mode = "development"
+    elif hub_pin is not None:
+        print(
+            "Hub/standalone layout detected "
+            f"(vendor/hub-pin.json → core {hub_pin.get('core_version')})"
+        )
+        print(
+            "Note: requirements.txt '-e ../../packages/core' is monorepo-only "
+            "and is ignored here (Hermes/skills.sh installs the skill folder alone)."
+        )
+        _install_hub_pin(python)
+        if args.dev:
+            run(
+                [
+                    python,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--disable-pip-version-check",
+                    "pytest==9.1.1",
+                ]
+            )
+        mode = "hub-pin"
+    else:
+        raise SystemExit(
+            "cannot bootstrap this Skill install:\n"
+            "  - not a release bundle (missing vendor/release.json + wheel),\n"
+            "  - not a monorepo checkout (missing ../../packages/core),\n"
+            "  - missing vendor/hub-pin.json for Hermes/hub installs.\n"
+            "Fix: reinstall from a skill-*.zip release, clone the monorepo, "
+            "or ensure vendor/hub-pin.json is present and network can reach "
+            f"GitHub Releases for {DEFAULT_RELEASE_REPO}."
+        )
 
     runtime_env = _environment_copy()
     runtime_env[RUNTIME_DIR_ENV] = str(runtime)
@@ -587,7 +788,6 @@ def main() -> None:
         print(
             f"Persist {RUNTIME_DIR_ENV}={runtime} for future CLI and bridge calls."
         )
-    mode = "release" if release else "development"
     print(f"Bootstrap complete ({mode}). Run: python scripts/xbloom.py scan")
 
 

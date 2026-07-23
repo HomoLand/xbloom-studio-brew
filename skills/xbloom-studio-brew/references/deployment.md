@@ -74,15 +74,25 @@ run bootstrap once to migrate, then remove that legacy directory only after `doc
 `"runtime_location": "external"`.
 
 Bootstrap uses only the Python standard library until dependencies are installed, so it can run
-before `xbloom-studio-core` is present. It then chooses one of two layouts:
+before `xbloom-studio-core` is present. It then chooses **one of three layouts** (first match wins):
 
 | Layout | How detected | Install path |
 | --- | --- | --- |
-| Development (repo checkout) | `requirements.txt` contains `-e ../../packages/core` and no release evidence | editable install of sibling `packages/core` (and optional dev extras) |
-| Release (GitHub Skill bundle) | `vendor/release.json` present, **or** a vendored `vendor/wheels/xbloom_studio_core-*.whl` | (1) exact hashed core wheel offline `--no-deps --no-index`; (2) non-core only via `pip install --only-binary :all: --require-hashes -r requirements-runtime.lock` |
+| Release (GitHub Skill ZIP) | `vendor/release.json` present, **or** a vendored `vendor/wheels/xbloom_studio_core-*.whl` | (1) exact hashed core wheel offline `--no-deps --no-index`; (2) non-core only via `pip install --only-binary :all: --require-hashes -r requirements-runtime.lock` |
+| Development (monorepo checkout) | sibling `../../packages/core/pyproject.toml` actually exists | editable install via monorepo `requirements.txt` (`-e ../../packages/core`) |
+| Hub / Hermes / skills.sh | no monorepo core, no release bundle; `vendor/hub-pin.json` present | download pinned GitHub Release core wheel (URL + `core_wheel_sha256`), cache under state dir; then same hashed `requirements-runtime.lock` |
 
-Do not rely on a sibling monorepo checkout for release installs. The published Skill bundle carries
-the exact core wheel under `vendor/wheels/` and the universal hashed runtime lock
+**Honest pitfall (v1.3.0 hub installs):** the Skill directory committed for Hermes/skills.sh still ships a
+monorepo-oriented `requirements.txt` line `-e ../../packages/core`. That path does **not** exist
+outside a full brew checkout. Running plain `pip install -r requirements.txt` from a hub-installed
+Skill **will fail** — that is expected, not user error. Always use `python scripts/bootstrap.py`.
+From the fix that introduced `vendor/hub-pin.json`, bootstrap **ignores** the editable line when
+`packages/core` is missing and installs via hub-pin (network required once to fetch the Release
+wheel). Doctor may still look “ok” if a prior runtime/state already exists while a full hub
+bootstrap never completed — prefer bootstrap + doctor after every skill force-update.
+
+Do not rely on a sibling monorepo checkout for release or hub installs. The published Skill **ZIP**
+carries the exact core wheel under `vendor/wheels/` and the universal hashed runtime lock
 `requirements-runtime.lock` at the Skill root. Bootstrap reads `vendor/release.json` for
 `core_version`, `core_wheel`, `core_wheel_sha256`, `runtime_lock`, and `runtime_lock_sha256`.
 When that file is present it is parsed strictly and fail-closed: malformed JSON, wrong types,
@@ -91,6 +101,12 @@ lock as a direct child of the Skill root named exactly `requirements-runtime.loc
 absolute paths / slash ambiguity), missing files, or bad hashes all abort **before any `pip`
 invocation**. There is no soft fallback when metadata exists but is invalid, and no line-to-args
 install of unhashed `requirements.txt` pins in release layout.
+
+**Hub pin (`vendor/hub-pin.json`):** committed next to the Skill for installs that only receive the
+skill folder (Hermes `skills install OWNER/REPO/skills/xbloom-studio-brew`). Fields pin
+`core_wheel_url` (GitHub Release asset), `core_wheel_sha256`, and `runtime_lock_sha256`. Regenerated
+by `tools/build_release.py` each release. Requires network for the first core wheel download unless
+already cached under `~/.xbloom-studio-brew/cache/wheels/`.
 
 **Damaged-bundle fail-closed:** if a vendored `xbloom_studio_core-*.whl` remains but
 `vendor/release.json` is missing (or unreadable), layout detection still classifies the Skill as

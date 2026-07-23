@@ -285,12 +285,20 @@ skills/.../requirements-runtime.lock    # committed universal runtime lock
 ```
 
 `packages/core` is the shared foundation imported by both the Skill CLI and the
-Web UI backend. The Skill stays at `skills/xbloom-studio-brew/` and depends on
-core via its `requirements.txt` (`-e ../../packages/core` in development). The
-Web UI lives in a sibling repo (`xbloom-studio-web`) and its backend depends on
-core the same way. The BLE bridge daemon (`xbloom_ble.bridge`) is a
-single-instance loopback process shared by all clients; installable as
-`xbloom-bridge` from the core wheel.
+Web UI backend. The Skill stays at `skills/xbloom-studio-brew/`. Bootstrap picks a layout:
+
+| Layout | When | Core install |
+| --- | --- | --- |
+| Monorepo | `../../packages/core` exists | editable (`-e` in `requirements.txt`) |
+| Release ZIP | `vendor/release.json` + vendored wheel | offline hashed wheel |
+| Hermes / hub | skill folder only + `vendor/hub-pin.json` | download Release wheel by URL + sha256 |
+
+**Do not** `pip install -r requirements.txt` from a Hermes/skills.sh install: that file still
+contains the monorepo line `-e ../../packages/core`, which fails outside a full checkout. Use
+`python scripts/bootstrap.py` only. The Web UI lives in a sibling repo (`xbloom-studio-web`) and
+its backend depends on core the same way. The BLE bridge daemon (`xbloom_ble.bridge`) is a
+single-instance loopback process shared by all clients; installable as `xbloom-bridge` from the
+core wheel.
 
 ## Development
 
@@ -306,6 +314,8 @@ checking `vendor/release.json` (`core_wheel` + `core_wheel_sha256`, fail-closed)
 installs non-core runtime deps only via
 `pip install --only-binary :all: --require-hashes -r requirements-runtime.lock`
 (also integrity-bound by `runtime_lock` + `runtime_lock_sha256` in `vendor/release.json`).
+Hermes/hub installs (skill folder without monorepo) use committed `vendor/hub-pin.json` to
+fetch the same Release core wheel and the same hashed lock.
 
 ### Universal runtime lock
 

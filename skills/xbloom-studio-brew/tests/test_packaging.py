@@ -455,6 +455,8 @@ def test_bootstrap_release_vs_dev_detection(tmp_path):
     (dev_root / "requirements.txt").write_text("-e ../../packages/core\n", encoding="utf-8")
     assert module.is_dev_requirements(dev_root)
     assert not module.is_release_layout(dev_root)
+    # requirements line alone is not enough: monorepo needs real packages/core.
+    assert module.monorepo_core_path(dev_root) is None
 
     rel_root = tmp_path / "rel-skill"
     wheel_name = "xbloom_studio_core-1.0.1-py3-none-any.whl"
@@ -468,6 +470,86 @@ def test_bootstrap_release_vs_dev_detection(tmp_path):
     assert module._release_core_version(rel_root) == "1.0.1"
     assert module._release_core_wheel(rel_root).name == wheel_name
     assert module._release_runtime_lock(rel_root).name == RUNTIME_LOCK_BASENAME
+
+
+def test_monorepo_core_path_requires_sibling_checkout(tmp_path):
+    """Hermes skill dir has -e ../../packages/core but no monorepo tree."""
+
+    module = _load_bootstrap_module()
+    skill = tmp_path / "skills" / "xbloom-studio-brew"
+    skill.mkdir(parents=True)
+    (skill / "requirements.txt").write_text("-e ../../packages/core\n", encoding="utf-8")
+    assert module.monorepo_core_path(skill) is None
+
+    core = tmp_path / "packages" / "core"
+    core.mkdir(parents=True)
+    (core / "pyproject.toml").write_text('[project]\nname = "x"\n', encoding="utf-8")
+    found = module.monorepo_core_path(skill)
+    assert found is not None
+    assert found.resolve() == core.resolve()
+
+
+def test_hub_pin_load_and_validate(tmp_path):
+    module = _load_bootstrap_module()
+    skill = tmp_path / "hub-skill"
+    skill.mkdir()
+    lock = _write_runtime_lock(skill)
+    lock_sha = _sha256(lock)
+    wheel_sha = "c" * 64
+    pin = {
+        "layout": "hub-pin",
+        "core_version": "1.3.0",
+        "core_wheel": "xbloom_studio_core-1.3.0-py3-none-any.whl",
+        "core_wheel_sha256": wheel_sha,
+        "core_wheel_url": (
+            "https://github.com/HomoLand/xbloom-studio-brew/releases/download/"
+            "v1.3.0/xbloom_studio_core-1.3.0-py3-none-any.whl"
+        ),
+        "runtime_lock": RUNTIME_LOCK_BASENAME,
+        "runtime_lock_sha256": lock_sha,
+        "release_repo": "HomoLand/xbloom-studio-brew",
+    }
+    (skill / "vendor").mkdir()
+    (skill / "vendor" / "hub-pin.json").write_text(
+        json.dumps(pin) + "\n", encoding="utf-8"
+    )
+    loaded = module._load_hub_pin(skill)
+    assert loaded is not None
+    assert loaded["layout"] == "hub-pin"
+    assert loaded["core_version"] == "1.3.0"
+    assert loaded["core_wheel_sha256"] == wheel_sha
+    assert loaded["runtime_lock_sha256"] == lock_sha
+
+    # Malformed layout fails closed.
+    pin["layout"] = "release"
+    (skill / "vendor" / "hub-pin.json").write_text(
+        json.dumps(pin) + "\n", encoding="utf-8"
+    )
+    with pytest.raises(module.ReleaseMetaError, match="hub-pin"):
+        module._load_hub_pin(skill)
+
+
+def test_committed_hub_pin_matches_runtime_lock():
+    """Skill tree for Hermes must ship a valid hub-pin bound to the lock."""
+
+    module = _load_bootstrap_module()
+    pin_path = SKILL_ROOT / "vendor" / "hub-pin.json"
+    assert pin_path.is_file(), (
+        "vendor/hub-pin.json must be committed so Hermes/skills.sh bootstrap "
+        "does not rely on monorepo -e ../../packages/core"
+    )
+    pin = module._load_hub_pin(SKILL_ROOT)
+    assert pin is not None
+    lock = SKILL_ROOT / RUNTIME_LOCK_BASENAME
+    assert lock.is_file()
+    assert _sha256(lock).lower() == str(pin["runtime_lock_sha256"]).lower()
+    assert str(pin["core_wheel_url"]).startswith(
+        "https://github.com/HomoLand/xbloom-studio-brew/releases/download/"
+    )
+    # Hub skill dir still has monorepo-style requirements, but monorepo path
+    # only resolves inside a full checkout (this test runs from monorepo).
+    assert module.is_dev_requirements(SKILL_ROOT)
+    assert module.monorepo_core_path(SKILL_ROOT) is not None
 
 
 def test_is_release_layout_authoritative_on_release_json(tmp_path):

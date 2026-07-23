@@ -1,0 +1,10 @@
+{
+  "core_version": "1.3.0",
+  "core_wheel": "xbloom_studio_core-1.3.0-py3-none-any.whl",
+  "core_wheel_sha256": "fcc7e145a859ffb9446a768c4885db362ed766301011bdbe945270c304d338aa",
+  "core_wheel_url": "https://github.com/HomoLand/xbloom-studio-brew/releases/download/v1.3.0/xbloom_studio_core-1.3.0-py3-none-any.whl",
+  "layout": "hub-pin",
+  "release_repo": "HomoLand/xbloom-studio-brew",
+  "runtime_lock": "requirements-runtime.lock",
+  "runtime_lock_sha256": "76a0886fdc70f55f59668bf008095431985993fbeaef277c5ab8bbfccb457c8e"
+}

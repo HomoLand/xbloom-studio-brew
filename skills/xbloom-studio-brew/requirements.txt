@@ -1,1 +1,10 @@
+# Monorepo development only (repo checkout of HomoLand/xbloom-studio-brew).
+# Installs editable packages/core when ../../packages/core exists.
+#
+# Hermes / skills.sh / extracted skill WITHOUT monorepo:
+#   - Do NOT use this file for bootstrap.
+#   - bootstrap.py uses vendor/hub-pin.json (GitHub Release wheel + hashed lock)
+#     or vendor/release.json (full offline skill-*.zip).
+#   - Running "pip install -r requirements.txt" outside the monorepo WILL fail
+#     on "-e ../../packages/core" — that is expected.
 -e ../../packages/core
