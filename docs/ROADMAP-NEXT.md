@@ -5,7 +5,7 @@
 > 前置：Phase 0–C 代码已合主干；A11 真机核心路径已验收；Web 真机/LAN 延后  
 > 相关基线：`docs/ARCHITECTURE-AND-ROADMAP.md`、`docs/BLE-LIFECYCLE.md`  
 > **已确认选择**：顺序 `D → E → F`；**只要 Home Assistant，不要 Homebridge/Siri**；自动化默认关；配方进 Home 需 opt-in。  
-> **进度**：D 知识+检查表已落地；E beans/preferences schema+CLI 已落地；F HA 仓脚手架已建（`xbloom-studio-ha`）。
+> **进度**：D 知识+检查表已落地；E beans/preferences schema+CLI 已落地；**F HA thin client v0.1 已实现**（RPC/传感器/冲煮服务；真机 HA 待用户侧验证）。
 
 ---
 
