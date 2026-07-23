@@ -124,6 +124,11 @@ verify the author and brewer, cite it, and label every adaptation.
   `c8712a46821016affe752277e62db11e4c9039c0`, version 2.3.0 — source of the vendored BLE protocol,
   client, recipe model, telemetry parser, and upstream protocol tests. Upstream describes the
   project as alpha and tested only on firmware `V12.0D.500`.
+- [Saievo/xbloom-CoT-Brew](https://github.com/Saievo/xbloom-CoT-Brew) — community statistical
+  notes (approx. 450 app-visible recipes, analysis 2026-05-04) adapted into
+  `references/recipe-baselines.md` as **optional advanced** baselines. Not official xBloom data;
+  pattern numeric encodings and cloud MCP stack are **not** used. Conservative first cups still
+  follow `recipe-design.md`.
 
 See `THIRD_PARTY_NOTICES.md` and `licenses/` for attribution and license texts.
 

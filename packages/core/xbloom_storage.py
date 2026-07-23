@@ -29,7 +29,7 @@ from xbloom_ble.tea import TeaRecipe, TeaRecipeError
 from xbloom_paths import normalize_state_root, state_dir as resolve_state_dir
 from xbloom_safety import SafetyError, strict_validate
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DB_FILE_NAME = "state.db"
 BUSY_TIMEOUT_MS = 5000
 # Cross-connection fresh-DB bootstrap: exclusive lock + busy retries (not a
@@ -992,6 +992,30 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         created_at TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS beans (
+        bean_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        origin TEXT,
+        process TEXT,
+        roast_level TEXT,
+        altitude TEXT,
+        flavor_notes TEXT,
+        roast_date TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS preferences (
+        key TEXT PRIMARY KEY,
+        value_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_beans_name ON beans(name)",
+    "CREATE INDEX IF NOT EXISTS idx_beans_updated ON beans(updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_recipe_revisions_recipe ON recipe_revisions(recipe_id)",
     "CREATE INDEX IF NOT EXISTS idx_workflow_events_workflow ON workflow_events(workflow_id, seq)",
     "CREATE INDEX IF NOT EXISTS idx_idempotency_expires ON idempotency(expires_at)",
@@ -1011,6 +1035,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
 # active-workflow and idempotency-status indexes used by Phase A bridge APIs.
 # Version 3 adds non-destructive recipe archive + listing indexes (Phase B B8).
 # Version 4 adds append-only history_events journal (Phase 0.3/0.4 history cutover).
+# Version 5 adds beans + preferences for dial-in / home opt-in (ROADMAP-NEXT Phase E).
 # Do not fold v3 columns into SCHEMA_STATEMENTS CREATE: fresh DBs apply CREATE
 # then run migrations once; putting archived_at in CREATE would make ALTER fail
 # or require dual-path schema init. New tables may appear in both CREATE (IF NOT
@@ -1084,6 +1109,36 @@ SCHEMA_MIGRATIONS: tuple[tuple[int, str, tuple[str, ...]], ...] = (
             "ON history_events(workflow_id)",
             "CREATE INDEX IF NOT EXISTS idx_history_events_remote "
             "ON history_events(remote_table_id)",
+        ),
+    ),
+    (
+        5,
+        "phase_e_beans_preferences_v5",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS beans (
+                bean_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                origin TEXT,
+                process TEXT,
+                roast_level TEXT,
+                altitude TEXT,
+                flavor_notes TEXT,
+                roast_date TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_beans_name ON beans(name)",
+            "CREATE INDEX IF NOT EXISTS idx_beans_updated ON beans(updated_at)",
+            """
+            CREATE TABLE IF NOT EXISTS preferences (
+                key TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
         ),
     ),
 )
@@ -3922,6 +3977,179 @@ class StateStore:
                 active, event, dedupe_key=dedupe_key
             )
             return public
+
+    # ------------------------------------------------------------------
+    # Beans + preferences (Phase E)
+    # ------------------------------------------------------------------
+
+    def _bean_row_to_public(self, row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
+        data = _row_to_dict(row) if isinstance(row, sqlite3.Row) else dict(row)
+        meta_raw = data.pop("metadata_json", "{}")
+        try:
+            metadata = json.loads(meta_raw or "{}")
+        except json.JSONDecodeError:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        data["metadata"] = metadata
+        return data
+
+    def list_beans(self, *, query: str | None = None) -> list[dict[str, Any]]:
+        """List beans newest-updated first; optional case-insensitive name/origin query."""
+
+        self.ensure_schema()
+        sql = "SELECT * FROM beans"
+        params: list[Any] = []
+        if query and query.strip():
+            like = f"%{query.strip()}%"
+            sql += (
+                " WHERE name LIKE ? COLLATE NOCASE"
+                " OR IFNULL(origin, '') LIKE ? COLLATE NOCASE"
+                " OR IFNULL(flavor_notes, '') LIKE ? COLLATE NOCASE"
+            )
+            params.extend([like, like, like])
+        sql += " ORDER BY updated_at DESC"
+        rows = self._connect().execute(sql, params).fetchall()
+        return [self._bean_row_to_public(row) for row in rows]
+
+    def get_bean(self, bean_id: str) -> dict[str, Any] | None:
+        self.ensure_schema()
+        row = self._connect().execute(
+            "SELECT * FROM beans WHERE bean_id = ?",
+            (bean_id,),
+        ).fetchone()
+        return self._bean_row_to_public(row) if row is not None else None
+
+    def upsert_bean(
+        self,
+        *,
+        name: str,
+        bean_id: str | None = None,
+        origin: str | None = None,
+        process: str | None = None,
+        roast_level: str | None = None,
+        altitude: str | None = None,
+        flavor_notes: str | None = None,
+        roast_date: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create or update a bean library entry."""
+
+        cleaned = (name or "").strip()
+        if not cleaned:
+            raise StorageError("bean name is required")
+        now = utc_now()
+        bid = (bean_id or "").strip() or f"bean_{uuid4().hex}"
+        meta_json = json.dumps(dict(metadata or {}), sort_keys=True, ensure_ascii=False)
+        with self.transaction() as conn:
+            existing = conn.execute(
+                "SELECT bean_id FROM beans WHERE bean_id = ?",
+                (bid,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO beans (
+                        bean_id, name, origin, process, roast_level, altitude,
+                        flavor_notes, roast_date, metadata_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        bid,
+                        cleaned,
+                        origin,
+                        process,
+                        roast_level,
+                        altitude,
+                        flavor_notes,
+                        roast_date,
+                        meta_json,
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE beans SET
+                        name = ?, origin = ?, process = ?, roast_level = ?,
+                        altitude = ?, flavor_notes = ?, roast_date = ?,
+                        metadata_json = ?, updated_at = ?
+                    WHERE bean_id = ?
+                    """,
+                    (
+                        cleaned,
+                        origin,
+                        process,
+                        roast_level,
+                        altitude,
+                        flavor_notes,
+                        roast_date,
+                        meta_json,
+                        now,
+                        bid,
+                    ),
+                )
+        out = self.get_bean(bid)
+        assert out is not None
+        return out
+
+    def delete_bean(self, bean_id: str) -> bool:
+        self.ensure_schema()
+        with self.transaction() as conn:
+            cur = conn.execute("DELETE FROM beans WHERE bean_id = ?", (bean_id,))
+            return cur.rowcount > 0
+
+    def get_preference(self, key: str) -> Any | None:
+        self.ensure_schema()
+        row = self._connect().execute(
+            "SELECT value_json FROM preferences WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return json.loads(row["value_json"])
+        except json.JSONDecodeError:
+            return None
+
+    def list_preferences(self) -> dict[str, Any]:
+        self.ensure_schema()
+        rows = self._connect().execute(
+            "SELECT key, value_json FROM preferences ORDER BY key ASC"
+        ).fetchall()
+        out: dict[str, Any] = {}
+        for row in rows:
+            try:
+                out[str(row["key"])] = json.loads(row["value_json"])
+            except json.JSONDecodeError:
+                out[str(row["key"])] = None
+        return out
+
+    def set_preference(self, key: str, value: Any) -> dict[str, Any]:
+        cleaned = (key or "").strip()
+        if not cleaned:
+            raise StorageError("preference key is required")
+        now = utc_now()
+        payload = json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False)
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO preferences (key, value_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at = excluded.updated_at
+                """,
+                (cleaned, payload, now),
+            )
+        return {"key": cleaned, "value": value, "updated_at": now}
+
+    def delete_preference(self, key: str) -> bool:
+        self.ensure_schema()
+        with self.transaction() as conn:
+            cur = conn.execute("DELETE FROM preferences WHERE key = ?", (key,))
+            return cur.rowcount > 0
 
     def load_history_events(self) -> list[dict[str, Any]]:
         """Return all history events in append order (oldest first)."""

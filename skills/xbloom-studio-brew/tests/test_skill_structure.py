@@ -20,6 +20,7 @@ def test_skill_frontmatter_is_portable_and_minimal():
 def test_skill_references_and_assets_exist():
     expected = [
         "references/recipe-design.md",
+        "references/recipe-baselines.md",
         "references/web-enrichment.md",
         "references/recipe-schema.md",
         "references/device-safety.md",

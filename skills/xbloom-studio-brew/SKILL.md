@@ -54,32 +54,64 @@ hot stages as local `flash-brew` metadata. Never replace the vessel ice with mac
 ## Design a recipe
 
 Read `references/recipe-design.md` when creating or adjusting a recipe. Read
-`references/recipe-schema.md` before writing YAML.
+`references/recipe-schema.md` before writing YAML. For advanced community statistical
+templates (optional), read `references/recipe-baselines.md` after the conservative guide.
+
+### Mandatory design checklist (before writing any recipe parameters)
+
+Complete this reasoning **before** emitting grind/temp/pours YAML. Do not skip to a template.
+
+1. **Prior art (catalog / history / beans first)**  
+   - Run `catalog list --kind coffee --query <bean-or-roaster>` (and tea if relevant).  
+   - Run `beans list --query <bean-or-roaster>` and `history list --limit 20` when dialing in.  
+   - Read `preferences list` when taste targets exist.  
+   - If an executable catalog recipe matches the bean/lot, **prefer exporting and adapting it**
+     over inventing a new baseline. State the catalog id in the rationale.
+2. **Bean model**  
+   - Roast (very light → dark), process (washed/honey/natural/anaerobic/…), age, density clues
+     (origin/altitude/variety).  
+   - Map to a conservative `recipe-design.md` row; only then consider baselines A–G.
+3. **Special cases**  
+   - Geisha/Gesha: split Panama washed vs Ethiopia natural (see baselines); never one density myth.  
+   - Flash brew: reconstruct hot water + `ice_g` per flash rules; never treat ice as a machine mode.  
+   - Clog risk (cake filter): honey/natural + fine grind + many pours + heavy vibration → reduce
+     mid-bed vibration and/or coarsen (baselines clog score).
+4. **Agitation / temp / structure**  
+   - Default bloom `vibration: after` only; no mid-pour vibration without a reason.  
+   - Prefer 3 pours for first cups; 4–5 only as advanced or catalog match.  
+   - Justify each of grind, temperature, ratio, rpm, pattern in one short phrase each.
+5. **Only then** write YAML and validate.
+
+Never use “most recipes use X” as the only reason for a parameter.
+
+### Design steps
 
 1. Extract drink style, roast, roast date, process, origin/variety, tasting notes, water, and the
    user's flavor target. Prefer the user's target over the roaster's notes.
-2. When an exact roaster, coffee, lot, or xPod is identifiable, or the user asks for expert/public
+2. Complete the **mandatory design checklist** above (catalog/history before invention).
+3. When an exact roaster, coffee, lot, or xPod is identifiable, or the user asks for expert/public
    recipes, read `references/web-enrichment.md` and search first-party public sources if web tools
    are available. If credible recipes exist, show the Skill baseline and up to two cited adaptations
    for selection. Never load an external adaptation before the user chooses it.
-3. If details are missing after research, use reasonable assumptions and state them. Default to 15 g coffee,
+4. If details are missing after research, use reasonable assumptions and state them. Default to 15 g coffee,
    240 g final water, Omni Dripper 2, and filtered water; never assume unknown water is RO.
-4. Choose the smallest useful pour count and a conservative first-cup profile.
-5. For manual-over-ice flash brew, keep the unchanged coffee pour-over program separate from vessel
+5. Choose the smallest useful pour count and a conservative first-cup profile (or catalog export).
+6. For manual-over-ice flash brew, keep the unchanged coffee pour-over program separate from vessel
    ice; label both ratios and require the ice before physical start.
    For an intentional bypass recipe, keep extraction pours and final bypass explicit; bypass is
    machine water, not display-only metadata. Use `RT`/`BP` only when that mode is intentional.
-6. Copy `assets/hot-template.yaml` or `assets/flash-brew-template.yaml` to a user/workspace path.
-   Never modify the installed template in place.
-7. Fill every public field with a concrete value. Do not add undocumented protocol fields.
-8. Validate the finished local file:
+7. Copy `assets/hot-template.yaml` or `assets/flash-brew-template.yaml` to a user/workspace path,
+   or export from catalog. Never modify the installed template in place.
+8. Fill every public field with a concrete value. Do not add undocumented protocol fields.
+9. Validate the finished local file:
 
 ```text
 python <skill-dir>/scripts/xbloom.py validate <recipe.yaml>
 ```
 
-9. Fix every validation error rather than bypassing the guard. Present the validated recipe, its
-   assumptions, and exactly one first correction for the next cup.
+10. Fix every validation error rather than bypassing the guard. Present the validated recipe, its
+    assumptions, checklist highlights (especially catalog match or deliberate deviation), and
+    exactly one first correction for the next cup.
 
 Do not claim a generated recipe has been taste-validated. After the user tastes it, use the result
 and drawdown behavior to adjust one variable at a time.
@@ -104,6 +136,10 @@ python <skill-dir>/scripts/xbloom.py catalog history-sync --region <china|intern
 python <skill-dir>/scripts/xbloom.py history status
 python <skill-dir>/scripts/xbloom.py history list --limit 20
 python <skill-dir>/scripts/xbloom.py history note <event_id> "tasting notes"
+python <skill-dir>/scripts/xbloom.py beans list
+python <skill-dir>/scripts/xbloom.py beans add "M2M 花魁 SELECT" --process natural --roast-level light
+python <skill-dir>/scripts/xbloom.py preferences set taste "{\"sweetness\":4,\"acidity\":3}"
+python <skill-dir>/scripts/xbloom.py preferences list
 ```
 
 The shared local catalog runtime is `state.db` (`recipes` / `recipe_revisions`), the same store
@@ -521,6 +557,7 @@ state support it. Distinguish `loaded/armed` from `started/brewing`.
 ## References
 
 - Read `references/recipe-design.md` for bean logic, flash brew, C40 conversion, and dial-in.
+- Read `references/recipe-baselines.md` for optional community statistical templates and clog/Geisha notes.
 - Read `references/web-enrichment.md` when researching bean metadata or public expert recipes.
 - Read `references/recipe-schema.md` for the exact guarded file contract.
 - Read `references/device-safety.md` before BLE writes or remote start.

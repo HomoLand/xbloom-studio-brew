@@ -12,6 +12,12 @@ recipe as a starting hypothesis, not a claim of an objectively best extraction.
 - Convert C40 clicks
 - Diagnose by changing one variable
 - Report the result
+- Advanced statistical baselines (optional)
+
+The rows below are the **default first-cup** guide. For optional community
+statistical templates (templates A–G, clog scoring, Geisha splits), read
+`recipe-baselines.md` **after** this file—never instead of validation or the
+user's own catalog recipe.
 
 ## Inputs and defaults
 
@@ -174,3 +180,12 @@ Return both:
 
 Name the flavor goal, state any assumptions, show hot and final ratios separately for flash
 brews, and never claim the recipe has been taste-validated before the user brews it.
+
+## Advanced statistical baselines (optional)
+
+When the user wants a more “app-population” or specialty-advanced starting point,
+or when comparing after web research, open `recipe-baselines.md`. Prefer:
+
+1. An executable catalog recipe for the same bean/lot if one exists.
+2. This file's conservative profile for a true first cup.
+3. Baselines only as a labeled advanced hypothesis, still validated.

@@ -1512,16 +1512,17 @@ def _coffee_edit(**overrides):
     return data
 
 
-def test_schema_fresh_is_v4_with_archive_and_history(tmp_path):
+def test_schema_fresh_is_v5_with_archive_history_beans(tmp_path):
     store = storage.StateStore(tmp_path)
     version = store.ensure_schema()
-    assert version == 4
-    assert storage.SCHEMA_VERSION == 4
+    assert version == 5
+    assert storage.SCHEMA_VERSION == 5
     names = {row["name"] for row in store.list_migrations()}
     assert "baseline_v1" in names
     assert any("v2" in n for n in names)
     assert any("v3" in n for n in names)
     assert any("v4" in n for n in names)
+    assert any("v5" in n for n in names)
     cols = {
         r[1]
         for r in store._connect().execute("PRAGMA table_info(recipes)").fetchall()
@@ -1538,6 +1539,7 @@ def test_schema_fresh_is_v4_with_archive_and_history(tmp_path):
     assert "idx_recipes_archived_updated" in index_names
     assert "idx_recipe_revisions_recipe_number" in index_names
     assert "idx_history_events_recorded" in index_names
+    assert "idx_beans_name" in index_names
     tables = {
         r[0]
         for r in store._connect()
@@ -1545,6 +1547,8 @@ def test_schema_fresh_is_v4_with_archive_and_history(tmp_path):
         .fetchall()
     }
     assert "history_events" in tables
+    assert "beans" in tables
+    assert "preferences" in tables
     # Fresh open must not re-apply migrations (single row per version).
     store.close()
     store2 = storage.StateStore(tmp_path)

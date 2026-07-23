@@ -959,6 +959,183 @@ def cmd_history(args: argparse.Namespace) -> int:
     raise RuntimeError(f"unknown history action {action}")
 
 
+def cmd_beans(args: argparse.Namespace) -> int:
+    """Manage the local bean library in state.db (no BLE)."""
+
+    from xbloom_storage import StorageError, open_store
+
+    action = args.beans_action
+    store = open_store()
+    try:
+        if action == "list":
+            beans = store.list_beans(query=getattr(args, "query", None))
+            emit(
+                {
+                    "command": "beans",
+                    "action": action,
+                    "count": len(beans),
+                    "beans": beans,
+                    "source": "state.db",
+                }
+            )
+            return 0
+        if action == "show":
+            bean = store.get_bean(args.bean_id)
+            if bean is None:
+                raise RuntimeError(f"unknown bean_id {args.bean_id!r}")
+            emit({"command": "beans", "action": action, "bean": bean, "source": "state.db"})
+            return 0
+        if action == "add":
+            bean = store.upsert_bean(
+                name=args.name,
+                origin=args.origin,
+                process=args.process,
+                roast_level=args.roast_level,
+                altitude=args.altitude,
+                flavor_notes=args.flavor_notes,
+                roast_date=args.roast_date,
+            )
+            emit(
+                {
+                    "command": "beans",
+                    "action": action,
+                    "status": "created",
+                    "bean": bean,
+                    "source": "state.db",
+                }
+            )
+            return 0
+        if action == "edit":
+            existing = store.get_bean(args.bean_id)
+            if existing is None:
+                raise RuntimeError(f"unknown bean_id {args.bean_id!r}")
+            bean = store.upsert_bean(
+                bean_id=args.bean_id,
+                name=args.name or existing["name"],
+                origin=args.origin if args.origin is not None else existing.get("origin"),
+                process=args.process if args.process is not None else existing.get("process"),
+                roast_level=(
+                    args.roast_level
+                    if args.roast_level is not None
+                    else existing.get("roast_level")
+                ),
+                altitude=(
+                    args.altitude if args.altitude is not None else existing.get("altitude")
+                ),
+                flavor_notes=(
+                    args.flavor_notes
+                    if args.flavor_notes is not None
+                    else existing.get("flavor_notes")
+                ),
+                roast_date=(
+                    args.roast_date
+                    if args.roast_date is not None
+                    else existing.get("roast_date")
+                ),
+                metadata=existing.get("metadata") if isinstance(existing.get("metadata"), dict) else {},
+            )
+            emit(
+                {
+                    "command": "beans",
+                    "action": action,
+                    "status": "updated",
+                    "bean": bean,
+                    "source": "state.db",
+                }
+            )
+            return 0
+        if action == "delete":
+            ok = store.delete_bean(args.bean_id)
+            if not ok:
+                raise RuntimeError(f"unknown bean_id {args.bean_id!r}")
+            emit(
+                {
+                    "command": "beans",
+                    "action": action,
+                    "status": "deleted",
+                    "bean_id": args.bean_id,
+                    "source": "state.db",
+                }
+            )
+            return 0
+    except StorageError as exc:
+        raise RuntimeError(str(exc)) from exc
+    finally:
+        store.close()
+    raise RuntimeError(f"unknown beans action {action}")
+
+
+def cmd_preferences(args: argparse.Namespace) -> int:
+    """Read/write taste and home opt-in preferences in state.db (no BLE)."""
+
+    from xbloom_storage import StorageError, open_store
+
+    action = args.preferences_action
+    store = open_store()
+    try:
+        if action == "list":
+            emit(
+                {
+                    "command": "preferences",
+                    "action": action,
+                    "preferences": store.list_preferences(),
+                    "source": "state.db",
+                }
+            )
+            return 0
+        if action == "get":
+            value = store.get_preference(args.key)
+            emit(
+                {
+                    "command": "preferences",
+                    "action": action,
+                    "key": args.key,
+                    "value": value,
+                    "found": value is not None,
+                    "source": "state.db",
+                }
+            )
+            return 0
+        if action == "set":
+            import json as _json
+
+            raw = args.value
+            try:
+                parsed = _json.loads(raw)
+            except _json.JSONDecodeError:
+                parsed = raw
+            result = store.set_preference(args.key, parsed)
+            emit(
+                {
+                    "command": "preferences",
+                    "action": action,
+                    "status": "set",
+                    **result,
+                    "source": "state.db",
+                }
+            )
+            return 0
+        if action == "delete":
+            ok = store.delete_preference(args.key)
+            if not ok:
+                raise RuntimeError(f"unknown preference key {args.key!r}")
+            emit(
+                {
+                    "command": "preferences",
+                    "action": action,
+                    "status": "deleted",
+                    "key": args.key,
+                    "source": "state.db",
+                }
+            )
+            return 0
+    except StorageError as exc:
+        raise RuntimeError(str(exc)) from exc
+    finally:
+        store.close()
+    raise RuntimeError(f"unknown preferences action {action}")
+
+
 async def async_load(args: argparse.Namespace) -> int:
     """Load/arm via daemon-owned BLE; returns durable workflow_id."""
 
@@ -2274,6 +2451,49 @@ def build_parser() -> argparse.ArgumentParser:
     )
     history_note.add_argument("event_id")
     history_note.add_argument("note")
+    beans = sub.add_parser(
+        "beans",
+        help="local bean library in state.db (no BLE; for design/dial-in)",
+    )
+    beans_sub = beans.add_subparsers(dest="beans_action", required=True)
+    beans_list = beans_sub.add_parser("list", help="list beans")
+    beans_list.add_argument("--query", help="filter by name/origin/notes")
+    beans_show = beans_sub.add_parser("show", help="show one bean by id")
+    beans_show.add_argument("bean_id")
+    beans_add = beans_sub.add_parser("add", help="add a bean")
+    beans_add.add_argument("name")
+    beans_add.add_argument("--origin")
+    beans_add.add_argument("--process")
+    beans_add.add_argument("--roast-level")
+    beans_add.add_argument("--altitude")
+    beans_add.add_argument("--flavor-notes")
+    beans_add.add_argument("--roast-date")
+    beans_edit = beans_sub.add_parser("edit", help="edit a bean by id")
+    beans_edit.add_argument("bean_id")
+    beans_edit.add_argument("--name")
+    beans_edit.add_argument("--origin")
+    beans_edit.add_argument("--process")
+    beans_edit.add_argument("--roast-level")
+    beans_edit.add_argument("--altitude")
+    beans_edit.add_argument("--flavor-notes")
+    beans_edit.add_argument("--roast-date")
+    beans_del = beans_sub.add_parser("delete", help="delete a bean by id")
+    beans_del.add_argument("bean_id")
+    prefs = sub.add_parser(
+        "preferences",
+        help="taste/home preferences in state.db (JSON values; no BLE)",
+    )
+    prefs_sub = prefs.add_subparsers(dest="preferences_action", required=True)
+    prefs_sub.add_parser("list", help="list all preference keys")
+    prefs_get = prefs_sub.add_parser("get", help="get one preference")
+    prefs_get.add_argument("key")
+    prefs_set = prefs_sub.add_parser(
+        "set", help="set a preference (JSON string or plain text)"
+    )
+    prefs_set.add_argument("key")
+    prefs_set.add_argument("value")
+    prefs_del = prefs_sub.add_parser("delete", help="delete a preference key")
+    prefs_del.add_argument("key")
     load = sub.add_parser("load", help="load and arm a recipe; never starts brewing")
     load.add_argument("recipe")
     monitor = sub.add_parser(
@@ -2600,6 +2820,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_catalog(args)
         if args.command == "history":
             return cmd_history(args)
+        if args.command == "beans":
+            return cmd_beans(args)
+        if args.command == "preferences":
+            return cmd_preferences(args)
         require_runtime()
         if args.command == "state":
             return cmd_state(args)

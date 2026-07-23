@@ -488,3 +488,11 @@ LAN 模式规则：
 ---
 
 （本文件已确认为 v1.0 开发基线；需求或 ADR 变化须先更新本文档，再进入实现。实现进度旁注以本节为准，合入主干后同步更新。）
+
+---
+
+## 7. 下一阶段
+
+Phase 0–C 与 A11 核心真机路径完成后的工作（博采众家之长、豆库/口味闭环、**Home Assistant only**）见：
+
+→ **[`docs/ROADMAP-NEXT.md`](./ROADMAP-NEXT.md)**（Homebridge/Siri 已取消）
