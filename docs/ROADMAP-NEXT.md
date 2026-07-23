@@ -1,4 +1,4 @@
-# 下一阶段路线图：博采众家 + 智能家居
+﻿# 下一阶段路线图：博采众家 + 智能家居
 
 > 状态：**已确认 v1.0**（2026-07-23）；实施中  
 > 最后更新：2026-07-23  
@@ -29,7 +29,7 @@
 
 | 能力 | 状态 |
 |------|------|
-| core 1.2.0 + SQLite 状态 + protocol v3 | 已发布 / main |
+| core 1.3.0 + SQLite 状态 + protocol v3 | 已发布 / main |
 | workflow 级 BLE + 终态释放 + App 可重连 | A11 真机核心路径已过 |
 | Agent Skill + 云 catalog / history | 可用 |
 | Web design / LAN / typed bridge | 代码在；真机 Web 延后 |

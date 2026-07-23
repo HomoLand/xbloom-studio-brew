@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xbloom-studio-core"
-version = "1.2.0"
+version = "1.3.0"
 description = "Core BLE protocol, recipe validation, catalog, and history for xBloom Studio. Shared by the Agent Skill and the Web UI; contains no Agent-coupled logic."
 readme = "README.md"
 requires-python = ">=3.11"

@@ -1,9 +1,9 @@
-# xBloom Studio 平台：需求书、架构设计与开发路线
+﻿# xBloom Studio 平台：需求书、架构设计与开发路线
 
 > 状态：已确认 v1.0（开发基线）；实现进度跟踪见 §5
 > 最后更新：2026-07-23
 > 适用范围：`xbloom-studio-brew`（core + skill）与 `xbloom-studio-web`（backend + frontend）两个仓库
-> 当前发布：GitHub Release **v1.2.0**（core wheel + knowledge zip + skill zip）
+> 当前发布：GitHub Release **v1.3.0**（core wheel + knowledge zip + skill zip）
 
 ---
 
@@ -394,7 +394,7 @@ LAN 模式规则：
 - 0.1 完善 `xbloom-studio-core` 包元数据、版本策略和 `xbloom-bridge` console entry；开发依赖可 editable，release 依赖必须固定版本与 hash。
   - **已完成**：core 元数据 + console entry；开发 `-e packages/core`；release 用 vendored wheel（`core_wheel_sha256`）+ 单一 universal `requirements-runtime.lock`（`--require-hashes`，排除 core；uv 0.11.28 生成；`tools/update_runtime_lock.py` update/check）。
 - 0.2 release build 从唯一 knowledge 源生成 self-contained Skill bundle 与 versioned knowledge bundle，写入 manifest、knowledge version 和内容 hash。
-  - **已完成**：`tools/build_release.py` + tag 驱动 `.github/workflows/release.yml`；**GitHub Release v1.2.0** 已发布 core wheel、knowledge zip、skill zip、`release-manifest.json`。
+  - **已完成**：`tools/build_release.py` + tag 驱动 `.github/workflows/release.yml`；**GitHub Release v1.3.0** 已发布 core wheel、knowledge zip、skill zip、`release-manifest.json`。
 - 0.3 引入 `XBLOOM_STATE_DIR` 与 `state.db`；为 catalog、recipe revisions、workflows、events、idempotency、migrations 建 schema。
   - **已完成（core）**：`xbloom_storage.StateStore` + WAL schema/migrations。
 - 0.4 编写一次性迁移：导入现有 `catalog.json`、`brew-history.jsonl` 和恢复记录；迁移前备份，失败可回滚且不删除原文件。
@@ -404,9 +404,9 @@ LAN 模式规则：
 - 0.6 core 提供受控 bridge 启动/停止/空闲重启 API；Web 不再查找 Skill 的 `xbloom.py` 来启动 daemon。
   - **已完成（core + Web）**：`ensure_bridge_daemon()`；Web 不依赖 Skill 脚本路径。
 - 0.7 Skill bootstrap 不在安装 core 前导入 core；分别验证仓库 checkout、仅 Skill 发布包、仅 Web 发布包三种 clean install。
-  - **已完成（Skill）**：stdlib-only bootstrap + release integrity；Web pin 已发布 wheel（v1.2.0）。主干合入后做一次 trunk clean-install 再确认。
+  - **已完成（Skill）**：stdlib-only bootstrap + release integrity；Web pin 已发布 wheel（v1.3.0）。主干合入后做一次 trunk clean-install 再确认。
 - 0.8 建立跨平台 CI：Windows、macOS、Linux 执行 build、安装、迁移、单实例竞争和协议兼容测试。
-  - **已完成**：`.github/workflows/test.yml` + release workflow；`codex/roadmap-completion` 与 `v1.2.0` tag 上 CI 已通过。
+  - **已完成**：`.github/workflows/test.yml` + release workflow；`codex/roadmap-completion` 与 `v1.3.0` tag 上 CI 已通过。
 
 **验收**：仅拿 Skill 发布包即可 bootstrap/doctor/validate；Web 只安装固定 core + knowledge 产物即可启动；两个并发启动者最终只有一个 bridge；旧 JSON/JSONL 数据无损进入 SQLite；不兼容客户端在任何 BLE 写之前被拒绝。
 
@@ -481,7 +481,7 @@ LAN 模式规则：
 ## 6. 已确认实施选择
 
 - **Phase 顺序**：`0 → (A 与 B 可并行) → C`。
-- **发布渠道**：初期使用 GitHub Release 发布 core wheel 与 knowledge bundle；self-contained Skill 发布包携带固定版本的 core wheel。暂不要求 PyPI。**当前：v1.2.0 已发布。**
+- **发布渠道**：初期使用 GitHub Release 发布 core wheel 与 knowledge bundle；self-contained Skill 发布包携带固定版本的 core wheel。暂不要求 PyPI。**当前：v1.3.0 已发布。**
 - **Vision provider**：使用本地 CLP 反代提供的 OpenAI-compatible 接口，主模型为 `grok-4.5`；provider adapter 边界仍保留，便于未来切换。
 - **LAN HTTPS**：复用已有本地域名与可信反向代理终止 TLS；Web backend 校验固定 public origin 和 trusted proxy，不自行承担证书签发。
 
