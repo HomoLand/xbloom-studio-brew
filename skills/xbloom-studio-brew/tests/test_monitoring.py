@@ -147,38 +147,33 @@ def test_resolve_address_helpers_removed():
 
 
 @pytest.mark.parametrize(
-    "workflow_status",
-    ["start_pending", "start_unconfirmed", "completion_unconfirmed"],
+    "workflow_phase",
+    ["starting", "control_unconfirmed", "running"],
 )
 def test_monitor_observes_bridge_without_connecting(
-    monkeypatch, tmp_path, workflow_status
+    monkeypatch, tmp_path, workflow_phase
 ):
-    """A9: monitor polls status/events only; never starts BLE or clears workflow."""
+    """A9: monitor polls status/events only; never starts BLE or mutates workflow."""
 
     _isolate_history(monkeypatch, tmp_path)
-    coffee_state = tmp_path / "coffee.json"
-    tea_state = tmp_path / "tea.json"
-    monkeypatch.setattr(xbloom, "STATE_FILE", coffee_state)
-    monkeypatch.setattr(xbloom, "TEA_STATE_FILE", tea_state)
-    xbloom.state_write(
-        {
-            "address": "recorded-device",
-            "machine": "xBloom",
-            "status": workflow_status,
-            "workflow_id": "wf_observe",
-        }
-    )
+    coffee_state = tmp_path / "armed-state.json"
+    tea_state = tmp_path / "tea-loaded-state.json"
     ensure_calls = []
+    connect_calls = []
 
     class FakeTyped:
         def ensure_daemon(self):
             ensure_calls.append("ensure")
             raise AssertionError("monitor must not ensure daemon")
 
+        def connect(self, **kwargs):
+            connect_calls.append(kwargs)
+            raise AssertionError("monitor must not connect")
+
         def status(self, *, require_hello=False):
             return {
                 "active_workflow_id": "wf_observe",
-                "phase": "running",
+                "phase": workflow_phase,
                 "activity": "coffee",
                 "connected": True,
                 "telemetry": {"dispensed_water_peak_ml": 12.0},
@@ -203,12 +198,16 @@ def test_monitor_observes_bridge_without_connecting(
     emitted = []
     monkeypatch.setattr(xbloom, "make_bridge_client", lambda _args: FakeTyped())
     monkeypatch.setattr(xbloom, "emit", emitted.append)
-    args = xbloom.build_parser().parse_args(["monitor", "--duration", "1"])
+    args = xbloom.build_parser().parse_args(
+        ["monitor", "--duration", "1", "--workflow-id", "wf_observe"]
+    )
 
     assert asyncio.run(xbloom.async_monitor(args)) == 0
     assert ensure_calls == []
-    # Observation does not clear local records; daemon owns lifecycle.
-    assert coffee_state.exists()
+    assert connect_calls == []
+    # Observation-only: never creates/clears coffee/tea JSON.
+    assert not coffee_state.exists()
+    assert not tea_state.exists()
     assert any(e.get("observation_only") for e in emitted)
     assert any(e.get("daemon_untouched") for e in emitted)
     assert emitted[0].get("status") == "listening"
@@ -618,29 +617,24 @@ def test_water_rejects_empty_workflow_id_before_monitor(monkeypatch, tmp_path):
 
 
 def test_start_uses_typed_client_workflow_id(monkeypatch, tmp_path):
-    """A9: start passes durable workflow_id and does not open XBloomClient."""
+    """A9: start passes durable workflow_id and never reads coffee JSON or recipe path."""
 
     _isolate_history(monkeypatch, tmp_path)
-    state_path = tmp_path / "armed.json"
-    monkeypatch.setattr(xbloom, "STATE_FILE", state_path)
+    coffee_state = tmp_path / "armed-state.json"
     monkeypatch.setenv(xbloom.REMOTE_START_ENV, xbloom.REMOTE_START_SENTINEL)
-    xbloom.state_write(
-        {
-            "address": "recorded-device",
-            "machine": "xBloom",
-            "recipe_sha256": "same-hash",
-            "loaded_at": time.time(),
-            "status": "armed",
-            "workflow_id": "wf_start_1",
-        }
-    )
     calls = []
+    load_recipe_calls = []
 
     class FakeTyped:
         def coffee_start(self, **kwargs):
             calls.append(("coffee_start", kwargs))
             assert kwargs["workflow_id"] == "wf_start_1"
-            return {"status": "running", "workflow_id": "wf_start_1"}
+            return {
+                "status": "running",
+                "workflow_id": "wf_start_1",
+                "machine_program": "coffee-pour-over",
+                "manual_preload_ice_g": 0,
+            }
 
         def status(self, *, require_hello=False):
             return {
@@ -648,24 +642,28 @@ def test_start_uses_typed_client_workflow_id(monkeypatch, tmp_path):
                 "phase": "idle",
                 "activity": None,
                 "connected": False,
-                "last_operation": {"result": "ready"},
+                "last_operation": {
+                    "workflow_id": "wf_start_1",
+                    "result": "ready",
+                },
             }
 
         def events(self, *, since=0, workflow_id=None):
             return {"events": [], "next_since": since}
 
+    def boom_load_recipe(path):
+        load_recipe_calls.append(path)
+        raise AssertionError("start must not open the legacy positional recipe")
+
     monkeypatch.setattr(xbloom, "make_bridge_client", lambda _args: FakeTyped())
-    monkeypatch.setattr(
-        xbloom,
-        "load_recipe",
-        lambda _path: (Path("recipe.yaml"), object(), {"recipe_sha256": "same-hash"}),
-    )
-    monkeypatch.setattr(xbloom_safety, "recipe_sha256", lambda _path: "same-hash")
+    monkeypatch.setattr(xbloom, "load_recipe", boom_load_recipe)
     monkeypatch.setattr(xbloom, "emit", lambda _data: None)
     args = xbloom.build_parser().parse_args(
         [
             "start",
             "recipe.yaml",
+            "--workflow-id",
+            "wf_start_1",
             "--confirm-ready",
             xbloom.READY_SENTINEL,
             "--duration",
@@ -675,43 +673,40 @@ def test_start_uses_typed_client_workflow_id(monkeypatch, tmp_path):
 
     assert asyncio.run(xbloom.async_start(args)) == 0
     assert calls and calls[0][0] == "coffee_start"
+    assert calls[0][1]["workflow_id"] == "wf_start_1"
+    assert load_recipe_calls == []
+    assert not coffee_state.exists()
 
 
-def test_start_failure_is_persisted_and_retry_is_refused(monkeypatch, tmp_path):
+def test_start_failure_propagates_without_coffee_json_write(monkeypatch, tmp_path):
+    """Start failure is bridge-owned; CLI never writes coffee JSON or local retry gate."""
+
     _isolate_history(monkeypatch, tmp_path)
-    state_path = tmp_path / "armed.json"
-    monkeypatch.setattr(xbloom, "STATE_FILE", state_path)
+    coffee_state = tmp_path / "armed-state.json"
+    tea_state = tmp_path / "tea-loaded-state.json"
     monkeypatch.setenv(xbloom.REMOTE_START_ENV, xbloom.REMOTE_START_SENTINEL)
-    xbloom.state_write(
-        {
-            "address": "recorded-device",
-            "machine": "xBloom",
-            "recipe_sha256": "same-hash",
-            "loaded_at": time.time(),
-            "status": "armed",
-            "last_state": "armed",
-            "workflow_id": "wf_fail",
-        }
-    )
     calls = []
 
     class FailingTyped:
         def coffee_start(self, **kwargs):
-            calls.append("start")
-            assert xbloom.state_read()["status"] == "start_pending"
-            raise RuntimeError("start acknowledgement lost")
+            calls.append(("coffee_start", kwargs))
+            assert kwargs["workflow_id"] == "wf_fail"
+            raise RuntimeError("start acknowledgement lost; do not retry start")
 
     monkeypatch.setattr(xbloom, "make_bridge_client", lambda _args: FailingTyped())
     monkeypatch.setattr(
         xbloom,
         "load_recipe",
-        lambda _path: (Path("recipe.yaml"), object(), {"recipe_sha256": "same-hash"}),
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("start must not open positional recipe")
+        ),
     )
-    monkeypatch.setattr(xbloom_safety, "recipe_sha256", lambda _path: "same-hash")
     args = xbloom.build_parser().parse_args(
         [
             "start",
-            "recipe.yaml",
+            "missing-or-ignored.yaml",
+            "--workflow-id",
+            "wf_fail",
             "--confirm-ready",
             xbloom.READY_SENTINEL,
         ]
@@ -719,14 +714,181 @@ def test_start_failure_is_persisted_and_retry_is_refused(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError, match="acknowledgement lost"):
         asyncio.run(xbloom.async_start(args))
-    # A9: local pending mark happens before coffee_start; failure leaves pending.
-    saved = xbloom.state_read()
-    assert saved["status"] == "start_pending"
-    assert "start_requested_at" in saved
+    assert len(calls) == 1
+    assert calls[0][0] == "coffee_start"
+    assert calls[0][1]["workflow_id"] == "wf_fail"
+    # No local coffee/tea JSON write; retry protection belongs to the bridge.
+    assert not coffee_state.exists()
+    assert not tea_state.exists()
 
-    # Local unconfirmed gate still blocks retry when status is pending/unconfirmed.
-    saved["status"] = "start_unconfirmed"
-    xbloom.state_write(saved, state_path)
-    with pytest.raises(RuntimeError, match="do not retry"):
-        asyncio.run(xbloom.async_start(args))
-    assert calls == ["start"]
+
+def test_start_ignores_nonexistent_positional_recipe(monkeypatch, tmp_path):
+    """Positional recipe is CLI compatibility only; nonexistent path is never read."""
+
+    _isolate_history(monkeypatch, tmp_path)
+    monkeypatch.setenv(xbloom.REMOTE_START_ENV, xbloom.REMOTE_START_SENTINEL)
+    missing = tmp_path / "does-not-exist.yaml"
+    assert not missing.exists()
+    calls = []
+    load_calls = []
+
+    class FakeTyped:
+        def coffee_start(self, **kwargs):
+            calls.append(kwargs)
+            assert kwargs["workflow_id"] == "wf_exact"
+            return {"status": "running", "workflow_id": "wf_exact"}
+
+        def status(self, *, require_hello=False):
+            return {
+                "active_workflow_id": "wf_exact",
+                "phase": "idle",
+                "activity": None,
+                "connected": False,
+                "last_operation": {
+                    "workflow_id": "wf_exact",
+                    "result": "ready",
+                },
+            }
+
+        def events(self, *, since=0, workflow_id=None):
+            return {"events": [], "next_since": since}
+
+    def boom_load(path):
+        load_calls.append(path)
+        raise AssertionError(f"must not open positional recipe {path!r}")
+
+    monkeypatch.setattr(xbloom, "make_bridge_client", lambda _a: FakeTyped())
+    monkeypatch.setattr(xbloom, "load_recipe", boom_load)
+    monkeypatch.setattr(xbloom, "emit", lambda _d: None)
+    args = xbloom.build_parser().parse_args(
+        [
+            "start",
+            str(missing),
+            "--workflow-id",
+            "wf_exact",
+            "--confirm-ready",
+            xbloom.READY_SENTINEL,
+            "--duration",
+            "1",
+        ]
+    )
+    assert asyncio.run(xbloom.async_start(args)) == 0
+    assert load_calls == []
+    assert calls and calls[0]["workflow_id"] == "wf_exact"
+    assert not (tmp_path / "armed-state.json").exists()
+
+
+def test_start_ignores_mutated_positional_recipe(monkeypatch, tmp_path):
+    """Mutated positional recipe content is never hashed or validated on start."""
+
+    _isolate_history(monkeypatch, tmp_path)
+    monkeypatch.setenv(xbloom.REMOTE_START_ENV, xbloom.REMOTE_START_SENTINEL)
+    recipe = tmp_path / "recipe.yaml"
+    recipe.write_text("name: Original\n", encoding="utf-8")
+    calls = []
+    hash_calls = []
+
+    class FakeTyped:
+        def coffee_start(self, **kwargs):
+            calls.append(kwargs)
+            return {"status": "running", "workflow_id": "wf_mut"}
+
+        def status(self, *, require_hello=False):
+            return {
+                "active_workflow_id": "wf_mut",
+                "phase": "idle",
+                "activity": None,
+                "connected": False,
+                "last_operation": {
+                    "workflow_id": "wf_mut",
+                    "result": "ready",
+                },
+            }
+
+        def events(self, *, since=0, workflow_id=None):
+            return {"events": [], "next_since": since}
+
+    def boom_hash(path):
+        hash_calls.append(path)
+        raise AssertionError("must not hash positional recipe")
+
+    monkeypatch.setattr(xbloom, "make_bridge_client", lambda _a: FakeTyped())
+    monkeypatch.setattr(
+        xbloom,
+        "load_recipe",
+        lambda _p: (_ for _ in ()).throw(AssertionError("must not load recipe")),
+    )
+    monkeypatch.setattr(xbloom_safety, "recipe_sha256", boom_hash)
+    monkeypatch.setattr(xbloom, "emit", lambda _d: None)
+    recipe.write_text("name: Mutated after load\ndose_g: 99\n", encoding="utf-8")
+    args = xbloom.build_parser().parse_args(
+        [
+            "start",
+            str(recipe),
+            "--workflow-id",
+            "wf_mut",
+            "--confirm-ready",
+            xbloom.READY_SENTINEL,
+            "--duration",
+            "1",
+        ]
+    )
+    assert asyncio.run(xbloom.async_start(args)) == 0
+    assert hash_calls == []
+    assert calls and calls[0]["workflow_id"] == "wf_mut"
+
+
+def test_tea_start_ignores_nonexistent_positional_recipe(monkeypatch, tmp_path):
+    """Symmetric tea-start: positional recipe ignored; exact workflow_id sent."""
+
+    _isolate_history(monkeypatch, tmp_path)
+    monkeypatch.setenv(xbloom.REMOTE_START_ENV, xbloom.REMOTE_START_SENTINEL)
+    missing = tmp_path / "tea-missing.yaml"
+    assert not missing.exists()
+    calls = []
+    load_calls = []
+
+    class FakeTyped:
+        def tea_start(self, **kwargs):
+            calls.append(kwargs)
+            assert kwargs["workflow_id"] == "wf_tea_exact"
+            return {"status": "running", "workflow_id": "wf_tea_exact"}
+
+        def status(self, *, require_hello=False):
+            return {
+                "active_workflow_id": "wf_tea_exact",
+                "phase": "idle",
+                "activity": None,
+                "connected": False,
+                "last_operation": {
+                    "workflow_id": "wf_tea_exact",
+                    "result": "ready",
+                },
+            }
+
+        def events(self, *, since=0, workflow_id=None):
+            return {"events": [], "next_since": since}
+
+    def boom_load(path):
+        load_calls.append(path)
+        raise AssertionError(f"must not open positional tea recipe {path!r}")
+
+    monkeypatch.setattr(xbloom, "make_bridge_client", lambda _a: FakeTyped())
+    monkeypatch.setattr(xbloom, "load_tea_recipe", boom_load)
+    monkeypatch.setattr(xbloom, "emit", lambda _d: None)
+    args = xbloom.build_parser().parse_args(
+        [
+            "tea-start",
+            str(missing),
+            "--workflow-id",
+            "wf_tea_exact",
+            "--confirm-ready",
+            xbloom.TEA_READY_SENTINEL,
+            "--duration",
+            "1",
+        ]
+    )
+    assert asyncio.run(xbloom.async_tea_start(args)) == 0
+    assert load_calls == []
+    assert calls and calls[0]["workflow_id"] == "wf_tea_exact"
+    assert not (tmp_path / "tea-loaded-state.json").exists()

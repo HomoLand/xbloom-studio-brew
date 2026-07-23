@@ -17,8 +17,9 @@ exist in its current form without their open-source contributions.
 - Vendored files: `scripts/xbloom_ble/` and the corresponding upstream tests under `tests/`.
 
 The vendored core is wrapped by a stricter local-file validator, firmware/state preflight,
-load-only default workflow, persistent armed-state hash, and explicit remote-start gates. Its
-package documentation was adjusted to describe this wrapper boundary accurately.
+load-only default workflow, durable SQLite immutable recipe snapshots (`state.db` workflow rows),
+and explicit remote-start gates. Legacy coffee/tea JSON is import-only. Its package documentation
+was adjusted to describe this wrapper boundary accurately.
 
 ## xbloom-studio-recipe-skill
 

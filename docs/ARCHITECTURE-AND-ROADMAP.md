@@ -298,6 +298,8 @@ bridge process: running（始终存活）
 - core 提供事务存储 API；CLI、HTTP、MCP 不直接拼 SQL，也不再各自执行 JSON 文件的 load-modify-save。
 - WAL + busy timeout 支持 Web/Skill 并发读写；recipe revision 创建和 workflow snapshot 创建必须原子提交。
 - `load` 接受规范化 recipe payload 或明确的 `recipe_revision_id`。bridge 在发出任何 BLE 写之前保存不可变 snapshot 与 SHA-256，不依赖调用者临时文件继续存在。
+- 源 YAML 路径仅作 provenance；load 之后 immutable `state.db` snapshot 为权威，删除/修改源文件不影响 start。
+- 遗留 `armed-state.json` / `tea-loaded-state.json` 仅为显式 migrate 的 import 输入，runtime 永不读写；coffee/tea 运行时状态只存在于 durable workflows。
 - 每次编辑创建新 revision；已加载 workflow 和历史始终引用当时 snapshot，后续编辑不回写过去。
 - provenance 至少记录来源、knowledge version/hash、provider/model（若适用）、父 revision 和创建时间；原始图片默认不保存。
 - 最终历史由 bridge 幂等写入一次，避免 CLI/Web 重复记账。

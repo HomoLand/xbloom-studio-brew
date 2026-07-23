@@ -125,6 +125,8 @@ def preferred_runtime_python(
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE_DIR = skill_state_dir()
+# Legacy coffee/tea JSON path names only (import-only via xbloom-state migrate).
+# Skill runtime never reads, writes, or unlinks these files.
 STATE_FILE = STATE_DIR / "armed-state.json"
 TEA_STATE_FILE = STATE_DIR / "tea-loaded-state.json"
 GRINDER_STATE_FILE = STATE_DIR / "grinder-rest-state.json"
@@ -229,7 +231,16 @@ def require_runtime() -> None:
 
 
 def state_write(data: dict[str, Any], path: Path | None = None) -> None:
-    path = STATE_FILE if path is None else path
+    """Write a grinder (or other non-coffee/tea) rest record.
+
+    Coffee/tea compatibility JSON is never written; default path is grinder only
+    when callers pass an explicit path. Do not use for armed-state/tea-loaded.
+    """
+
+    if path is None:
+        raise RuntimeError(
+            "state_write requires an explicit path; coffee/tea JSON is import-only"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(".tmp")
     temp.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -237,7 +248,12 @@ def state_write(data: dict[str, Any], path: Path | None = None) -> None:
 
 
 def state_read(path: Path | None = None) -> dict[str, Any]:
-    path = STATE_FILE if path is None else path
+    """Read a grinder (or other non-coffee/tea) rest record."""
+
+    if path is None:
+        raise RuntimeError(
+            "state_read requires an explicit path; coffee/tea JSON is import-only"
+        )
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
@@ -248,13 +264,16 @@ def state_read(path: Path | None = None) -> dict[str, Any]:
 
 
 def state_clear(path: Path | None = None) -> None:
-    path = STATE_FILE if path is None else path
+    """Clear a grinder (or other non-coffee/tea) rest record."""
+
+    if path is None:
+        raise RuntimeError(
+            "state_clear requires an explicit path; coffee/tea JSON is import-only"
+        )
     try:
         path.unlink()
     except FileNotFoundError:
         pass
-
-
 
 
 def history_path() -> Path:
@@ -319,11 +338,31 @@ def account_password_for_catalog(action: str) -> str:
     return getpass.getpass("xBloom account password: ")
 
 
-def ensure_no_loaded_workflow() -> None:
-    active = [path.name for path in (STATE_FILE, TEA_STATE_FILE) if path.exists()]
-    if active:
+def ensure_no_loaded_workflow(client: Any | None = None) -> None:
+    """Refuse new one-shot work when bridge owns an active durable workflow.
+
+    Does not inspect legacy armed-state.json / tea-loaded-state.json (import-only).
+    When ``client`` is omitted the bridge ownership gate is applied by the RPC.
+    """
+
+    if client is None:
+        return
+    try:
+        status = client.status(require_hello=False)
+    except Exception:
+        return
+    activity = status.get("activity")
+    active_wf = status.get("active_workflow_id")
+    if activity is not None or active_wf:
         raise RuntimeError(
-            f"a loaded recipe record exists ({', '.join(active)}); cancel before changing modes"
+            f"bridge owns activity={activity!r} workflow_id={active_wf!r}; "
+            "cancel before changing modes"
+        )
+    if status.get("idle") is False and (
+        status.get("recovery") or status.get("recovery_records")
+    ):
+        raise RuntimeError(
+            "bridge is not idle (recovery or active ownership); cancel first"
         )
 
 
@@ -358,14 +397,6 @@ def reserve_grinder_rest(seconds: float) -> None:
         },
         GRINDER_STATE_FILE,
     )
-
-
-def loaded_workflow_records() -> list[tuple[Path, dict[str, Any]]]:
-    return [
-        (path, state_read(path))
-        for path in (STATE_FILE, TEA_STATE_FILE)
-        if path.exists()
-    ]
 
 
 def redact_machine_info(machine_info: dict[str, object]) -> dict[str, object]:
@@ -573,9 +604,8 @@ async def async_scan(args: argparse.Namespace) -> int:
 async def async_probe(args: argparse.Namespace) -> int:
     """Safe one-shot probe via the daemon (never direct Bleak)."""
 
-    if STATE_FILE.exists() or TEA_STATE_FILE.exists():
-        raise RuntimeError("a loaded-recipe record exists; use monitor or cancel, not probe")
     client = make_bridge_client(args)
+    # Bridge ownership gate refuses probe while a durable workflow is active.
     result = client.probe(
         address=args.address,
         scan_timeout=float(args.scan_timeout),
@@ -1047,7 +1077,6 @@ async def async_load(args: argparse.Namespace) -> int:
     """Load/arm via daemon-owned BLE; returns durable workflow_id."""
 
     path, _recipe, summary = load_recipe(args.recipe)
-    ensure_no_loaded_workflow()
     client = make_bridge_client(args)
     result = client.coffee_load(
         recipe=str(path),
@@ -1057,26 +1086,12 @@ async def async_load(args: argparse.Namespace) -> int:
     workflow_id = result.get("workflow_id")
     if workflow_id is None or not str(workflow_id).strip():
         raise RuntimeError(
-            "coffee.load returned no workflow_id; refuse success and do not "
-            "write compatibility state (do not retry uncertain load)"
+            "coffee.load returned no workflow_id; refuse success "
+            "(do not retry uncertain load)"
         )
     workflow_id = str(workflow_id).strip()
-    state = {
-        "address": result.get("address") or args.address or environment_value("XBLOOM_ADDRESS"),
-        "machine": result.get("machine"),
-        "recipe_path": str(path),
-        "recipe_sha256": summary["recipe_sha256"],
-        "loaded_at": time.time(),
-        "status": "armed",
-        "firmware": result.get("firmware"),
-        "target_dispensed_water_ml": summary["target_dispensed_water_ml"],
-        "serving_kind": summary["kind"],
-        "machine_program": summary["machine_program"],
-        "manual_preload_ice_g": summary["manual_preload_ice_g"],
-        "workflow_id": workflow_id,
-    }
-    state_write(state)
-    # Bridge owns durable terminal history; Skill does not journal load.
+    # Durable workflow/snapshot on the bridge is authoritative; never write
+    # armed-state.json compatibility JSON.
     payload = {
         "command": "load",
         "status": result.get("status") or "armed",
@@ -1183,40 +1198,6 @@ def volume_comparison(
                 float(result.cup_delta_g) / float(result.dispensed_water_ml), 4
             )
     return data
-
-
-def mark_workflow_started(
-    state: dict[str, Any], path: Path, machine_state: str
-) -> dict[str, Any]:
-    updated = dict(state)
-    updated.update(
-        {
-            "status": "running",
-            "started_at": time.time(),
-            "last_state": machine_state,
-        }
-    )
-    state_write(updated, path)
-    return updated
-
-
-def finalize_workflow_state(
-    state: dict[str, Any], path: Path, result: MonitorResult
-) -> bool:
-    """Clear only a terminal-confirmed workflow; preserve uncertain recovery state."""
-    if result.terminal_confirmed:
-        state_clear(path)
-        return True
-    updated = dict(state)
-    updated.update(
-        {
-            "status": "completion_unconfirmed",
-            "last_state": result.last_state or state.get("last_state"),
-            "last_telemetry_at": time.time(),
-        }
-    )
-    state_write(updated, path)
-    return False
 
 
 async def monitor_client(
@@ -1708,7 +1689,6 @@ def cmd_tea_validate(args: argparse.Namespace) -> int:
 
 async def async_tea_load(args: argparse.Namespace) -> int:
     path, _recipe, summary = load_tea_recipe(args.recipe)
-    ensure_no_loaded_workflow()
     client = make_bridge_client(args)
     result = client.tea_load(
         recipe=str(path),
@@ -1718,24 +1698,12 @@ async def async_tea_load(args: argparse.Namespace) -> int:
     workflow_id = result.get("workflow_id")
     if workflow_id is None or not str(workflow_id).strip():
         raise RuntimeError(
-            "tea.load returned no workflow_id; refuse success and do not "
-            "write compatibility state (do not retry uncertain load)"
+            "tea.load returned no workflow_id; refuse success "
+            "(do not retry uncertain load)"
         )
     workflow_id = str(workflow_id).strip()
-    state = {
-        "address": result.get("address") or args.address or environment_value("XBLOOM_ADDRESS"),
-        "recipe_path": str(path),
-        "recipe_sha256": summary["recipe_sha256"],
-        "loaded_at": time.time(),
-        "status": "tea_loaded",
-        "firmware": result.get("firmware"),
-        "target_dispensed_water_ml": summary["programmed_water_ml"],
-        "serving_kind": "tea",
-        "machine_program": "omni-tea-brewer",
-        "workflow_id": workflow_id,
-    }
-    state_write(state, TEA_STATE_FILE)
-    # Bridge owns durable terminal history; Skill does not journal tea-load.
+    # Durable workflow/snapshot on the bridge is authoritative; never write
+    # tea-loaded-state.json compatibility JSON.
     payload = {
         "command": "tea-load",
         "status": result.get("status") or "tea_loaded",
@@ -1749,8 +1717,6 @@ async def async_tea_load(args: argparse.Namespace) -> int:
 
 
 async def async_tea_start(args: argparse.Namespace) -> int:
-    from xbloom_safety import recipe_sha256
-
     if environment_value(REMOTE_START_ENV) != REMOTE_START_SENTINEL:
         raise RuntimeError(
             f"hot-water actions disabled; administrator must set "
@@ -1760,12 +1726,10 @@ async def async_tea_start(args: argparse.Namespace) -> int:
         raise RuntimeError(f"--confirm-ready must equal {TEA_READY_SENTINEL}")
     if not 1 <= float(args.duration) <= 3600:
         raise RuntimeError("tea-start --duration must be 1-3600 seconds")
-    path, _recipe, summary = load_tea_recipe(args.recipe)
-    state = state_read(TEA_STATE_FILE) if TEA_STATE_FILE.exists() else {}
-    if state and state.get("recipe_sha256") not in (None, recipe_sha256(path)):
-        raise RuntimeError("tea recipe changed since it was loaded")
+    # Legacy positional recipe is ignored/deprecated CLI compatibility only.
+    # Never open, validate, hash, or depend on it; durable workflow_id is sole input.
     client = make_bridge_client(args)
-    workflow_id = getattr(args, "workflow_id", None) or state.get("workflow_id")
+    workflow_id = getattr(args, "workflow_id", None)
     if not workflow_id:
         workflow_id = client.resolve_active_workflow_id(
             kind="tea",
@@ -1775,17 +1739,14 @@ async def async_tea_start(args: argparse.Namespace) -> int:
         workflow_id=str(workflow_id),
         confirmation=args.confirm_ready,
     )
-    if state:
-        state = mark_workflow_started(state, TEA_STATE_FILE, "start_accepted")
-    emit(
-        {
-            "command": "tea-start",
-            "status": result.get("status") or "start_accepted",
-            "workflow_id": workflow_id,
-            "recipe_sha256": summary["recipe_sha256"],
-            **result,
-        }
-    )
+    # Output only from durable bridge results (no local recipe/hash fields).
+    payload: dict[str, Any] = {
+        "command": "tea-start",
+        "status": result.get("status") or "start_accepted",
+        "workflow_id": workflow_id,
+        **result,
+    }
+    emit(payload)
     # Observation-only poll; does not connect or cancel the daemon workflow.
     args.workflow_id = workflow_id
     await async_monitor(args)
@@ -1806,7 +1767,6 @@ async def async_tea_brew(args: argparse.Namespace) -> int:
         raise RuntimeError("tea-brew --duration must be 1-3600 seconds")
 
     path, _recipe, summary = load_tea_recipe(args.recipe)
-    ensure_no_loaded_workflow()
     client = make_bridge_client(args)
     loaded = client.tea_load(
         recipe=str(path),
@@ -1816,17 +1776,6 @@ async def async_tea_brew(args: argparse.Namespace) -> int:
     workflow_id = loaded.get("workflow_id")
     if not workflow_id:
         raise RuntimeError("tea.load did not return workflow_id")
-    state = {
-        "address": args.address or environment_value("XBLOOM_ADDRESS"),
-        "recipe_path": str(path),
-        "recipe_sha256": summary["recipe_sha256"],
-        "loaded_at": time.time(),
-        "status": "tea_loaded",
-        "firmware": loaded.get("firmware"),
-        "target_dispensed_water_ml": summary["programmed_water_ml"],
-        "workflow_id": workflow_id,
-    }
-    state_write(state, TEA_STATE_FILE)
     emit(
         {
             "command": "tea-brew",
@@ -1840,7 +1789,6 @@ async def async_tea_brew(args: argparse.Namespace) -> int:
         workflow_id=str(workflow_id),
         confirmation=args.confirm_ready,
     )
-    mark_workflow_started(state, TEA_STATE_FILE, "start_accepted")
     emit(
         {
             "command": "tea-brew",
@@ -1858,18 +1806,8 @@ async def async_cancel(args: argparse.Namespace) -> int:
     """Cancel a durable workflow. Emergency requires explicit ``--emergency``."""
 
     client = make_bridge_client(args)
-    prior_state = None
     workflow_id = getattr(args, "workflow_id", None)
     emergency = bool(getattr(args, "emergency", False))
-    for path in (STATE_FILE, TEA_STATE_FILE):
-        if path.exists():
-            try:
-                prior_state = state_read(path)
-                if not workflow_id:
-                    workflow_id = prior_state.get("workflow_id")
-                break
-            except RuntimeError:
-                pass
     if not workflow_id and not emergency:
         try:
             workflow_id = client.resolve_active_workflow_id()
@@ -1887,16 +1825,12 @@ async def async_cancel(args: argparse.Namespace) -> int:
         workflow_id=str(workflow_id) if workflow_id else None,
         emergency=emergency,
     )
-    state_clear()
-    state_clear(TEA_STATE_FILE)
-    # Bridge commit_workflow_terminal owns the one final history row for cancel.
+    # Bridge durable terminal is authoritative; never clear coffee/tea JSON.
     payload = {
         "command": "cancel",
         "status": result.get("status") or "cancel_sent",
         "workflow_id": workflow_id,
         "emergency": emergency,
-        "coffee_state_cleared": True,
-        "tea_state_cleared": True,
         **result,
     }
     emit(payload)
@@ -1904,8 +1838,6 @@ async def async_cancel(args: argparse.Namespace) -> int:
 
 
 async def async_start(args: argparse.Namespace) -> int:
-    from xbloom_safety import recipe_sha256
-
     if environment_value(REMOTE_START_ENV) != REMOTE_START_SENTINEL:
         raise RuntimeError(
             f"remote start disabled; administrator must set {REMOTE_START_ENV}={REMOTE_START_SENTINEL}"
@@ -1914,52 +1846,27 @@ async def async_start(args: argparse.Namespace) -> int:
         raise RuntimeError(f"--confirm-ready must equal {READY_SENTINEL}")
     if not 1 <= float(args.duration) <= 3600:
         raise RuntimeError("start --duration must be 1-3600 seconds")
-    path, _recipe, summary = load_recipe(args.recipe)
-    state = state_read() if STATE_FILE.exists() else {}
-    state_status = state.get("status")
-    if state_status in {"start_pending", "start_unconfirmed"}:
-        raise RuntimeError(
-            "previous start outcome is unconfirmed; run monitor or cancel; do not retry"
-        )
-    if state and state.get("recipe_sha256") not in (None, recipe_sha256(path)):
-        raise RuntimeError("recipe changed since it was loaded")
+    # Legacy positional recipe is ignored/deprecated CLI compatibility only.
+    # Never open, validate, hash, or depend on it; durable workflow_id is sole input.
     client = make_bridge_client(args)
-    workflow_id = getattr(args, "workflow_id", None) or state.get("workflow_id")
+    workflow_id = getattr(args, "workflow_id", None)
     if not workflow_id:
         workflow_id = client.resolve_active_workflow_id(
             kind="coffee",
             allowed_phases={"loaded", "armed"},
         )
-    if state:
-        state = dict(state)
-        state.update(
-            status="start_pending",
-            start_requested_at=time.time(),
-            workflow_id=workflow_id,
-        )
-        state_write(state, STATE_FILE)
     result = client.coffee_start(
         workflow_id=str(workflow_id),
         confirmation=args.confirm_ready,
     )
-    if state:
-        mark_workflow_started(state, STATE_FILE, str(result.get("status") or "running"))
-    emit(
-        {
-            "command": "start",
-            "status": result.get("status") or "running",
-            "workflow_id": workflow_id,
-            "recipe_sha256": summary["recipe_sha256"],
-            "machine_program": summary.get("machine_program", "coffee-pour-over"),
-            "machine_dispenses_ice": bool(
-                summary.get("machine_dispenses_ice", False)
-            ),
-            "manual_preload_ice_g": int(
-                summary.get("manual_preload_ice_g", 0) or 0
-            ),
-            **result,
-        }
-    )
+    # Output only from durable bridge results (no local recipe/hash fields).
+    payload: dict[str, Any] = {
+        "command": "start",
+        "status": result.get("status") or "running",
+        "workflow_id": workflow_id,
+        **result,
+    }
+    emit(payload)
     # Observation bound only — does not release BLE or shut down the daemon.
     args.workflow_id = workflow_id
     await async_monitor(args)
@@ -2553,7 +2460,15 @@ def build_parser() -> argparse.ArgumentParser:
     tea_load = sub.add_parser("tea-load", help="upload a tea recipe; never starts it")
     tea_load.add_argument("recipe")
     tea_start = sub.add_parser("tea-start", help="explicitly gated tea recipe execution")
-    tea_start.add_argument("recipe")
+    tea_start.add_argument(
+        "recipe",
+        nargs="?",
+        default=None,
+        help=(
+            "ignored/deprecated CLI compatibility only; never opened or hashed. "
+            "Use --workflow-id or the bridge active durable workflow"
+        ),
+    )
     tea_start.add_argument("--confirm-ready", default="")
     tea_start.add_argument("--duration", type=float, default=600.0)
     tea_start.add_argument(
@@ -2583,7 +2498,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicit emergency stop (required when no workflow_id can be resolved)",
     )
     start = sub.add_parser("start", help="explicitly gated remote start")
-    start.add_argument("recipe")
+    start.add_argument(
+        "recipe",
+        nargs="?",
+        default=None,
+        help=(
+            "ignored/deprecated CLI compatibility only; never opened or hashed. "
+            "Use --workflow-id or the bridge active durable workflow"
+        ),
+    )
     start.add_argument("--confirm-ready", default="")
     start.add_argument("--duration", type=float, default=300.0)
     start.add_argument(

@@ -32,6 +32,7 @@ from xbloom_ble.bridge import (
     start_bridge_daemon,
     stop_bridge_daemon,
 )
+import xbloom_storage as storage
 
 
 def _wait_for(predicate, *, timeout: float = 5.0, interval: float = 0.05) -> bool:
@@ -301,11 +302,28 @@ def test_restart_if_idle_refuses_when_recovery_present(tmp_path, monkeypatch):
     first = start_bridge_daemon(state_root=tmp_path, start_timeout=15.0)
     first_id = first["instance_id"]
     record = bridge_record_path(tmp_path)
-    # Plant recovery while daemon is running; status must re-read from disk.
-    (tmp_path / "armed-state.json").write_text("{}", encoding="utf-8")
+
+    # Plant durable SQLite non-terminal ownership while the daemon runs (not
+    # legacy coffee JSON). status/is_idle re-query StateStore from disk.
+    store = storage.StateStore(tmp_path)
+    try:
+        store.create_workflow(
+            workflow_id="wf_block_restart",
+            kind="coffee",
+            state="loaded",
+            source="test_restart_gate",
+            metadata={"machine_address": "AA:BB:CC:DD:EE:FF"},
+        )
+        planted = store.get_workflow("wf_block_restart")
+        assert planted is not None
+        assert planted["state"] == "loaded"
+        assert planted.get("terminal_at") is None
+    finally:
+        store.close()
+
     status = bridge_call("status", record_path=record, require_hello=False)
-    assert "armed-state.json" in (status.get("recovery_records") or [])
     assert status.get("idle") is False
+    assert "armed-state.json" not in (status.get("recovery_records") or [])
 
     outcome = restart_bridge_daemon_if_idle(state_root=tmp_path)
     # Must refuse unequivocally — never report a successful restart.
@@ -316,9 +334,29 @@ def test_restart_if_idle_refuses_when_recovery_present(tmp_path, monkeypatch):
     assert bridge_is_running(record_path=record)
     still = bridge_call("status", record_path=record, require_hello=False)
     assert still.get("instance_id") == first_id
+    assert still.get("idle") is False
 
-    (tmp_path / "armed-state.json").unlink(missing_ok=True)
-    stop_bridge_daemon(state_root=tmp_path, force=True)
+    # Planted workflow remains non-terminal after restart refusal.
+    after_store = storage.StateStore(tmp_path)
+    try:
+        still_planted = after_store.get_workflow("wf_block_restart")
+        assert still_planted is not None
+        assert still_planted["state"] == "loaded"
+        assert still_planted.get("terminal_at") is None
+    finally:
+        after_store.close()
+
+    # Terminalize the planted row so clean stop does not hang on force-cancel.
+    cleanup = storage.StateStore(tmp_path)
+    try:
+        cleanup.commit_workflow_terminal(
+            "wf_block_restart",
+            state="cancelled",
+            event_type="test_cleanup",
+        )
+    finally:
+        cleanup.close()
+    stop_bridge_daemon(state_root=tmp_path)
 
 
 def test_restart_if_idle_when_clean(tmp_path, monkeypatch):

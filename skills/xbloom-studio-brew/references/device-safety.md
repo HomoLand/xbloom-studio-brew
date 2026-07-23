@@ -47,7 +47,7 @@ skill also completed its initial hardware validation on that firmware.
 
 1. Do not touch BLE when the user only asked for a recipe. Generate and validate the file.
 2. Use `scripts/xbloom.py`; never invoke the vendored client or raw protocol builders directly.
-3. Run `probe` only before loading, never while an armed-state record exists.
+3. Run `probe` only before loading, never while a durable coffee/tea workflow is active.
 4. Validate before load. Treat validation errors as blockers; do not weaken limits ad hoc.
 5. Load is the default device action. It arms the recipe and lets the user approve physically.
 6. Use `start`, `water`, or `tea-start` only when the deployment owner enabled hot-water actions
@@ -133,12 +133,14 @@ disabled until the deployment owner sets:
 XBLOOM_ENABLE_REMOTE_START=I_UNDERSTAND_REMOTE_HOT_WATER
 ```
 
-The command additionally requires an exact readiness argument and a durable `workflow_id` for the
-same recipe on the same machine (unchanged file hash). Loaded recipes wait indefinitely for
-explicit start or cancel — there is **no** five-minute loaded expiry:
+The command additionally requires an exact readiness argument and a durable `workflow_id` from
+`load` / `tea-load` (or the bridge active durable workflow). After load, the immutable
+`state.db` snapshot is authoritative; source YAML paths are provenance only and are not re-read
+or re-hashed on start. Loaded recipes wait indefinitely for explicit start or cancel — there is
+**no** five-minute loaded expiry:
 
 ```text
-python scripts/xbloom.py start recipe.yaml --confirm-ready cup-filter-water-beans
+python scripts/xbloom.py start --workflow-id <id-from-load> --confirm-ready cup-filter-water-beans
 ```
 
 These gates prevent accidental starts. They do not prove physical safety, so current-turn
@@ -234,13 +236,17 @@ physical controls remain the final fallback if the process or BLE adapter fails 
 
 Use the least invasive recovery path:
 
-1. Stop monitoring with Ctrl+C if only the terminal is stuck.
-2. If `start`/`tea-start` reports `completion_unconfirmed` (exit 3), run `monitor` to reattach or
-   `cancel` to stop. Both commands reuse the machine address stored by load and do not scan first.
-3. Run `python scripts/xbloom.py cancel` for an armed, waiting, or active workflow.
+1. Stop monitoring with Ctrl+C if only the terminal is stuck (observation-only; does not release BLE).
+2. If `start`/`tea-start` reports `completion_unconfirmed` (exit 3), run
+   `monitor --workflow-id …` to reattach or `cancel` to stop. Durable workflow ownership is in
+   `state.db`; do not retry start (bridge owns retry protection).
+3. Run `python scripts/xbloom.py cancel` for an armed, waiting, or active durable workflow.
 4. Use the machine's physical cancel control if BLE is unavailable.
 5. Move the cup only after the machine has stopped dispensing.
-6. If the local armed-state file is stale, run `cancel` once to clear it safely.
+6. If a durable coffee/tea workflow is stale or unconfirmed after a daemon restart, inspect
+   `bridge status`, run `recovery.reconcile` when appropriate, or `cancel` once. Do not treat
+   legacy `armed-state.json` / `tea-loaded-state.json` as runtime gates (import-only migration
+   inputs).
 
 For a bridge-owned activity, inspect `bridge status` and `bridge events` first, then use
 `bridge cancel`. An idle `bridge stop` is clean; `bridge stop --force` may send a physical stop and
@@ -248,8 +254,10 @@ must be treated as an action, not process cleanup. If the bridge process crashes
 its persisted `in_progress` rest record intentionally blocks another run until the operator has
 confirmed the machine stopped and the conservative cooldown has elapsed.
 
-Coffee, tea, grinder-rest, bridge endpoint/token, bridge log, SQLite `state.db`, and the external
-Python runtime live under `~/.xbloom-studio-brew/` by default. Override the directory with
+Durable coffee/tea workflows and immutable snapshots live in SQLite `state.db`. Legacy coffee/tea
+JSON (`armed-state.json`, `tea-loaded-state.json`) is import-only via explicit migration and is
+never written by runtime. Grinder-rest JSON, bridge endpoint/token, bridge log, and the external
+Python runtime also live under `~/.xbloom-studio-brew/` by default. Override the directory with
 `XBLOOM_STATE_DIR` (canonical) or legacy `XBLOOM_SKILL_STATE_DIR` for tests or managed deployments;
 `XBLOOM_SKILL_RUNTIME_DIR` can override only the virtual environment. The bridge binds only to
 loopback, holds a lifecycle `bridge.lock`, and authenticates each JSON-line request with its random

@@ -628,10 +628,14 @@ class BridgeCore:
 
     @property
     def coffee_state_file(self) -> Path:
+        """Legacy path name only (import-only via migrate). Runtime never reads/writes it."""
+
         return self.state_dir / COFFEE_STATE_NAME
 
     @property
     def tea_state_file(self) -> Path:
+        """Legacy path name only (import-only via migrate). Runtime never reads/writes it."""
+
         return self.state_dir / TEA_STATE_NAME
 
     @property
@@ -727,18 +731,27 @@ class BridgeCore:
         # Targets from metadata when available (best-effort; no BLE).
         if isinstance(meta.get("targets"), dict):
             self.targets = dict(meta["targets"])
-        address = meta.get("address") or active.get("owner")
-        if isinstance(address, str) and address and ":" in address:
-            # Prefer explicit machine address from metadata.
-            pass
-        machine_addr = meta.get("machine_address")
-        if isinstance(machine_addr, str) and machine_addr:
-            self.address = machine_addr
-            self.default_address = self.default_address or machine_addr
+        # Hydrate address for later explicit reconnect/cancel only — never
+        # auto-connect. Prefer durable machine_address, then metadata.address,
+        # then the active recovery payload address (migrated armed/tea JSON).
+        recovery = active.get("recovery")
+        recovery_addr = None
+        if isinstance(recovery, Mapping):
+            recovery_addr = recovery.get("address")
+        chosen_address: str | None = None
+        for candidate in (
+            meta.get("machine_address"),
+            meta.get("address"),
+            recovery_addr,
+        ):
+            if isinstance(candidate, str) and candidate:
+                chosen_address = candidate
+                break
+        if chosen_address:
+            self.address = chosen_address
+            if not self.default_address:
+                self.default_address = chosen_address
         # Remain disconnected; connection_scope stays None until explicit reconnect.
-        if self.phase not in {"disconnected"}:
-            # In-memory phase reflects workflow, not BLE link.
-            pass
 
     @staticmethod
     def _require_request_id(params: Mapping[str, Any]) -> str:
@@ -1704,23 +1717,33 @@ class BridgeCore:
         return bool(state.get("in_progress"))
 
     def recovery_record_names(self) -> list[str]:
+        """Names of recovery markers that block idle restart.
+
+        Coffee/tea legacy JSON files are import-only and never consulted here.
+        Durable coffee/tea recovery is reflected via active workflow / activity.
+        Grinder rest JSON remains a runtime recovery marker (not this batch).
+        """
+
         names: list[str] = []
-        if self.coffee_state_file.exists():
-            names.append(COFFEE_STATE_NAME)
-        if self.tea_state_file.exists():
-            names.append(TEA_STATE_NAME)
         if self._grinder_is_recovery():
             names.append(GRINDER_STATE_NAME)
         return names
 
     def is_idle(self) -> bool:
-        """True when phase is safe, no activity, and no recovery records."""
+        """True when phase is safe, no activity, and no durable ownership/recovery."""
 
         if self.activity is not None:
             return False
         if self.phase not in SAFE_IDLE_PHASES:
             return False
-        if self.coffee_state_file.exists() or self.tea_state_file.exists():
+        if self.active_workflow_id is not None:
+            return False
+        try:
+            if self.store.get_active_workflow() is not None:
+                return False
+        except StorageError:
+            return False
+        if self._recovery_required:
             return False
         if self._grinder_is_recovery():
             return False
@@ -1998,10 +2021,7 @@ class BridgeCore:
             "finished_at": round(time.time(), 3),
             **details,
         }
-        if previous == "coffee":
-            _unlink(self.coffee_state_file)
-        if previous == "tea":
-            _unlink(self.tea_state_file)
+        # Coffee/tea legacy JSON is import-only; never unlink or rewrite it here.
         if previous == "grinder":
             self._cancel_grinder_timer()
         if previous == "water":
@@ -2890,14 +2910,33 @@ class BridgeCore:
         )
 
     def _ensure_no_loaded_record(self) -> None:
-        active = [
-            path.name
-            for path in (self.coffee_state_file, self.tea_state_file)
-            if path.exists()
-        ]
-        if active:
+        """Refuse new work while durable/in-memory workflow ownership is active.
+
+        Legacy armed-state.json / tea-loaded-state.json are import-only and are
+        never inspected here. Active durable workflow / in-memory activity is
+        the sole gate.
+        """
+
+        if self.activity is not None:
             raise BridgeError(
-                f"a loaded workflow record exists ({', '.join(active)}); recover/cancel first"
+                f"bridge owns {self.activity}:{self.phase}; recover/cancel first"
+            )
+        if self.active_workflow_id is not None:
+            raise BridgeError(
+                f"active durable workflow {self.active_workflow_id!r} still owns "
+                "the bridge; recover/cancel first"
+            )
+        try:
+            active_wf = self.store.get_active_workflow()
+        except StorageError as exc:
+            raise BridgeError(
+                f"durable workflow state unreadable; refuse new work: {exc}",
+                category="durable_state_unreadable",
+            ) from exc
+        if active_wf is not None:
+            raise BridgeError(
+                f"active durable workflow {active_wf.get('workflow_id')!r} "
+                f"(state={active_wf.get('state')!r}); recover/cancel first"
             )
 
     def _require_hot_water(self, confirmation: Any, expected: str) -> None:
@@ -3644,24 +3683,8 @@ class BridgeCore:
             self._fail_request(request_id, str(exc), keep_pending=False)
             await self._release_auto_connect_on_preflight_failure(newly_connected)
             raise
-        state = {
-            "address": self.address,
-            "machine": self.machine_name,
-            "recipe_path": str(path) if path else None,
-            "recipe_sha256": (
-                _sha256(path) if path is not None else summary.get("recipe_sha256")
-            ),
-            "loaded_at": time.time(),
-            "status": "armed",
-            "firmware": firmware,
-            "owner": "bridge",
-            "serving_kind": summary["kind"],
-            "machine_program": summary["machine_program"],
-            "manual_preload_ice_g": summary["manual_preload_ice_g"],
-            "workflow_id": workflow_id,
-            "snapshot_sha256": wf.get("snapshot_sha256"),
-        }
-        _atomic_json(self.coffee_state_file, state, private=True)
+        # Durable workflow/snapshot is authoritative. Never dual-write
+        # armed-state.json (import-only legacy file).
         self.activity = "coffee"
         self.phase = "loaded"
         self._loaded_needs_reconcile = False
@@ -3687,6 +3710,8 @@ class BridgeCore:
                 "recipe_name": path.name if path else recipe.name,
                 "machine_address": self.address,
                 "targets": dict(self.targets),
+                "serving_kind": summary["kind"],
+                "firmware": firmware,
             },
             event_type="loaded",
             event_payload={"status": "armed", "firmware": firmware},
@@ -3706,6 +3731,32 @@ class BridgeCore:
         }
         self._complete_request(request_id, result)
         return result
+
+    def _coffee_start_display_fields(self, workflow_id: str) -> dict[str, Any]:
+        """Recipe display fields from durable workflow / in-memory targets only.
+
+        Never reopens or re-hashes the original source path.
+        """
+
+        wf = self.store.get_workflow(workflow_id) or {}
+        meta = dict(wf.get("metadata") or {})
+        targets_meta = dict(meta.get("targets") or {})
+        machine_program = (
+            self.targets.get("machine_program")
+            or targets_meta.get("machine_program")
+            or "coffee-pour-over"
+        )
+        if "manual_preload_ice_g" in self.targets:
+            ice = self.targets.get("manual_preload_ice_g")
+        else:
+            ice = targets_meta.get("manual_preload_ice_g", 0)
+        return {
+            "machine_program": machine_program,
+            "machine_dispenses_ice": False,
+            "manual_preload_ice_g": int(ice or 0),
+            "workflow_id": workflow_id,
+            "snapshot_sha256": wf.get("snapshot_sha256"),
+        }
 
     async def _coffee_start(self, params: Mapping[str, Any]) -> dict[str, Any]:
         request_id = self._require_request_id(params)
@@ -3737,32 +3788,9 @@ class BridgeCore:
         )
         if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
             return dict(reserved.get("result") or {})
-        if self.coffee_state_file.exists():
-            state = _read_json(self.coffee_state_file)
-        else:
-            # Daemon reconstruction: durable workflow is authoritative for
-            # recipe identity, but machine armed state must be re-confirmed.
-            wf = self.store.get_workflow(workflow_id) or {}
-            meta = dict(wf.get("metadata") or {})
-            state = {
-                "recipe_path": meta.get("recipe_path"),
-                "recipe_sha256": (wf.get("snapshot") or {}).get("_source_sha256"),
-                "machine_program": "coffee-pour-over",
-                "manual_preload_ice_g": 0,
-                "workflow_id": workflow_id,
-                "status": "armed",
-            }
-            self._loaded_needs_reconcile = True
-        path = Path(str(state.get("recipe_path") or ""))
-        if state.get("recipe_path"):
-            if not path.is_file() or (
-                state.get("recipe_sha256")
-                and _sha256(path) != state.get("recipe_sha256")
-            ):
-                self._fail_request(
-                    request_id, "recipe changed or disappeared", keep_pending=False
-                )
-                raise BridgeError("recipe changed or disappeared since it was loaded")
+        # Durable workflow/snapshot is authoritative. Source YAML changes or
+        # deletion after load must not affect start. Never re-read/re-hash path.
+        display = self._coffee_start_display_fields(workflow_id)
         if not self.connected:
             await self._ensure_connected(params, scope="workflow")
         if self._loaded_needs_reconcile:
@@ -3770,8 +3798,6 @@ class BridgeCore:
                 kind="coffee", request_id=request_id
             )
         self._reset_liquid_telemetry()
-        state.update(status="start_pending", start_requested_at=time.time())
-        _atomic_json(self.coffee_state_file, state, private=True)
         self.phase = "starting"
         self._set_workflow_state(
             "starting",
@@ -3785,12 +3811,6 @@ class BridgeCore:
         except BaseException as exc:
             self.phase = "control_unconfirmed"
             self.last_error = f"coffee start outcome is unconfirmed: {exc}"
-            state.update(
-                status="start_unconfirmed",
-                start_unconfirmed_at=time.time(),
-                last_state=self.machine_state or state.get("last_state"),
-            )
-            _atomic_json(self.coffee_state_file, state, private=True)
             self._set_workflow_state(
                 "control_unconfirmed",
                 workflow_id=workflow_id,
@@ -3841,9 +3861,11 @@ class BridgeCore:
                     else (event.state_name if event is not None else self.phase)
                 ),
                 "terminal_during_start": True,
-                "machine_program": state.get("machine_program", "coffee-pour-over"),
+                "machine_program": display.get("machine_program", "coffee-pour-over"),
                 "machine_dispenses_ice": False,
-                "manual_preload_ice_g": int(state.get("manual_preload_ice_g", 0) or 0),
+                "manual_preload_ice_g": int(
+                    display.get("manual_preload_ice_g", 0) or 0
+                ),
             }
             if self.phase == "recovery_required" or self._recovery_required:
                 result["recovery_required"] = True
@@ -3860,8 +3882,6 @@ class BridgeCore:
         self.phase = "running"
         self.last_error = None
         self._saw_active = event.state in ACTIVE_STATE_BYTES or self._saw_active
-        state.update(status="running", started_at=time.time(), last_state=event.state_name)
-        _atomic_json(self.coffee_state_file, state, private=True)
         self._set_workflow_state(
             "running",
             workflow_id=workflow_id,
@@ -3873,9 +3893,11 @@ class BridgeCore:
             "status": "running",
             "state": event.state_name,
             "workflow_id": workflow_id,
-            "machine_program": state.get("machine_program", "coffee-pour-over"),
+            "machine_program": display.get("machine_program", "coffee-pour-over"),
             "machine_dispenses_ice": False,
-            "manual_preload_ice_g": int(state.get("manual_preload_ice_g", 0) or 0),
+            "manual_preload_ice_g": int(
+                display.get("manual_preload_ice_g", 0) or 0
+            ),
         }
         self._complete_request(request_id, result)
         return result
@@ -3902,7 +3924,6 @@ class BridgeCore:
         from .tea import TeaRecipe, TeaRecipeError
 
         path: Path | None = None
-        revision_content_sha: str | None = None
         if has_path:
             path = Path(str(raw_path)).expanduser().resolve(strict=True)
             recipe = TeaRecipe.from_yaml(path)
@@ -3938,7 +3959,6 @@ class BridgeCore:
                     f"recipe_revision_id {rid!r} failed tea validation: {exc}",
                     category="validation_error",
                 ) from exc
-            revision_content_sha = revision.get("content_sha256")
         snapshot = self._snapshot_tea_recipe(recipe, path)
         source = str(params.get("source") or "bridge")
 
@@ -4031,21 +4051,8 @@ class BridgeCore:
             self._fail_request(request_id, str(exc), keep_pending=False)
             await self._release_auto_connect_on_preflight_failure(newly_connected)
             raise
-        state = {
-            "address": self.address,
-            "machine": self.machine_name,
-            "recipe_path": str(path) if path is not None else None,
-            "recipe_sha256": (
-                _sha256(path) if path is not None else revision_content_sha
-            ),
-            "loaded_at": time.time(),
-            "status": "tea_loaded",
-            "firmware": firmware,
-            "owner": "bridge",
-            "workflow_id": workflow_id,
-            "snapshot_sha256": wf.get("snapshot_sha256"),
-        }
-        _atomic_json(self.tea_state_file, state, private=True)
+        # Durable workflow/snapshot is authoritative. Never dual-write
+        # tea-loaded-state.json (import-only legacy file).
         self.activity = "tea"
         self.phase = "loaded"
         self._loaded_needs_reconcile = False
@@ -4070,6 +4077,7 @@ class BridgeCore:
                 "recipe_name": recipe_name,
                 "machine_address": self.address,
                 "targets": dict(self.targets),
+                "firmware": firmware,
             },
             event_type="loaded",
             event_payload={"status": "tea_loaded", "firmware": firmware},
@@ -4119,34 +4127,8 @@ class BridgeCore:
         )
         if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
             return dict(reserved.get("result") or {})
-        if self.tea_state_file.exists():
-            state = _read_json(self.tea_state_file)
-        else:
-            wf = self.store.get_workflow(workflow_id) or {}
-            meta = dict(wf.get("metadata") or {})
-            state = {
-                "recipe_path": meta.get("recipe_path"),
-                "recipe_sha256": (wf.get("snapshot") or {}).get("_source_sha256"),
-                "workflow_id": workflow_id,
-                "status": "tea_loaded",
-            }
-            self._loaded_needs_reconcile = True
-        # Pathless revision-only loads store null recipe_path; only re-check a
-        # local file when Skill/MCP provided one at load time.
-        if state.get("recipe_path"):
-            path = Path(str(state.get("recipe_path") or ""))
-            if not path.is_file() or (
-                state.get("recipe_sha256")
-                and _sha256(path) != state.get("recipe_sha256")
-            ):
-                self._fail_request(
-                    request_id,
-                    "tea recipe changed or disappeared",
-                    keep_pending=False,
-                )
-                raise BridgeError(
-                    "tea recipe changed or disappeared since it was loaded"
-                )
+        # Durable workflow/snapshot is authoritative. Source YAML changes or
+        # deletion after load must not affect start. Never re-read/re-hash path.
         if not self.connected:
             await self._ensure_connected(params, scope="workflow")
         if self._loaded_needs_reconcile:
@@ -4221,8 +4203,6 @@ class BridgeCore:
         # coffee active-state byte. A confirmed 4512 response is the activation
         # boundary; a later terminal state may safely finish the bridge activity.
         self._saw_active = True
-        state.update(status="running", started_at=time.time(), last_state=event.state_name)
-        _atomic_json(self.tea_state_file, state, private=True)
         self._set_workflow_state(
             "running",
             workflow_id=workflow_id,
@@ -5128,45 +5108,6 @@ class BridgeCore:
             )
         return result
 
-    async def _recover_loaded_record(self) -> dict[str, Any] | None:
-        records = [
-            ("coffee", self.coffee_state_file),
-            ("tea", self.tea_state_file),
-        ]
-        existing = [(kind, path) for kind, path in records if path.exists()]
-        if not existing:
-            return None
-        if len(existing) != 1:
-            raise BridgeError("multiple loaded workflow records exist; inspect them manually")
-        kind, path = existing[0]
-        state = _read_json(path)
-        address = state.get("address") or self.default_address
-        if not address:
-            raise BridgeError("loaded workflow record has no machine address")
-        await self._connect_unlocked({"address": str(address)}, scope="workflow")
-        self.activity = kind
-        self.phase = "recovering"
-        self.targets = {"recovered_record": path.name}
-        try:
-            if kind == "coffee":
-                await self.client.cancel_brew()
-            else:
-                await self.client.unload_tea_recipe()
-        except Exception as exc:
-            self.phase = "stop_unconfirmed"
-            self.last_error = f"{kind} recovery cancel is unconfirmed: {exc}"
-            raise BridgeError(self.last_error) from exc
-        _unlink(path)
-        self._finish_activity(
-            "recovery_cancel_sent", release_reason="recovery_cancel"
-        )
-        self.last_error = None
-        return {
-            "status": "recovery_cancel_sent",
-            "activity": kind,
-            "record_cleared": True,
-        }
-
     async def _stop(
         self,
         params: Mapping[str, Any] | None = None,
@@ -5186,23 +5127,9 @@ class BridgeCore:
         )
         if cached is not None:
             return cached
-        # Legacy JSON recovery without an in-memory activity: allow without
-        # matching workflow_id (explicit recovery path).
+        # Stale legacy coffee/tea JSON without explicit migration is ignored.
+        # Ownership is durable workflow / in-memory activity only.
         if self.activity is None:
-            if self.coffee_state_file.exists() or self.tea_state_file.exists():
-                reserved = self._reserve_request(
-                    method_name, params, workflow_id=self.active_workflow_id
-                )
-                if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
-                    return dict(reserved.get("result") or {})
-                recovered = await self._recover_loaded_record()
-                if recovered is not None:
-                    recovered = dict(recovered)
-                    recovered["workflow_id"] = self.active_workflow_id
-                    if emergency:
-                        recovered["emergency"] = True
-                    self._complete_request(request_id, recovered)
-                    return recovered
             raise BridgeError("there is no bridge-owned activity to stop")
 
         workflow_id, used_emergency = self._require_active_workflow(
@@ -5231,7 +5158,6 @@ class BridgeCore:
                 )
                 self._fail_request(request_id, str(exc), keep_pending=True)
                 raise BridgeError(self.last_error) from exc
-            _unlink(self.coffee_state_file)
             result = {
                 "status": "cancel_sent",
                 "activity": "coffee",
@@ -5267,7 +5193,6 @@ class BridgeCore:
                 )
                 self._fail_request(request_id, str(exc), keep_pending=True)
                 raise BridgeError(self.last_error) from exc
-            _unlink(self.tea_state_file)
             result = {
                 "status": "cancel_sent",
                 "activity": "tea",
@@ -5520,14 +5445,7 @@ class BridgeCore:
                         "workflow_id": self.active_workflow_id,
                     }
                 )
-            elif force and (self.coffee_state_file.exists() or self.tea_state_file.exists()):
-                await self._stop(
-                    {
-                        "request_id": f"shutdown_{uuid4().hex}",
-                        "emergency": True,
-                        "workflow_id": self.active_workflow_id,
-                    }
-                )
+            # Legacy coffee/tea JSON is never a shutdown gate (import-only).
             self._cancel_pending_release()
             self._cancel_idle_orphan_task()
             self._idle_orphan_since = None

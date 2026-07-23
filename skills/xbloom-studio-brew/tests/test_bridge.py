@@ -511,9 +511,7 @@ def test_revision_only_coffee_and_tea_load_and_start_without_paths(tmp_path):
             ),
         )
         coffee_workflow = core.store.get_workflow(loaded_coffee["workflow_id"])
-        coffee_state = json.loads(
-            core.coffee_state_file.read_text(encoding="utf-8")
-        )
+        assert not core.coffee_state_file.exists()
         assert loaded_coffee["recipe_revision_id"] == coffee_revision["revision_id"]
         assert coffee_workflow["recipe_revision_id"] == coffee_revision["revision_id"]
         assert coffee_workflow["snapshot"] == coffee_revision["content"]
@@ -524,7 +522,6 @@ def test_revision_only_coffee_and_tea_load_and_start_without_paths(tmp_path):
                 {
                     "result": loaded_coffee,
                     "workflow": coffee_workflow,
-                    "state": coffee_state,
                 }
             )
         )
@@ -541,7 +538,7 @@ def test_revision_only_coffee_and_tea_load_and_start_without_paths(tmp_path):
             _with_ids({"recipe_revision_id": tea_revision["revision_id"]}),
         )
         tea_workflow = core.store.get_workflow(loaded_tea["workflow_id"])
-        tea_state = json.loads(core.tea_state_file.read_text(encoding="utf-8"))
+        assert not core.tea_state_file.exists()
         assert loaded_tea["recipe_revision_id"] == tea_revision["revision_id"]
         assert tea_workflow["recipe_revision_id"] == tea_revision["revision_id"]
         assert tea_workflow["snapshot"] == tea_revision["content"]
@@ -552,7 +549,6 @@ def test_revision_only_coffee_and_tea_load_and_start_without_paths(tmp_path):
                 {
                     "result": loaded_tea,
                     "workflow": tea_workflow,
-                    "state": tea_state,
                 }
             )
         )
@@ -639,7 +635,7 @@ def test_coffee_lifecycle_uses_one_held_client(tmp_path):
         )
         assert loaded["status"] == "armed"
         assert loaded["workflow_id"]
-        assert core.coffee_state_file.exists()
+        assert not core.coffee_state_file.exists()
         wid = loaded["workflow_id"]
 
         await core.rpc(
@@ -685,10 +681,11 @@ def test_coffee_start_failure_requires_recovery_instead_of_retry(tmp_path):
         status = core.status()
         assert status["activity"] == "coffee"
         assert status["phase"] == "control_unconfirmed"
-        saved = json.loads(core.coffee_state_file.read_text(encoding="utf-8"))
-        assert saved["status"] == "start_unconfirmed"
-        assert "start_requested_at" in saved
-        assert "start_unconfirmed_at" in saved
+        # Unconfirmed start is durable-only; no coffee JSON dual-write.
+        assert not core.coffee_state_file.exists()
+        wf = core.store.get_workflow(wid)
+        assert wf is not None
+        assert wf["state"] == "control_unconfirmed"
 
         # Same pending request_id must not reissue start.
         with pytest.raises(BridgeError, match="recovery_required|do not retry"):
@@ -740,16 +737,11 @@ def test_coffee_terminal_during_pause_does_not_restore_stale_paused_state(tmp_pa
     asyncio.run(go())
 
 
-@pytest.mark.parametrize(
-    ("kind", "expected_call"),
-    [("coffee", "coffee_cancel"), ("tea", "tea_unload")],
-)
-def test_cancel_recovers_loaded_record_after_bridge_restart(
-    tmp_path, kind, expected_call
-):
+def test_stale_legacy_json_ignored_without_migration_or_cancel(tmp_path):
+    """Unmigrated armed-state/tea-loaded JSON is not a runtime gate or cancel source."""
+
     core, fake = _core(tmp_path)
-    record = core.coffee_state_file if kind == "coffee" else core.tea_state_file
-    record.write_text(
+    core.coffee_state_file.write_text(
         json.dumps(
             {
                 "address": "AA:BB",
@@ -759,17 +751,25 @@ def test_cancel_recovers_loaded_record_after_bridge_restart(
         ),
         encoding="utf-8",
     )
+    core.tea_state_file.write_text(
+        json.dumps({"address": "AA:BB", "status": "tea_loaded"}),
+        encoding="utf-8",
+    )
+    original_coffee = core.coffee_state_file.read_bytes()
+    original_tea = core.tea_state_file.read_bytes()
 
     async def go():
-        result = await core.rpc("cancel", _with_ids())
-        assert result["status"] == "recovery_cancel_sent"
-        assert result["activity"] == kind
-        assert result["record_cleared"] is True
-        assert not record.exists()
-        await core.shutdown()
+        # settings.read must proceed; legacy files are not ownership gates.
+        await core.rpc("settings.read")
+        assert fake.connect_count == 1
+        with pytest.raises(BridgeError, match="no bridge-owned activity"):
+            await core.rpc("cancel", _with_ids())
+        # Originals untouched (import-only; runtime never unlinks).
+        assert core.coffee_state_file.read_bytes() == original_coffee
+        assert core.tea_state_file.read_bytes() == original_tea
+        await core.shutdown(force=True)
 
     asyncio.run(go())
-    assert expected_call in fake.calls
 
 
 def test_tea_lifecycle_stays_on_held_connection_and_finishes_on_terminal(tmp_path):
@@ -782,7 +782,7 @@ def test_tea_lifecycle_stays_on_held_connection_and_finishes_on_terminal(tmp_pat
         )
         assert loaded["status"] == "tea_loaded"
         assert loaded["workflow_id"]
-        assert core.tea_state_file.exists()
+        assert not core.tea_state_file.exists()
         wid = loaded["workflow_id"]
 
         started = await core.rpc(
@@ -916,16 +916,18 @@ def test_bridge_persistent_writes_keep_their_independent_gate(tmp_path):
 
 def test_local_validation_and_recovery_records_block_before_ble_connect(tmp_path):
     core, fake = _core(tmp_path)
-    core.coffee_state_file.write_text(
-        json.dumps({"address": "AA:BB", "status": "armed"}),
-        encoding="utf-8",
-    )
+    # Stale legacy JSON is ignored; plant durable active ownership instead.
+    recipe = _recipe(tmp_path / "recipe.yaml")
 
     async def go():
-        with pytest.raises(BridgeError, match="loaded workflow record exists"):
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        with pytest.raises(BridgeError, match="owns|active durable workflow"):
             await core.rpc("settings.read")
-        assert fake.calls == []
-        core.coffee_state_file.unlink()
+        assert fake.calls.count("connect") == 1
+        await core.rpc("cancel", _with_ids(workflow_id=loaded["workflow_id"]))
+        await _drain_release(core)
         with pytest.raises(BridgeError, match="volume must be 20-360"):
             await core.rpc(
                 "water.start",
@@ -937,8 +939,9 @@ def test_local_validation_and_recovery_records_block_before_ble_connect(tmp_path
                     }
                 ),
             )
+        await core.shutdown(force=True)
+
     asyncio.run(go())
-    assert fake.calls == []
 
 
 def test_freesolo_water_live_adjust_is_separately_gated(tmp_path):
@@ -1567,12 +1570,9 @@ def test_loaded_recipe_holds_without_timeout_then_start_reuses_connection(tmp_pa
         assert not hasattr(core, "_arm_expiry_task")
         assert not hasattr(core, "_arm_expiry_key")
         assert not hasattr(bridge_mod, "ARM_MAX_AGE_SECONDS")
+        assert not core.coffee_state_file.exists()
 
-        # Even a very old loaded_at must not auto-cancel or block start.
-        state = json.loads(core.coffee_state_file.read_text(encoding="utf-8"))
-        state["loaded_at"] = time.time() - 400
-        core.coffee_state_file.write_text(json.dumps(state), encoding="utf-8")
-
+        # Wait beyond any historical five-minute window; no auto-cancel.
         await asyncio.sleep(0.1)
         status = core.status()
         assert status["phase"] == "loaded"
@@ -1589,6 +1589,7 @@ def test_loaded_recipe_holds_without_timeout_then_start_reuses_connection(tmp_pa
         )
         assert core.status()["phase"] == "running"
         assert fake.calls.count("connect") == 1
+        assert not core.coffee_state_file.exists()
 
         await core.rpc("pause", _with_ids(workflow_id=wid))
         await core.rpc("resume", _with_ids(workflow_id=wid))
@@ -1987,10 +1988,10 @@ def test_daemon_reconstruction_from_durable_state_no_auto_connect_or_start(tmp_p
         )
         wid = loaded["workflow_id"]
         assert core.connected is True
+        assert not core.coffee_state_file.exists()
         # Simulate process loss: close durable store without terminal / without
         # auto-start. BLE link is process-local and dies with the process.
-        # Keep the local armed-state file so reconstruct is "loaded" (confirmed
-        # load in a prior process) rather than bare durable-only.
+        # Durable workflow alone reconstructs loaded + recovery (no coffee JSON).
         core.store.close()
         fake2 = FakeBridgeClient("AA:BB")
         # Reconcile gate requires confirmed armed after restart.
@@ -2008,6 +2009,7 @@ def test_daemon_reconstruction_from_durable_state_no_auto_connect_or_start(tmp_p
         assert core2.phase == "loaded"
         assert core2.connected is False
         assert core2._loaded_needs_reconcile is True
+        assert not core2.coffee_state_file.exists()
         assert fake2.calls == []  # no auto-connect, no auto-start
         status = core2.status()
         assert status["active_workflow_id"] == wid
@@ -4586,5 +4588,355 @@ def test_recovery_reconcile_requires_matching_workflow_id(tmp_path):
         # Wrong id must not connect.
         assert core.connected is False
         await core.shutdown(force=True)
+
+    asyncio.run(go())
+
+def test_source_deleted_after_load_same_process_start_reuses_link(tmp_path):
+    """Source YAML deleted after load; same-process start uses durable snapshot only."""
+
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        sha = loaded["snapshot_sha256"]
+        assert not core.coffee_state_file.exists()
+        recipe.unlink()
+        assert not recipe.exists()
+        started = await core.rpc(
+            "coffee.start",
+            _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+        )
+        assert started["status"] == "running"
+        assert started["workflow_id"] == wid
+        assert core.store.get_workflow(wid)["snapshot_sha256"] == sha
+        assert fake.calls.count("connect") == 1
+        assert fake.calls.count(("load_recipe", "Bridge test")) == 1
+        assert fake.calls.count("coffee_start") == 1
+        assert not core.coffee_state_file.exists()
+        await core.rpc("cancel", _with_ids(workflow_id=wid))
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_source_modified_after_load_does_not_alter_durable_snapshot(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        before = core.store.get_workflow(wid)
+        snap_before = dict(before["snapshot"])
+        sha_before = before["snapshot_sha256"]
+        recipe.write_text(
+            """name: Mutated after load
+dose_g: 20
+grind: 40
+pours:
+  - {ml: 50, temp_c: 90, pattern: center, pause_s: 10, rpm: 100, flow_ml_s: 3.0}
+  - {ml: 100, temp_c: 90, pattern: center, pause_s: 5, rpm: 100, flow_ml_s: 3.0}
+  - {ml: 100, temp_c: 90, pattern: center, pause_s: 5, rpm: 100, flow_ml_s: 3.0}
+""",
+            encoding="utf-8",
+        )
+        started = await core.rpc(
+            "coffee.start",
+            _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+        )
+        assert started["status"] == "running"
+        after = core.store.get_workflow(wid)
+        assert after["snapshot"] == snap_before
+        assert after["snapshot_sha256"] == sha_before
+        assert after["snapshot"].get("name") == "Bridge test"
+        assert not core.coffee_state_file.exists()
+        await core.rpc("cancel", _with_ids(workflow_id=wid))
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_no_coffee_tea_json_created_across_load_start_unconfirmed_terminal(tmp_path):
+    core, fake = _core(tmp_path)
+    fake.fail_coffee_start = True
+    recipe = _recipe(tmp_path / "recipe.yaml")
+    tea = _tea_recipe(tmp_path / "tea.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "coffee.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        assert not core.coffee_state_file.exists()
+        assert not core.tea_state_file.exists()
+        with pytest.raises(BridgeError, match="do not retry start"):
+            await core.rpc(
+                "coffee.start",
+                _with_ids({"confirmation": READY_SENTINEL}, workflow_id=wid),
+            )
+        assert not core.coffee_state_file.exists()
+        await core.rpc("cancel", _with_ids(workflow_id=wid))
+        await _drain_release(core)
+        assert not core.coffee_state_file.exists()
+
+        loaded_tea = await core.rpc(
+            "tea.load", _with_ids({"recipe": str(tea)})
+        )
+        twid = loaded_tea["workflow_id"]
+        assert not core.tea_state_file.exists()
+        await core.rpc(
+            "tea.start",
+            _with_ids({"confirmation": TEA_READY_SENTINEL}, workflow_id=twid),
+        )
+        assert not core.tea_state_file.exists()
+        fake.emit(_event(state=0x01, name="idle"))
+        await _drain_release(core)
+        assert not core.tea_state_file.exists()
+        await core.shutdown(force=True)
+
+    asyncio.run(go())
+
+
+def test_explicit_migration_imports_coffee_tea_json_byte_identical(tmp_path):
+    """migrate_legacy_state imports recovery JSON without modifying originals.
+
+    Lossless / public StateStore import verification only. Runtime no-auto-
+    connect and cancel-with-imported-address behavior is covered by the
+    single-record parametrized migration recovery test.
+    """
+
+    armed = {
+        "address": "AA:BB:CC:DD:EE:FF",
+        "status": "armed",
+        "recipe_sha256": "deadbeef",
+        "owner": "legacy",
+    }
+    tea = {"address": "AA:BB", "status": "tea_loaded", "recipe_path": "/tmp/x.yaml"}
+    coffee_path = tmp_path / "armed-state.json"
+    tea_path = tmp_path / "tea-loaded-state.json"
+    coffee_path.write_text(json.dumps(armed, indent=2), encoding="utf-8")
+    tea_path.write_text(json.dumps(tea, indent=2), encoding="utf-8")
+    coffee_bytes = coffee_path.read_bytes()
+    tea_bytes = tea_path.read_bytes()
+
+    result = storage.migrate_legacy_state(tmp_path)
+    assert result["status"] == "completed"
+    assert coffee_path.read_bytes() == coffee_bytes
+    assert tea_path.read_bytes() == tea_bytes
+
+    coffee_sha = storage.sha256_bytes(coffee_bytes)
+    tea_sha = storage.sha256_bytes(tea_bytes)
+    coffee_wid = f"legacy_recovery_armed_{coffee_sha[:16]}"
+    tea_wid = f"legacy_recovery_tea_{tea_sha[:16]}"
+
+    store = storage.StateStore(tmp_path)
+    try:
+        assert store.count_legacy_imports("recovery_armed") == 1
+        assert store.count_legacy_imports("recovery_tea") == 1
+        coffee_wf = store.get_workflow(coffee_wid)
+        tea_wf = store.get_workflow(tea_wid)
+        assert coffee_wf is not None
+        assert tea_wf is not None
+        assert coffee_wf["kind"] == "coffee_recovery"
+        assert tea_wf["kind"] == "tea_recovery"
+        assert coffee_wf["state"] == "recovery_imported"
+        assert tea_wf["state"] == "recovery_imported"
+        assert coffee_wf["source"] == "legacy_migration"
+        assert tea_wf["source"] == "legacy_migration"
+        assert coffee_wf["recovery"] == armed
+        assert tea_wf["recovery"] == tea
+        assert coffee_wf["snapshot"] is None
+        assert tea_wf["snapshot"] is None
+        assert (coffee_wf.get("metadata") or {}).get("legacy_sha256") == coffee_sha
+        assert (tea_wf.get("metadata") or {}).get("legacy_sha256") == tea_sha
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "filename", "payload", "expected_activity", "expected_call"),
+    [
+        (
+            "recovery_armed",
+            "armed-state.json",
+            {
+                "address": "AA:BB:CC:DD:EE:FF",
+                "status": "armed",
+                "recipe_sha256": "deadbeef",
+                "owner": "legacy",
+            },
+            "coffee",
+            "coffee_cancel",
+        ),
+        (
+            "recovery_tea",
+            "tea-loaded-state.json",
+            {
+                "address": "11:22:33:44:55:66",
+                "status": "tea_loaded",
+                "recipe_path": "/tmp/x.yaml",
+            },
+            "tea",
+            "tea_unload",
+        ),
+    ],
+)
+def test_migrated_single_recovery_no_autoconnect_cancel_uses_imported_address(
+    tmp_path,
+    source_kind,
+    filename,
+    payload,
+    expected_activity,
+    expected_call,
+):
+    """One legacy recovery JSON: migrate, no auto-BLE, cancel via imported address."""
+
+    path = tmp_path / filename
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    original_bytes = path.read_bytes()
+    imported_address = payload["address"]
+    file_sha = storage.sha256_bytes(original_bytes)
+    expected_wid = f"legacy_{source_kind}_{file_sha[:16]}"
+
+    result = storage.migrate_legacy_state(tmp_path)
+    assert result["status"] == "completed"
+    assert path.read_bytes() == original_bytes
+
+    clients: list[FakeBridgeClient] = []
+    factory_addresses: list[str] = []
+
+    def capturing_factory(address: str) -> FakeBridgeClient:
+        factory_addresses.append(address)
+        client = FakeBridgeClient(address)
+        clients.append(client)
+        return client
+
+    async def boom_scan(*, timeout: float = 8.0):
+        raise AssertionError(f"scan must not run; timeout={timeout}")
+
+    core = BridgeCore(
+        default_address=None,
+        state_dir=tmp_path,
+        client_factory=capturing_factory,
+        scan_fn=boom_scan,
+        environ=_environment(),
+        machine_info_timeout=0.1,
+    )
+    try:
+        # Startup hydrates durable recovery only — zero BLE.
+        assert factory_addresses == []
+        assert clients == []
+        status = core.status()
+        assert status["connected"] is False
+        assert status["idle"] is False
+        assert status["active_workflow_id"] == expected_wid
+        assert status["activity"] == expected_activity
+        recovery = status.get("recovery") or {}
+        assert recovery.get("required") is True
+        assert (recovery.get("detail") or {}).get("workflow_id") == expected_wid
+        assert core.address == imported_address
+        assert core.default_address == imported_address
+        assert path.read_bytes() == original_bytes
+
+        async def go():
+            cancelled = await core.rpc(
+                "cancel", _with_ids(workflow_id=expected_wid)
+            )
+            assert cancelled["status"] == "cancel_sent"
+            assert cancelled["activity"] == expected_activity
+            assert cancelled["workflow_id"] == expected_wid
+            await _drain_release(core)
+            assert core.connected is False
+            assert core.activity is None
+            assert core.active_workflow_id is None
+            assert core.is_idle() is True
+
+        asyncio.run(go())
+
+        assert factory_addresses == [imported_address]
+        assert len(clients) == 1
+        fake = clients[0]
+        assert fake.address == imported_address
+        assert fake.calls.count("connect") == 1
+        assert expected_call in fake.calls
+        assert fake.calls.count("disconnect") == 1
+
+        terminal = core.store.get_workflow(expected_wid)
+        assert terminal is not None
+        assert terminal.get("terminal_at") is not None
+        assert path.read_bytes() == original_bytes
+    finally:
+        asyncio.run(core.shutdown(force=True))
+
+
+def test_source_deleted_after_tea_load_same_process_start_reuses_snapshot(tmp_path):
+    """Source YAML deleted after tea.load; same-process start uses durable snapshot only."""
+
+    core, fake = _core(tmp_path)
+    recipe = _tea_recipe(tmp_path / "tea.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "tea.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        sha = loaded["snapshot_sha256"]
+        assert not core.tea_state_file.exists()
+        recipe.unlink()
+        assert not recipe.exists()
+        started = await core.rpc(
+            "tea.start",
+            _with_ids({"confirmation": TEA_READY_SENTINEL}, workflow_id=wid),
+        )
+        assert started["status"] == "running"
+        assert started["workflow_id"] == wid
+        assert core.store.get_workflow(wid)["snapshot_sha256"] == sha
+        assert fake.calls.count("connect") == 1
+        assert not core.tea_state_file.exists()
+        await core.rpc("cancel", _with_ids(workflow_id=wid))
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_source_modified_after_tea_load_does_not_alter_durable_snapshot(tmp_path):
+    core, fake = _core(tmp_path)
+    recipe = _tea_recipe(tmp_path / "tea.yaml")
+
+    async def go():
+        loaded = await core.rpc(
+            "tea.load", _with_ids({"recipe": str(recipe)})
+        )
+        wid = loaded["workflow_id"]
+        before = core.store.get_workflow(wid)
+        snap_before = dict(before["snapshot"])
+        sha_before = before["snapshot_sha256"]
+        recipe.write_text(
+            """name: Mutated tea after load
+kind: tea
+leaf_g: 9
+output_ml_per_steep: 100
+pours:
+  - {ml: 90, temp_c: 95, pattern: circular, pause_s: 60, flow_ml_s: 3.5}
+""",
+            encoding="utf-8",
+        )
+        started = await core.rpc(
+            "tea.start",
+            _with_ids({"confirmation": TEA_READY_SENTINEL}, workflow_id=wid),
+        )
+        assert started["status"] == "running"
+        after = core.store.get_workflow(wid)
+        assert after["snapshot"] == snap_before
+        assert after["snapshot_sha256"] == sha_before
+        assert not core.tea_state_file.exists()
+        await core.rpc("cancel", _with_ids(workflow_id=wid))
+        await core.shutdown()
 
     asyncio.run(go())

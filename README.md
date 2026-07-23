@@ -226,17 +226,19 @@ Optional `--scale on off on` configures the three on-brew scale flags in A/B/C o
 
 ## Safety model
 
-- `load` sends guarded recipe frames and stops at `armed`; it does not start brewing.
-- `tea-load` uploads a dedicated tea recipe but never executes it; `scale` reports its auto-zero
-  baseline and always exits its mode.
+- `load` sends guarded recipe frames and stops at `armed`; it does not start brewing. It returns a
+  durable `workflow_id` and stores an immutable snapshot in `state.db` (source paths are provenance
+  only after load).
+- `tea-load` uploads a dedicated tea recipe but never executes it; the same durable snapshot
+  contract applies. `scale` reports its auto-zero baseline and always exits its mode.
 - Firmware/state preflight runs before recipe or preset writes.
-- Remote start requires an owner opt-in, current physical-readiness confirmation, and the same
-  recipe hash / durable `workflow_id` on the same machine. Loaded recipes wait indefinitely for
-  explicit start or cancel (no five-minute loaded expiry); the daemon holds BLE until confirmed
-  terminal or cancel.
-- Brew telemetry is aggregated to one progress update per second. Workflow state is cleared only
-  after a terminal machine notification; a monitor timeout preserves recovery state for reattach
-  or cancel, using the already-recorded machine instead of scanning.
+- Remote start requires an owner opt-in, current physical-readiness confirmation, and the durable
+  `workflow_id` from load on the same machine (immutable snapshot; not a re-hash of source YAML).
+  Loaded recipes wait indefinitely for explicit start or cancel (no five-minute loaded expiry);
+  the daemon holds BLE until confirmed terminal or cancel.
+- Brew telemetry is aggregated to one progress update per second. Durable workflow ownership is
+  terminalized only after confirmed terminal telemetry, then BLE is released; a monitor timeout
+  preserves recovery state for reattach or cancel. Monitor is observation-only.
 - The tested firmware allowlist currently contains `V12.0D.500`; other firmware requires an explicit
   owner-level compatibility override.
 - Every external or generated recipe must pass the same validator.
