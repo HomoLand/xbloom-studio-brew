@@ -280,6 +280,8 @@ skills/xbloom-studio-brew/              # the Agent Skill (CLI client of core)
   scripts/bootstrap.py                  #   runtime venv setup (stdlib-only until install)
   assets/, references/, agents/, tests/
 tools/build_release.py                  # GitHub Release artifacts (not PyPI)
+tools/update_runtime_lock.py            # universal hashed non-core lock (uv 0.11.28)
+skills/.../requirements-runtime.lock    # committed universal runtime lock
 ```
 
 `packages/core` is the shared foundation imported by both the Skill CLI and the
@@ -300,24 +302,43 @@ python scripts/bootstrap.py --dev
 Repository checkouts install core in editable mode from `../../packages/core`.
 Release Skill bundles instead vendor the exact core wheel under `vendor/wheels/`
 and bootstrap installs that path with `pip install --no-deps --no-index <wheel>` after
-checking `vendor/release.json` (`core_wheel` + `core_wheel_sha256`, fail-closed).
+checking `vendor/release.json` (`core_wheel` + `core_wheel_sha256`, fail-closed), then
+installs non-core runtime deps only via
+`pip install --only-binary :all: --require-hashes -r requirements-runtime.lock`
+(also integrity-bound by `runtime_lock` + `runtime_lock_sha256` in `vendor/release.json`).
+
+### Universal runtime lock
+
+Non-core dependencies (bleak, PyYAML, and platform transitive wheels: Linux `dbus-fast`,
+macOS PyObjC, Windows WinRT) are locked in one committed universal hashed file:
+
+`skills/xbloom-studio-brew/requirements-runtime.lock`
+
+Generated with **uv 0.11.28** from `packages/core/pyproject.toml` (core itself is excluded;
+releases install the vendored wheel). Maintain with:
+
+```text
+python tools/update_runtime_lock.py --update   # refresh the tracked lock
+python tools/update_runtime_lock.py --check    # temp compile + byte-compare (CI)
+```
 
 ## Build / release artifacts
 
-Artifacts are published via **GitHub Releases** (not PyPI). From the repository root:
+Artifacts are built for **GitHub Releases** (not PyPI). Tag-driven publish is implemented in
+`.github/workflows/release.yml` (push `v*` tags, or `workflow_dispatch` with an explicit version
+tag). This document does not claim a Release has been published yet.
+
+From the repository root:
 
 ```text
 python tools/build_release.py
 # or: python tools/build_release.py --out dist
 ```
 
-Builds set a stable `SOURCE_DATE_EPOCH`, pin setuptools to an exact build requirement, and
-write ZIPs with normalized timestamps/modes so consecutive builds produce matching SHA-256 for
-the wheel and both ZIPs. A `release-manifest.json` records name/version/size/SHA-256 for each
-publishable artifact and is verified before the build finishes.
-
-**Deferred (Phase 0.1 incomplete):** non-core per-platform `--hash` lockfiles for bleak/PyYAML
-transitive wheels remain a follow-up; only the core wheel is hash-locked in the Skill bundle today.
+Builds require the committed runtime lock, set a stable `SOURCE_DATE_EPOCH`, pin setuptools to an
+exact build requirement, and write ZIPs with normalized timestamps/modes so consecutive builds
+produce matching SHA-256 for the wheel and both ZIPs. A `release-manifest.json` records
+name/version/size/SHA-256 for each publishable artifact and is verified before the build finishes.
 
 This writes to `dist/` (gitignored):
 
@@ -325,7 +346,7 @@ This writes to `dist/` (gitignored):
 | --- | --- |
 | `xbloom_studio_core-<ver>-*.whl` | Installable core library + `xbloom-bridge` |
 | `knowledge-<ver>/` + `.zip` | `SKILL.md` + `references/` + `assets/` with `manifest.json` (per-file SHA-256 + aggregate content hash) |
-| `skill-xbloom-studio-brew-<ver>/` + `.zip` | Self-contained Skill including `vendor/wheels/` core wheel + `vendor/release.json` |
+| `skill-xbloom-studio-brew-<ver>/` + `.zip` | Self-contained Skill: vendored core wheel, `requirements-runtime.lock`, `vendor/release.json` |
 | `release-manifest.json` | Deterministic name/version/size/SHA-256 for every publishable wheel/ZIP |
 
 Verify a built wheel:

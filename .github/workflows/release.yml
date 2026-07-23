@@ -1,0 +1,221 @@
+name: release
+
+# Publish GitHub Release artifacts only from an explicit version tag.
+# Does not publish arbitrary branch builds.
+# Cross-platform validation (test.yml matrix) must succeed before publish.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to release (must match v + packages/core version, e.g. v1.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: resolve release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      # Validate the release tag format before any checkout. Untrusted dispatch
+      # input is only read via env (never interpolated into shell source).
+      # Tag existence is enforced later by checkout of the resolved ref.
+      - name: Resolve and verify release tag
+        id: tag
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAG="${INPUT_TAG}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          if [ -z "${TAG}" ]; then
+            echo "empty release tag" >&2
+            exit 1
+          fi
+          # Fail closed: only exact v* version tags (no paths/refs tricks).
+          if ! [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]]; then
+            printf 'refusing non-version tag: %s\n' "${TAG}" >&2
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "Using release tag: ${TAG}"
+
+  validate:
+    name: cross-platform validation
+    needs: resolve
+    uses: ./.github/workflows/test.yml
+    with:
+      ref: ${{ needs.resolve.outputs.tag }}
+    permissions:
+      contents: read
+
+  publish:
+    name: build and publish GitHub Release
+    needs: [resolve, validate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Checkout the exact resolved tag. Fails closed if the tag does not exist.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            packages/core/pyproject.toml
+            skills/xbloom-studio-brew/requirements-runtime.lock
+
+      - name: Verify tag matches packages/core version
+        shell: bash
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION=$(python -c "import re,pathlib; t=pathlib.Path('packages/core/pyproject.toml').read_text(); print(re.search(r'^version\s*=\s*\"([^\"]+)\"', t, re.M).group(1))")
+          EXPECTED="v${VERSION}"
+          if [ "${TAG}" != "${EXPECTED}" ]; then
+            echo "tag ${TAG} does not equal v + packages/core version (${EXPECTED})" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_ENV}"
+          echo "Tag ${TAG} matches core version ${VERSION}"
+
+      - name: Install uv 0.11.28
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check "uv==0.11.28"
+          uv --version | grep -F "0.11.28"
+
+      - name: Check universal runtime lock
+        run: python tools/update_runtime_lock.py --check
+
+      - name: Build release artifacts
+        env:
+          SOURCE_DATE_EPOCH: "1704067200"
+          PYTHONHASHSEED: "0"
+        run: python tools/build_release.py --out dist
+
+      - name: Verify release-manifest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f dist/release-manifest.json
+          python -c "
+          import importlib.util, pathlib
+          path = pathlib.Path('tools/build_release.py')
+          spec = importlib.util.spec_from_file_location('build_release', path)
+          mod = importlib.util.module_from_spec(spec)
+          assert spec and spec.loader
+          spec.loader.exec_module(mod)
+          mod.verify_release_manifest(pathlib.Path('dist'))
+          print('release-manifest.json verified')
+          "
+
+      - name: Extracted Skill bootstrap / doctor / validate smoke
+        env:
+          XBLOOM_STATE_DIR: ${{ runner.temp }}/xbloom-release-state
+          XBLOOM_SKILL_RUNTIME_DIR: ${{ runner.temp }}/xbloom-release-runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${VERSION}"
+          SKILL_ZIP="dist/skill-xbloom-studio-brew-${VERSION}.zip"
+          test -f "${SKILL_ZIP}"
+          EXTRACT_ROOT="${RUNNER_TEMP}/xbloom-skill-release-smoke"
+          rm -rf "${EXTRACT_ROOT}"
+          mkdir -p "${EXTRACT_ROOT}"
+          python -c "
+          import sys, zipfile
+          from pathlib import Path
+          zpath, dest = Path(sys.argv[1]), Path(sys.argv[2])
+          with zipfile.ZipFile(zpath) as zf:
+              for info in zf.infolist():
+                  name = info.filename.replace('\\\\', '/')
+                  if name.startswith('/') or '..' in Path(name).parts:
+                      raise SystemExit(f'unsafe zip member: {info.filename!r}')
+              zf.extractall(dest)
+          " "${SKILL_ZIP}" "${EXTRACT_ROOT}"
+          cd "${EXTRACT_ROOT}"
+          test -f requirements-runtime.lock
+          test -f vendor/release.json
+          ! grep -q '^\s*-e ' requirements.txt
+          ! test -e packages
+          python scripts/bootstrap.py
+          python scripts/xbloom.py doctor
+          python scripts/xbloom.py validate assets/hot-template.yaml
+
+      - name: Collect publishable artifacts (fail closed)
+        id: artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${VERSION}"
+          shopt -s nullglob
+          WHEELS=(dist/xbloom_studio_core-${VERSION}-*.whl)
+          if [ "${#WHEELS[@]}" -ne 1 ]; then
+            echo "expected exactly one core wheel for ${VERSION}, found ${#WHEELS[@]}" >&2
+            ls -la dist/ || true
+            exit 1
+          fi
+          KNOWLEDGE="dist/knowledge-${VERSION}.zip"
+          SKILL="dist/skill-xbloom-studio-brew-${VERSION}.zip"
+          MANIFEST="dist/release-manifest.json"
+          NOTES="dist/RELEASE-${VERSION}.txt"
+          for path in "${WHEELS[0]}" "${KNOWLEDGE}" "${SKILL}" "${MANIFEST}" "${NOTES}"; do
+            if [ ! -f "${path}" ]; then
+              echo "missing required artifact: ${path}" >&2
+              exit 1
+            fi
+          done
+          # Publish only the closed set (not dist trees or unverified extras).
+          {
+            echo "wheel=${WHEELS[0]}"
+            echo "knowledge=${KNOWLEDGE}"
+            echo "skill=${SKILL}"
+            echo "manifest=${MANIFEST}"
+            echo "notes=${NOTES}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Create GitHub Release and upload artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          NOTES: ${{ steps.artifacts.outputs.notes }}
+          WHEEL: ${{ steps.artifacts.outputs.wheel }}
+          KNOWLEDGE: ${{ steps.artifacts.outputs.knowledge }}
+          SKILL: ${{ steps.artifacts.outputs.skill }}
+          MANIFEST: ${{ steps.artifacts.outputs.manifest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${VERSION}"
+          # Non-draft, non-prerelease; notes from generated RELEASE-version.txt.
+          # Fail closed if the release already exists with different assets.
+          # --verify-tag: refuse to create a tag from default branch if missing.
+          # Assets: wheel, knowledge zip, Skill zip, release-manifest only.
+          # NOTES is used with --notes-file and is not uploaded as a release asset.
+          gh release create "${TAG}" \
+            --verify-tag \
+            --title "xbloom-studio-brew ${VERSION}" \
+            --notes-file "${NOTES}" \
+            "${WHEEL}" \
+            "${KNOWLEDGE}" \
+            "${SKILL}" \
+            "${MANIFEST}"

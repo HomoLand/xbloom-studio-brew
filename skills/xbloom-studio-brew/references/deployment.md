@@ -76,32 +76,33 @@ run bootstrap once to migrate, then remove that legacy directory only after `doc
 Bootstrap uses only the Python standard library until dependencies are installed, so it can run
 before `xbloom-studio-core` is present. It then chooses one of two layouts:
 
-| Layout | How detected | Core install |
+| Layout | How detected | Install path |
 | --- | --- | --- |
-| Development (repo checkout) | `requirements.txt` contains `-e ../../packages/core` and no release evidence | editable install of sibling `packages/core` |
-| Release (GitHub Skill bundle) | `vendor/release.json` present, **or** a vendored `vendor/wheels/xbloom_studio_core-*.whl` | install the exact hashed wheel from `vendor/release.json` / `vendor/wheels/` with `pip install --no-deps --no-index <wheel>`, then pinned non-core deps |
+| Development (repo checkout) | `requirements.txt` contains `-e ../../packages/core` and no release evidence | editable install of sibling `packages/core` (and optional dev extras) |
+| Release (GitHub Skill bundle) | `vendor/release.json` present, **or** a vendored `vendor/wheels/xbloom_studio_core-*.whl` | (1) exact hashed core wheel offline `--no-deps --no-index`; (2) non-core only via `pip install --only-binary :all: --require-hashes -r requirements-runtime.lock` |
 
 Do not rely on a sibling monorepo checkout for release installs. The published Skill bundle carries
-the exact core wheel it needs under `vendor/wheels/`. Bootstrap reads `vendor/release.json` for
-`core_version`, `core_wheel`, and `core_wheel_sha256`. When that file is present it is parsed
-strictly and fail-closed: malformed JSON, wrong types, `layout` other than `release`, version
-mismatch, unsafe `core_wheel` (must be basename-only matching
-`xbloom_studio_core-<version>-*.whl`, resolve as a direct child of `vendor/wheels/`, no `..` /
-absolute paths / slash ambiguity), or a bad hash all abort before `pip` runs. There is no soft
-fallback when metadata exists but is invalid.
+the exact core wheel under `vendor/wheels/` and the universal hashed runtime lock
+`requirements-runtime.lock` at the Skill root. Bootstrap reads `vendor/release.json` for
+`core_version`, `core_wheel`, `core_wheel_sha256`, `runtime_lock`, and `runtime_lock_sha256`.
+When that file is present it is parsed strictly and fail-closed: malformed JSON, wrong types,
+`layout` other than `release`, version mismatch, unsafe basenames (wheel under `vendor/wheels/`,
+lock as a direct child of the Skill root named exactly `requirements-runtime.lock`; no `..` /
+absolute paths / slash ambiguity), missing files, or bad hashes all abort **before any `pip`
+invocation**. There is no soft fallback when metadata exists but is invalid, and no line-to-args
+install of unhashed `requirements.txt` pins in release layout.
 
 **Damaged-bundle fail-closed:** if a vendored `xbloom_studio_core-*.whl` remains but
 `vendor/release.json` is missing (or unreadable), layout detection still classifies the Skill as
 **release** so bootstrap never falls through to development editable install or PyPI core install.
-Install then **requires** valid `vendor/release.json` and aborts **before any `pip` invocation**
-when that metadata is missing — it will not install an unhashed fallback wheel.
+Install then **requires** valid `vendor/release.json` (wheel + lock fields) and aborts **before
+any `pip` invocation** when that metadata is missing.
 
-**Air-gapped hosts:** only **core** is installed offline from the bundle. `bleak` and `PyYAML` still
-need network (or a pre-populated pip cache) unless you mirror those wheels yourself. Universal
-`--hash` lockfiles for non-core deps are deferred because transitive wheels differ by platform
-(winrt-*, dbus-fast, etc.). **Phase 0.1 is not fully complete** until per-platform non-core hash
-lockfiles are generated in CI; core integrity is already bound by the vendored wheel plus
-`core_wheel_sha256`.
+**Air-gapped hosts:** **core** is installed offline from the bundle. Non-core packages still need
+network (or a pre-populated pip cache of the wheels listed in `requirements-runtime.lock`). The
+universal hashed lock covers Linux (`dbus-fast`), macOS (PyObjC), and Windows (WinRT) markers in
+one file; regenerate with `python tools/update_runtime_lock.py --update` (uv 0.11.28) from the
+repo root and verify with `--check`.
 
 ## Build and release artifacts
 
@@ -113,12 +114,20 @@ python tools/build_release.py
 python tools/build_release.py --out dist
 ```
 
-`tools/build_release.py` aims for byte-for-byte reproducible wheel and ZIP digests by fixing
-`SOURCE_DATE_EPOCH` (default `1704067200` unless already set), pinning the setuptools build
-requirement to an exact version, and writing ZIPs with explicit `ZipInfo` (normalized timestamp,
-Unix file mode, sorted members, `ZIP_DEFLATED` at a fixed compression level). A
-`release-manifest.json` lists `name`, `version`, `size`, and SHA-256 for every publishable
-wheel/ZIP and is verified before the build reports success (the manifest does not list itself).
+`tools/build_release.py` requires the committed universal runtime lock, aims for byte-for-byte
+reproducible wheel and ZIP digests by fixing `SOURCE_DATE_EPOCH` (default `1704067200` unless
+already set), pinning the setuptools build requirement to an exact version, and writing ZIPs with
+explicit `ZipInfo` (normalized timestamp, Unix file mode, sorted members, `ZIP_DEFLATED` at a fixed
+compression level). A `release-manifest.json` lists `name`, `version`, `size`, and SHA-256 for
+every publishable wheel/ZIP and is verified before the build reports success (the manifest does not
+list itself).
+
+Tag-driven GitHub Release publish is implemented in `.github/workflows/release.yml` (push of `v*`
+tags, or `workflow_dispatch` with an explicit version tag that must equal `v` +
+`packages/core` version). The workflow checks the lock, builds artifacts, verifies the manifest,
+smoke-tests extracted Skill bootstrap/doctor/validate, then uploads exactly the core wheel,
+knowledge zip, Skill zip, and `release-manifest.json`. Having the workflow in the repository does
+not mean a Release has been published yet.
 
 Outputs under `dist/`:
 
@@ -128,11 +137,19 @@ Outputs under `dist/`:
   aggregate content hash). Validate with `xbloom_knowledge.validate_bundle(...)` (rejects path
   traversal, missing/tampered files, and extra on-disk knowledge files).
 - `skill-xbloom-studio-brew-<version>/` and `.zip` - self-contained Skill with
-  `vendor/wheels/` holding that same core wheel, `vendor/release.json` (includes
-  `core_wheel_sha256`), and a non-editable `requirements.txt` (exact `==` pins for non-core deps;
-  full hash locks deferred per platform — Phase 0.1 incomplete for non-core locks)
+  `vendor/wheels/` holding that same core wheel, byte-identical `requirements-runtime.lock`,
+  `vendor/release.json` (`core_wheel` / `core_wheel_sha256` / `runtime_lock` /
+  `runtime_lock_sha256`), and a non-editable `requirements.txt` that records only the exact core
+  version as source identity (bootstrap does not pip-install non-core pins from it)
 - `release-manifest.json` - deterministic per-artifact name/version/size/SHA-256 for the wheel and
   both ZIPs (excludes the manifest itself)
+
+Maintain the lock from the repository root:
+
+```text
+python tools/update_runtime_lock.py --update
+python tools/update_runtime_lock.py --check
+```
 
 Clean-install check for a release Skill ZIP (extract outside the checkout; do not use the
 `dist/skill-.../` tree as a substitute for the published ZIP):
@@ -288,15 +305,19 @@ cloud tokens, or recipes containing private purchase/account data.
 ## Release checklist
 
 1. Run `python scripts/bootstrap.py --dev` on a clean checkout.
-2. Run `python tools/build_release.py` from the repository root; confirm `dist/` contains the core
-   wheel, knowledge bundle (valid `manifest.json`), Skill bundle with `vendor/wheels/`, and a
+2. Run `python tools/update_runtime_lock.py --check`, then `python tools/build_release.py` from the
+   repository root; confirm `dist/` contains the core wheel, knowledge bundle (valid
+   `manifest.json`), Skill bundle with `vendor/wheels/` + `requirements-runtime.lock`, and a
    verified `release-manifest.json`. Confirm two consecutive builds with the same
    `SOURCE_DATE_EPOCH` produce matching SHA-256 for the wheel and both ZIPs.
-3. In a clean venv, install the built core wheel and invoke `xbloom-bridge --help`.
+3. In a clean venv, install the built core wheel offline (`--no-deps --no-index`), then non-core
+   deps with `--require-hashes -r skills/xbloom-studio-brew/requirements-runtime.lock`, and invoke
+   `xbloom-bridge --help`.
 4. Extract `dist/skill-xbloom-studio-brew-<version>.zip` into a fresh temporary directory **outside**
    the checkout (not the `dist/skill-.../` tree), run `python scripts/bootstrap.py`, then `doctor`
    and `validate` without a sibling `packages/core` checkout. Confirm `vendor/release.json`
-   `core_wheel_sha256` matches the vendored wheel.
+   `core_wheel_sha256` matches the vendored wheel and `runtime_lock_sha256` matches
+   `requirements-runtime.lock`.
 5. Run the Agent Skills structural validator.
 6. Inspect `git diff` for addresses, serials, tokens, and packet captures.
 7. Import scripted coffee, tea, Easy, xPod, and J20 JSON fixtures; mock all five own-account recipe

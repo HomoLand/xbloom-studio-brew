@@ -141,7 +141,10 @@ For a scale, grinder, or water request, also read `references/standalone-tools.m
 `references/tea-brewing.md`.
 
 Bootstrap once per user/Agent environment. The virtual environment is stored in the writable
-state directory, not inside the installed Skill, so upgrades and read-only package caches are safe:
+state directory, not inside the installed Skill, so upgrades and read-only package caches are safe.
+Release bundles install the exact vendored core wheel offline, then non-core deps from the
+universal hashed `requirements-runtime.lock` (`pip --require-hashes`); see
+`references/deployment.md`.
 
 ```text
 python <skill-dir>/scripts/bootstrap.py

@@ -391,17 +391,21 @@ LAN 模式规则：
 
 **任务**：
 - 0.1 完善 `xbloom-studio-core` 包元数据、版本策略和 `xbloom-bridge` console entry；开发依赖可 editable，release 依赖必须固定版本与 hash。
+  - **已完成（本仓库代码）**：core 元数据 + console entry；开发 `-e packages/core`；release 用 vendored wheel（`core_wheel_sha256`）+ 单一 universal `requirements-runtime.lock`（`--require-hashes`，排除 core；uv 0.11.28 生成；`tools/update_runtime_lock.py` update/check）。不代表远端已跑 CI 或已有 GitHub Release 资产。
 - 0.2 release build 从唯一 knowledge 源生成 self-contained Skill bundle 与 versioned knowledge bundle，写入 manifest、knowledge version 和内容 hash。
+  - **已完成（本仓库代码）**：`tools/build_release.py` 产出 core wheel、knowledge zip（manifest/hash）、Skill zip（含 lock + `vendor/release.json`）、`release-manifest.json`；可复现 ZIP；tag 驱动的 `.github/workflows/release.yml` 已写入（校验 tag=`v`+core version、check lock、构建、smoke bootstrap、上传封闭产物集）。**未**声称已有已发布 Release。
 - 0.3 引入 `XBLOOM_STATE_DIR` 与 `state.db`；为 catalog、recipe revisions、workflows、events、idempotency、migrations 建 schema。
 - 0.4 编写一次性迁移：导入现有 `catalog.json`、`brew-history.jsonl` 和恢复记录；迁移前备份，失败可回滚且不删除原文件。
 - 0.5 daemon 使用 OS 生命周期锁；`bridge.json` 写 instance/core/protocol/config 信息，实现 `hello` 兼容握手与 stale record 清理。
 - 0.6 core 提供受控 bridge 启动/停止/空闲重启 API；Web 不再查找 Skill 的 `xbloom.py` 来启动 daemon。
 - 0.7 Skill bootstrap 不在安装 core 前导入 core；分别验证仓库 checkout、仅 Skill 发布包、仅 Web 发布包三种 clean install。
+  - **已完成（本仓库 Skill 侧）**：stdlib-only bootstrap；release 严格校验 wheel+lock 后再 pip；extracted Skill ZIP 无 sibling checkout。Web 侧 clean install 仍在 sibling Web 仓库范围。
 - 0.8 建立跨平台 CI：Windows、macOS、Linux 执行 build、安装、迁移、单实例竞争和协议兼容测试。
+  - **已完成（workflow 定义）**：`.github/workflows/test.yml` 含三 OS 全量测试与 release-artifacts（uv lock check、offline core + hashed lock install、extracted Skill bootstrap）。**未**声称远端 CI 已实际跑通本次变更。
 
 **验收**：仅拿 Skill 发布包即可 bootstrap/doctor/validate；Web 只安装固定 core + knowledge 产物即可启动；两个并发启动者最终只有一个 bridge；旧 JSON/JSONL 数据无损进入 SQLite；不兼容客户端在任何 BLE 写之前被拒绝。
 
-**影响文件**：core `pyproject.toml`、storage/migration 模块、bridge launcher、Skill bootstrap/requirements、Web requirements/startup、release workflow。
+**影响文件**：core `pyproject.toml`、storage/migration 模块、bridge launcher、Skill bootstrap/requirements/runtime lock、Web requirements/startup、release workflow。
 
 ### Phase A — 工作流级连接生命周期（core）
 

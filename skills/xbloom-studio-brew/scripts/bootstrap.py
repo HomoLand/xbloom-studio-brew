@@ -26,6 +26,9 @@ DEFAULT_STATE_DIRNAME = ".xbloom-studio-brew"
 ROOT = Path(__file__).resolve().parents[1]
 VENDOR_WHEELS = ROOT / "vendor" / "wheels"
 RELEASE_META = ROOT / "vendor" / "release.json"
+# Universal hashed non-core runtime lock (committed; copied into Skill releases).
+RUNTIME_LOCK_BASENAME = "requirements-runtime.lock"
+RUNTIME_LOCK_PATH = ROOT / RUNTIME_LOCK_BASENAME
 
 # Basename-only wheel name: xbloom_studio_core-<version>-<tags>.whl
 _CORE_WHEEL_NAME_RE = re.compile(
@@ -172,15 +175,79 @@ def _validate_release_meta(
             f"(refusing to install a tampered wheel)"
         )
 
+    runtime_lock = data.get("runtime_lock")
+    if not isinstance(runtime_lock, str) or not runtime_lock:
+        raise ReleaseMetaError(
+            f"{meta_path}: runtime_lock must be a non-empty string"
+        )
+    _assert_safe_runtime_lock_basename(runtime_lock, meta_path=meta_path)
+
+    runtime_lock_sha256 = data.get("runtime_lock_sha256")
+    if not isinstance(runtime_lock_sha256, str) or not _SHA256_HEX_RE.fullmatch(
+        runtime_lock_sha256
+    ):
+        raise ReleaseMetaError(
+            f"{meta_path}: runtime_lock_sha256 must be a 64-char lowercase hex string"
+        )
+
+    # Resolve lock as a direct child of the Skill root (reject traversal / abs).
+    skill_root_resolved = skill_root.resolve()
+    lock_candidate = (skill_root / runtime_lock).resolve()
+    if lock_candidate.parent != skill_root_resolved:
+        raise ReleaseMetaError(
+            f"{meta_path}: runtime_lock resolves outside Skill root: {runtime_lock!r}"
+        )
+    if not lock_candidate.is_file():
+        raise ReleaseMetaError(
+            f"{meta_path}: runtime_lock file not found: {lock_candidate.name}"
+        )
+    lock_actual = _sha256_file(lock_candidate)
+    if lock_actual != runtime_lock_sha256:
+        raise ReleaseMetaError(
+            f"{meta_path}: runtime_lock_sha256 mismatch for {runtime_lock}: "
+            f"expected {runtime_lock_sha256}, got {lock_actual} "
+            f"(refusing to install from a tampered lock)"
+        )
+
     # Return a cleaned copy with normalized strings.
     cleaned = dict(data)
     cleaned["layout"] = "release"
     cleaned["core_version"] = core_version
     cleaned["core_wheel"] = core_wheel
     cleaned["core_wheel_sha256"] = core_wheel_sha256
+    cleaned["runtime_lock"] = runtime_lock
+    cleaned["runtime_lock_sha256"] = runtime_lock_sha256
     if version is not None:
         cleaned["version"] = core_version
     return cleaned
+
+
+def _assert_safe_basename_field(
+    name: str, field: str, *, meta_path: Path
+) -> None:
+    """Reject path separators, absolute paths, traversal, and hidden basenames."""
+
+    if not name or name.strip() != name:
+        raise ReleaseMetaError(
+            f"{meta_path}: {field} must be a basename with no surrounding whitespace"
+        )
+    if name != Path(name).name:
+        raise ReleaseMetaError(
+            f"{meta_path}: {field} must be basename-only, got {name!r}"
+        )
+    if "/" in name or "\\" in name:
+        raise ReleaseMetaError(
+            f"{meta_path}: {field} must not contain path separators, got {name!r}"
+        )
+    if ".." in name or name.startswith(".") or name.startswith("~"):
+        raise ReleaseMetaError(
+            f"{meta_path}: {field} rejects traversal/hidden names, got {name!r}"
+        )
+    # Reject absolute Windows/Unix forms that Path.name alone may not catch.
+    if re.match(r"^[A-Za-z]:", name) or name.startswith(("/", "\\")):
+        raise ReleaseMetaError(
+            f"{meta_path}: {field} must not be absolute, got {name!r}"
+        )
 
 
 def _assert_safe_core_wheel_basename(
@@ -188,27 +255,7 @@ def _assert_safe_core_wheel_basename(
 ) -> None:
     """Reject path separators, absolute paths, traversal, and pattern mismatch."""
 
-    if not name or name.strip() != name:
-        raise ReleaseMetaError(
-            f"{meta_path}: core_wheel must be a basename with no surrounding whitespace"
-        )
-    if name != Path(name).name:
-        raise ReleaseMetaError(
-            f"{meta_path}: core_wheel must be basename-only, got {name!r}"
-        )
-    if "/" in name or "\\" in name:
-        raise ReleaseMetaError(
-            f"{meta_path}: core_wheel must not contain path separators, got {name!r}"
-        )
-    if ".." in name or name.startswith(".") or name.startswith("~"):
-        raise ReleaseMetaError(
-            f"{meta_path}: core_wheel rejects traversal/hidden names, got {name!r}"
-        )
-    # Reject absolute Windows/Unix forms that Path.name alone may not catch.
-    if re.match(r"^[A-Za-z]:", name) or name.startswith(("/", "\\")):
-        raise ReleaseMetaError(
-            f"{meta_path}: core_wheel must not be absolute, got {name!r}"
-        )
+    _assert_safe_basename_field(name, "core_wheel", meta_path=meta_path)
     match = _CORE_WHEEL_NAME_RE.fullmatch(name)
     if match is None:
         raise ReleaseMetaError(
@@ -225,6 +272,17 @@ def _assert_safe_core_wheel_basename(
         raise ReleaseMetaError(
             f"{meta_path}: core_wheel must match "
             f"{expected_prefix}*.whl, got {name!r}"
+        )
+
+
+def _assert_safe_runtime_lock_basename(name: str, *, meta_path: Path) -> None:
+    """Require the fixed lock basename under the Skill root (no path tricks)."""
+
+    _assert_safe_basename_field(name, "runtime_lock", meta_path=meta_path)
+    if name != RUNTIME_LOCK_BASENAME:
+        raise ReleaseMetaError(
+            f"{meta_path}: runtime_lock must be exactly {RUNTIME_LOCK_BASENAME!r}, "
+            f"got {name!r}"
         )
 
 
@@ -282,6 +340,27 @@ def _release_core_wheel(skill_root: Path | None = None) -> Path | None:
     matches = sorted(wheels_dir.glob("xbloom_studio_core-*.whl"))
     if len(matches) == 1:
         return matches[0]
+    return None
+
+
+def _release_runtime_lock(skill_root: Path | None = None) -> Path | None:
+    """Return the universal hashed runtime lock path for a release layout.
+
+    When ``vendor/release.json`` exists, validation has already checked
+    basename, parent, existence, and SHA-256. Without metadata, return the
+    fixed basename under the Skill root when present (install still requires
+    valid release.json).
+    """
+
+    root = ROOT if skill_root is None else Path(skill_root)
+    meta = _load_release_meta(root)
+    if meta is not None:
+        named = meta["runtime_lock"]
+        assert isinstance(named, str)
+        return (root / named).resolve()
+    candidate = root / RUNTIME_LOCK_BASENAME
+    if candidate.is_file():
+        return candidate.resolve()
     return None
 
 
@@ -365,33 +444,39 @@ def run(args: list[str], *, env: dict[str, str] | None = None) -> None:
 
 
 def _install_release(python: str) -> None:
-    """Install the bundled core wheel offline, then pinned non-core deps.
+    """Install the bundled core wheel offline, then hashed non-core deps.
 
-    Valid ``vendor/release.json`` is mandatory. A damaged bundle that still has
-    a vendored core wheel is classified as release, but install aborts before
-    any pip invocation when metadata is missing (no unhashed fallback wheel,
-    no development/PyPI fall-through).
+    Valid ``vendor/release.json`` is mandatory (wheel + universal runtime lock
+    fields, basenames, hashes). A damaged bundle that still has a vendored core
+    wheel is classified as release, but install aborts before any pip invocation
+    when metadata is missing or invalid (no unhashed fallback wheel, no
+    requirements.txt line-to-args fallback, no development/PyPI core fall-through).
     """
 
-    # Require validated release metadata before any pip/run call.
+    # Require validated release metadata (wheel + lock) before any pip/run call.
     meta = _load_release_meta()
     if meta is None:
         raise SystemExit(
             "release layout requires vendor/release.json with core_wheel + "
-            "core_wheel_sha256; refusing unhashed wheel install and "
-            "development/PyPI fall-through"
+            "core_wheel_sha256 + runtime_lock + runtime_lock_sha256; "
+            "refusing unhashed wheel install and development/PyPI fall-through"
         )
 
     wheels = VENDOR_WHEELS
     if not wheels.is_dir():
         raise SystemExit(f"release layout missing vendor wheels directory: {wheels}")
 
-    # Strict release.json is required; hash is checked inside _load_release_meta.
+    # Strict release.json is required; wheel + lock hashes checked in meta load.
     wheel = _release_core_wheel()
+    lock = _release_runtime_lock()
     version = _release_core_version()
     if wheel is None:
         raise SystemExit(
             f"release layout missing xbloom_studio_core wheel under {wheels}"
+        )
+    if lock is None:
+        raise SystemExit(
+            f"release layout missing {RUNTIME_LOCK_BASENAME} under Skill root"
         )
     if version is None:
         raise SystemExit(
@@ -399,8 +484,7 @@ def _install_release(python: str) -> None:
             f"(vendor/release.json or xbloom-studio-core==... in requirements.txt)"
         )
 
-    # Install the exact vendored wheel path (no name resolution / PyPI).
-    # --no-index keeps the install offline for core; --no-deps defers bleak/PyYAML.
+    # 1) Exact vendored core wheel (offline, no deps, no index / name resolution).
     print(f"Installing core from {wheel.name} (xbloom-studio-core=={version})")
     run(
         [
@@ -414,31 +498,26 @@ def _install_release(python: str) -> None:
             str(wheel),
         ]
     )
-    # Non-core runtime deps: exact pins from requirements.txt (may use network).
-    # Filter out the core line so pip does not try to re-resolve core from PyPI.
-    # Per-platform --hash lockfiles for bleak/PyYAML remain deferred (Phase 0.1).
-    req_path = ROOT / "requirements.txt"
-    filtered: list[str] = []
-    for line in req_path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if stripped.lower().startswith("xbloom-studio-core"):
-            continue
-        if stripped.startswith("-e "):
-            continue
-        filtered.append(stripped)
-    if filtered:
-        run(
-            [
-                python,
-                "-m",
-                "pip",
-                "install",
-                "--disable-pip-version-check",
-                *filtered,
-            ]
-        )
+    # 2) Non-core runtime deps only via the universal hashed lock.
+    # Never parse lock/requirements lines into positional pip args.
+    # Never fall back to unhashed requirements.txt or PyPI core.
+    # --only-binary :all: avoids unhashed PEP 517 build deps (all locked
+    # packages publish wheels for supported platforms).
+    print(f"Installing non-core runtime deps from {lock.name} (--require-hashes)")
+    run(
+        [
+            python,
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--only-binary",
+            ":all:",
+            "--require-hashes",
+            "-r",
+            str(lock),
+        ]
+    )
 
 
 def _install_dev(python: str, *, dev: bool) -> None:

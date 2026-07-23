@@ -44,6 +44,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CORE_DIR = REPO_ROOT / "packages" / "core"
 SKILL_DIR = REPO_ROOT / "skills" / "xbloom-studio-brew"
 DEFAULT_OUT = REPO_ROOT / "dist"
+RUNTIME_LOCK_BASENAME = "requirements-runtime.lock"
+RUNTIME_LOCK_PATH = SKILL_DIR / RUNTIME_LOCK_BASENAME
 
 # Fixed epoch for reproducible wheel/ZIP timestamps when the environment does
 # not already provide SOURCE_DATE_EPOCH (Unix time, 2024-01-01T00:00:00Z).
@@ -213,8 +215,50 @@ def _should_copy_skill_path(rel: Path) -> bool:
     return True
 
 
+def require_runtime_lock() -> Path:
+    """Require the committed universal hashed runtime lock before packaging."""
+
+    if not RUNTIME_LOCK_PATH.is_file():
+        raise RuntimeError(
+            f"missing committed runtime lock: {RUNTIME_LOCK_PATH}\n"
+            "Generate with: python tools/update_runtime_lock.py --update\n"
+            "Verify with:   python tools/update_runtime_lock.py --check"
+        )
+    text = RUNTIME_LOCK_PATH.read_text(encoding="utf-8")
+    if "xbloom-studio-core" in text.lower() or "xbloom_studio_core" in text.lower():
+        raise RuntimeError(
+            f"{RUNTIME_LOCK_PATH.name} must exclude xbloom-studio-core "
+            "(core is the vendored wheel, not a lock entry)"
+        )
+    if "--hash=sha256:" not in text:
+        raise RuntimeError(
+            f"{RUNTIME_LOCK_PATH.name} must contain sha256 hashes "
+            "(regenerate with uv --generate-hashes)"
+        )
+    # Require at least the direct core deps and one platform-marker family.
+    lowered = text.lower()
+    for required in ("bleak==", "pyyaml==", "typing-extensions=="):
+        if required not in lowered:
+            raise RuntimeError(
+                f"{RUNTIME_LOCK_PATH.name} missing expected pin: {required}"
+            )
+    if "sys_platform == 'linux'" not in text and 'sys_platform == "linux"' not in text:
+        raise RuntimeError(
+            f"{RUNTIME_LOCK_PATH.name} missing Linux platform markers (dbus-fast)"
+        )
+    if "sys_platform == 'darwin'" not in text and 'sys_platform == "darwin"' not in text:
+        raise RuntimeError(
+            f"{RUNTIME_LOCK_PATH.name} missing macOS platform markers (PyObjC)"
+        )
+    if "sys_platform == 'win32'" not in text and 'sys_platform == "win32"' not in text:
+        raise RuntimeError(
+            f"{RUNTIME_LOCK_PATH.name} missing Windows platform markers (WinRT)"
+        )
+    return RUNTIME_LOCK_PATH
+
+
 def build_skill_bundle(
-    out_dir: Path, version: str, wheel: Path, *, epoch: int
+    out_dir: Path, version: str, wheel: Path, *, epoch: int, runtime_lock: Path
 ) -> Path:
     bundle_dir = out_dir / f"skill-xbloom-studio-brew-{version}"
     if bundle_dir.exists():
@@ -231,33 +275,51 @@ def build_skill_bundle(
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, dest)
 
-    # Release requirements: bootstrap installs the exact vendored core wheel path
-    # offline; non-core deps use exact version pins from this file (network OK).
-    #
-    # Hash pinning for bleak/PyYAML is intentionally deferred: PyYAML ships
-    # platform-tagged wheels and bleak pulls OS-specific transitive deps
-    # (winrt-*, dbus-fast, etc.). A single universal --hash requirements file
-    # cannot cover Windows/macOS/Linux cleanly. Core itself is integrity-bound
-    # by the exact wheel file under vendor/wheels/ plus core_wheel_sha256 in
-    # vendor/release.json (offline --no-index install). Non-core per-platform
-    # hash lockfiles remain deferred, so Phase 0.1 is not fully complete.
-    # Follow-up: per-platform lockfiles with hashes generated in CI.
+    # Assert the universal hashed lock is present in the bundle (normal tree
+    # copy should include it; fail closed if the exclude rules ever drop it).
+    bundled_lock = bundle_dir / RUNTIME_LOCK_BASENAME
+    if not bundled_lock.is_file():
+        shutil.copy2(runtime_lock, bundled_lock)
+    if not bundled_lock.is_file():
+        raise RuntimeError(
+            f"Skill bundle missing {RUNTIME_LOCK_BASENAME} after copy"
+        )
+    lock_bytes = runtime_lock.read_bytes()
+    if bundled_lock.read_bytes() != lock_bytes:
+        raise RuntimeError(
+            f"Skill bundle {RUNTIME_LOCK_BASENAME} is not byte-identical to "
+            f"the committed lock at {runtime_lock}"
+        )
+    lock_sha256 = sha256_file(bundled_lock)
+
+    # Release requirements.txt is source-identity only: exact core version for
+    # humans/tools. Bootstrap never pip-installs this file for non-core deps
+    # (those come only from requirements-runtime.lock with --require-hashes).
+    # Do not list unhashed bleak/PyYAML pins that would form a second contract.
     requirements = (
         f"# Release requirements for xbloom-studio-brew {version}\n"
-        f"# Core: exact wheel under vendor/wheels/ (bootstrap uses path + --no-index).\n"
-        f"# Non-core: exact version pins only; full --hash lockfiles are a follow-up\n"
-        f"# because bleak/PyYAML transitive wheels differ by platform.\n"
-        f"# Phase 0.1 is not fully complete until per-platform non-core hash locks land.\n"
+        f"#\n"
+        f"# Source identity: exact core version for this Skill release.\n"
+        f"# Bootstrap does NOT use this file to install packages in release layout.\n"
+        f"#\n"
+        f"# Core: exact wheel under vendor/wheels/ via\n"
+        f"#   pip install --no-deps --no-index <wheel>\n"
+        f"# after verifying core_wheel_sha256 in vendor/release.json.\n"
+        f"#\n"
+        f"# Non-core runtime dependencies (bleak, PyYAML, platform wheels):\n"
+        f"#   pip install --only-binary :all: --require-hashes -r {RUNTIME_LOCK_BASENAME}\n"
+        f"# Do not install unhashed pins from this file; do not resolve core from PyPI.\n"
         f"xbloom-studio-core=={version}\n"
-        f"bleak==3.0.2\n"
-        f"PyYAML==6.0.3\n"
     )
     (bundle_dir / "requirements.txt").write_text(requirements, encoding="utf-8")
 
-    # Dev requirements still layer pytest on top of release runtime pins.
+    # Dev extras only; release bootstrap --dev installs pytest after the
+    # integrity-bound runtime (does not pip -r this file for core/runtime).
     requirements_dev = (
-        "-r requirements.txt\n"
-        "pytest==9.1.1\n"
+        f"# Development extras for an extracted Skill release.\n"
+        f"# Runtime: bootstrap installs core wheel + {RUNTIME_LOCK_BASENAME} first.\n"
+        f"# Then: pip install pytest==9.1.1  (or: python scripts/bootstrap.py --dev)\n"
+        f"pytest==9.1.1\n"
     )
     (bundle_dir / "requirements-dev.txt").write_text(requirements_dev, encoding="utf-8")
 
@@ -272,6 +334,8 @@ def build_skill_bundle(
         "core_version": version,
         "core_wheel": wheel.name,
         "core_wheel_sha256": sha256_file(wheel),
+        "runtime_lock": RUNTIME_LOCK_BASENAME,
+        "runtime_lock_sha256": lock_sha256,
         "layout": "release",
     }
     (bundle_dir / "vendor" / "release.json").write_text(
@@ -489,13 +553,15 @@ def write_release_notes(out_dir: Path, version: str, wheel: Path, knowledge_dir:
         "  python scripts/xbloom.py validate assets/hot-template.yaml",
         "",
         "Dependency integrity notes:",
-        "  - Core is installed offline from vendor/wheels/<exact wheel> (--no-index)",
-        "    and verified via core_wheel_sha256 in vendor/release.json.",
-        "  - bleak/PyYAML use exact == pins; universal --hash lockfiles are deferred",
-        "    (platform-tagged transitive wheels). Per-platform hash locks: follow-up.",
-        "  - Non-core per-platform hash lockfiles remain deferred; Phase 0.1 is not",
-        "    fully complete until those land.",
-        "  - Non-core install still requires network unless wheels are pre-cached.",
+        "  - Core is the exact vendored wheel under vendor/wheels/ (pip install",
+        "    --no-deps --no-index <wheel>) verified by core_wheel_sha256 in",
+        "    vendor/release.json.",
+        "  - All non-core runtime dependencies install with:",
+        f"      pip install --only-binary :all: --require-hashes -r {RUNTIME_LOCK_BASENAME}",
+        "    The universal lock is integrity-bound by runtime_lock_sha256 in",
+        "    vendor/release.json (Linux dbus-fast / macOS PyObjC / Windows WinRT",
+        "    markers in one file). Non-core install needs network unless wheels",
+        "    are pre-cached.",
         "",
     ]
     notes.write_text("\n".join(lines), encoding="utf-8")
@@ -522,13 +588,21 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Building release artifacts for version {version} -> {out_dir}")
     print(f"  SOURCE_DATE_EPOCH={epoch}")
 
+    runtime_lock = require_runtime_lock()
+    print(
+        f"  runtime lock: {runtime_lock.relative_to(REPO_ROOT).as_posix()} "
+        f"(sha256={sha256_file(runtime_lock)[:12]}...)"
+    )
+
     wheel = build_core_wheel(out_dir, epoch=epoch)
     print(f"  core wheel: {wheel.name}")
 
     knowledge_dir = build_knowledge_bundle(out_dir, version, knowledge, epoch=epoch)
     print(f"  knowledge:  {knowledge_dir.name}/ and knowledge-{version}.zip")
 
-    skill_dir = build_skill_bundle(out_dir, version, wheel, epoch=epoch)
+    skill_dir = build_skill_bundle(
+        out_dir, version, wheel, epoch=epoch, runtime_lock=runtime_lock
+    )
     print(f"  skill:      {skill_dir.name}/ and skill-xbloom-studio-brew-{version}.zip")
 
     write_release_notes(out_dir, version, wheel, knowledge_dir)
