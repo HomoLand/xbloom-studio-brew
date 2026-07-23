@@ -1545,3 +1545,29 @@ def test_release_workflow_source_contracts():
         r"(?m)^\s*gh release create\b[\s\S]*?--verify-tag\b",
         create_tail,
     ), "gh release create must include --verify-tag"
+
+    # GITHUB_ENV / set -u version case consistency (v1.2.0 publish regression).
+    # Linux runners treat env names as case-sensitive: writing version= leaves VERSION
+    # unset under set -u and aborts collect/upload before gh release create.
+    assert re.search(
+        r'(?m)^\s*echo\s+"VERSION=\$\{VERSION\}"\s*>>\s*"\$\{GITHUB_ENV\}"\s*$',
+        text,
+    ), "publish must export uppercase VERSION to GITHUB_ENV for set -u consumers"
+    assert not re.search(
+        r'(?m)^\s*echo\s+"version=\$\{VERSION\}"\s*>>\s*"\$\{GITHUB_ENV\}"\s*$',
+        text,
+    ), "must not write lowercase version= to GITHUB_ENV (case mismatch with ${VERSION})"
+    # Downstream set -u publish bodies must read uppercase VERSION after the export.
+    version_export_idx = text.find('echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"')
+    assert version_export_idx != -1
+    after_export = text[version_export_idx:]
+    for needle in (
+        'VERSION="${VERSION}"',
+        "skill-xbloom-studio-brew-${VERSION}.zip",
+        "knowledge-${VERSION}.zip",
+        "xbloom_studio_core-${VERSION}-*.whl",
+        "RELEASE-${VERSION}.txt",
+    ):
+        assert needle in after_export, (
+            f"post-export publish path must use uppercase ${{VERSION}}: missing {needle!r}"
+        )

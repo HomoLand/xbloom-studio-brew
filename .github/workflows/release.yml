@@ -93,7 +93,8 @@ jobs:
             echo "tag ${TAG} does not equal v + packages/core version (${EXPECTED})" >&2
             exit 1
           fi
-          echo "version=${VERSION}" >> "${GITHUB_ENV}"
+          # Uppercase VERSION: later set -u steps read ${VERSION} (Linux env is case-sensitive).
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
           echo "Tag ${TAG} matches core version ${VERSION}"
 
       - name: Install uv 0.11.28
