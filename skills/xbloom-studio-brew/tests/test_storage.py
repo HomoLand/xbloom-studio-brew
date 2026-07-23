@@ -131,15 +131,22 @@ def test_legacy_migration_backup_hashes_and_idempotent(tmp_path):
         "source": "local-skill",
         "schema_version": 1,
     }
+    # One non-terminal recovery only (armed). Grinder rest is terminal cooldown.
+    # Multiple non-terminal recoveries roll back (see multi-active test).
     armed = {"phase": "armed", "recipe_sha256": "abc"}
+    grinder_rest = {
+        "in_progress": False,
+        "stopped_at": 1_700_000_000.0,
+        "blocked_until": 1_700_000_060.0,
+        "status": "rest",
+    }
     _write(
         tmp_path / "catalog" / "catalog.json",
         json.dumps(catalog, indent=2),
     )
     _write(tmp_path / "brew-history.jsonl", json.dumps(history_line) + "\n")
     _write(tmp_path / "armed-state.json", json.dumps(armed))
-    _write(tmp_path / "tea-loaded-state.json", json.dumps({"phase": "loaded"}))
-    _write(tmp_path / "grinder-rest-state.json", json.dumps({"status": "rest"}))
+    _write(tmp_path / "grinder-rest-state.json", json.dumps(grinder_rest))
 
     originals = {
         rel: (tmp_path / rel).read_bytes()
@@ -147,7 +154,6 @@ def test_legacy_migration_backup_hashes_and_idempotent(tmp_path):
             Path("catalog/catalog.json"),
             Path("brew-history.jsonl"),
             Path("armed-state.json"),
-            Path("tea-loaded-state.json"),
             Path("grinder-rest-state.json"),
         )
     }
@@ -160,7 +166,7 @@ def test_legacy_migration_backup_hashes_and_idempotent(tmp_path):
     backup_dir = Path(first["backup"]["backup_dir"])
     assert backup_dir.is_dir()
     manifest = json.loads((backup_dir / "MANIFEST.json").read_text(encoding="utf-8"))
-    assert manifest["file_count"] == 5
+    assert manifest["file_count"] == 4
     for item in manifest["files"]:
         rel = Path(item["relative_path"])
         copied = backup_dir / rel
@@ -176,6 +182,15 @@ def test_legacy_migration_backup_hashes_and_idempotent(tmp_path):
     assert store.count_legacy_imports("catalog") >= 1
     assert store.count_legacy_imports("history") >= 1
     assert store.count_legacy_imports("recovery_armed") == 1
+    assert store.count_legacy_imports("recovery_grinder") == 1
+    grinder_sha = storage.sha256_bytes(originals[Path("grinder-rest-state.json")])
+    grinder_wf = store.get_workflow(f"legacy_recovery_grinder_{grinder_sha[:16]}")
+    assert grinder_wf is not None
+    assert grinder_wf["kind"] == "grinder_recovery"
+    assert grinder_wf["state"] == "cooldown_imported"
+    assert grinder_wf["terminal_at"] is not None
+    assert grinder_wf["recovery"]["blocked_until"] == grinder_rest["blocked_until"]
+    assert grinder_wf["recovery"]["stopped_at"] == grinder_rest["stopped_at"]
     # History cutover: each JSONL line lands in history_events as well.
     assert store.count_history_events() == 1
     loaded = store.load_history_events()
@@ -399,6 +414,210 @@ def test_migration_source_race_uses_manifest_not_pre_backup_listing(
     # No phantom kinds with empty import but listed in files_seen.
     assert store.count_legacy_imports("catalog") == 0
     store.close()
+
+
+def test_multi_active_legacy_recovery_migration_rolls_back_losslessly(tmp_path):
+    """Two non-terminal recoveries abort the whole import; originals stay intact."""
+
+    armed = {"address": "AA:BB", "status": "armed"}
+    tea = {"address": "CC:DD", "status": "tea_loaded"}
+    coffee_path = tmp_path / "armed-state.json"
+    tea_path = tmp_path / "tea-loaded-state.json"
+    coffee_path.write_text(json.dumps(armed), encoding="utf-8")
+    tea_path.write_text(json.dumps(tea), encoding="utf-8")
+    coffee_bytes = coffee_path.read_bytes()
+    tea_bytes = tea_path.read_bytes()
+    coffee_sha = storage.sha256_bytes(coffee_bytes)
+    tea_sha = storage.sha256_bytes(tea_bytes)
+
+    with pytest.raises(storage.StorageError, match="more than one non-terminal recovery"):
+        storage.migrate_legacy_state(tmp_path)
+
+    # Originals remain byte-identical.
+    assert coffee_path.read_bytes() == coffee_bytes
+    assert tea_path.read_bytes() == tea_bytes
+
+    store = storage.StateStore(tmp_path)
+    try:
+        assert not store.migration_completed(storage.LEGACY_MIGRATION_NAME)
+        assert store.count_legacy_imports() == 0
+        assert store.count_legacy_imports("recovery_armed") == 0
+        assert store.count_legacy_imports("recovery_tea") == 0
+        assert store.get_active_workflow() is None
+        assert store.list_active_workflows() == []
+        receipts = store._connect().execute(
+            "SELECT name FROM migration_receipts"
+        ).fetchall()
+        assert receipts == []
+    finally:
+        store.close()
+
+    # Backup directory and MANIFEST exist with byte-identical copies + matching SHA-256.
+    backup_root = tmp_path / "backups"
+    assert backup_root.is_dir()
+    backups = sorted(backup_root.glob("legacy-*"))
+    assert len(backups) == 1
+    backup_dir = backups[0]
+    assert backup_dir.is_dir()
+    manifest_path = backup_dir / "MANIFEST.json"
+    assert manifest_path.is_file()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["file_count"] == 2
+    by_rel = {item["relative_path"]: item for item in manifest["files"]}
+    assert set(by_rel) == {"armed-state.json", "tea-loaded-state.json"}
+    coffee_copy = backup_dir / "armed-state.json"
+    tea_copy = backup_dir / "tea-loaded-state.json"
+    assert coffee_copy.read_bytes() == coffee_bytes
+    assert tea_copy.read_bytes() == tea_bytes
+    assert by_rel["armed-state.json"]["sha256"] == coffee_sha
+    assert by_rel["tea-loaded-state.json"]["sha256"] == tea_sha
+    assert storage.sha256_file(coffee_copy) == coffee_sha
+    assert storage.sha256_file(tea_copy) == tea_sha
+
+
+def test_get_latest_workflow_for_kinds_same_second_rowid_tiebreak(tmp_path):
+    """Later-inserted same-second terminal grinder must win over an older row."""
+
+    store = storage.StateStore(tmp_path)
+    try:
+        older = store.create_workflow(kind="grinder", state="running")
+        store.commit_workflow_terminal(
+            older["workflow_id"],
+            state="stopped",
+            event_payload={"result": "stopped", "marker": "older"},
+        )
+        newer = store.create_workflow(kind="grinder", state="running")
+        store.commit_workflow_terminal(
+            newer["workflow_id"],
+            state="stopped",
+            event_payload={"result": "stopped", "marker": "newer"},
+        )
+        fixed = "2026-07-23T12:00:00+00:00"
+        conn = store._connect()
+        conn.execute(
+            """
+            UPDATE workflows
+            SET created_at = ?, updated_at = ?, terminal_at = ?
+            WHERE kind = 'grinder'
+            """,
+            (fixed, fixed, fixed),
+        )
+        conn.commit()
+        # Without rowid DESC, second-resolution timestamps make ordering unstable.
+        stamp_rows = conn.execute(
+            "SELECT workflow_id, updated_at, created_at, rowid FROM workflows "
+            "WHERE kind = 'grinder' ORDER BY rowid ASC"
+        ).fetchall()
+        assert len(stamp_rows) == 2
+        assert stamp_rows[0]["updated_at"] == stamp_rows[1]["updated_at"]
+        assert stamp_rows[0]["created_at"] == stamp_rows[1]["created_at"]
+        assert int(stamp_rows[0]["rowid"]) < int(stamp_rows[1]["rowid"])
+
+        latest = store.get_latest_workflow_for_kinds(["grinder"], terminal=True)
+        assert latest is not None
+        assert latest["workflow_id"] == newer["workflow_id"]
+        # Active non-terminal query is also deterministic under same stamps.
+        a1 = store.create_workflow(kind="grinder", state="running")
+        a2 = store.create_workflow(kind="grinder", state="running")
+        conn.execute(
+            "UPDATE workflows SET created_at = ?, updated_at = ? "
+            "WHERE workflow_id IN (?, ?)",
+            (fixed, fixed, a1["workflow_id"], a2["workflow_id"]),
+        )
+        conn.commit()
+        active = store.get_latest_workflow_for_kinds(["grinder"], terminal=False)
+        assert active is not None
+        assert active["workflow_id"] == a2["workflow_id"]
+    finally:
+        store.close()
+
+
+def test_grinder_recovery_import_classifies_terminal_and_active(tmp_path):
+    """Stopped/rest grinder JSON -> cooldown_imported; in_progress/reserve -> recovery."""
+
+    # Terminal cooldown import.
+    stopped = {
+        "in_progress": False,
+        "stopped_at": 1_700_000_000.0,
+        "blocked_until": 1_700_000_060.0,
+        "owner": "legacy",
+    }
+    path = tmp_path / "grinder-rest-state.json"
+    path.write_text(json.dumps(stopped), encoding="utf-8")
+    original = path.read_bytes()
+    result = storage.migrate_legacy_state(tmp_path)
+    assert result["status"] == "completed"
+    assert path.read_bytes() == original
+    sha = storage.sha256_bytes(original)
+    store = storage.StateStore(tmp_path)
+    try:
+        wf = store.get_workflow(f"legacy_recovery_grinder_{sha[:16]}")
+        assert wf is not None
+        assert wf["kind"] == "grinder_recovery"
+        assert wf["state"] == "cooldown_imported"
+        assert wf["terminal_at"] is not None
+        assert wf["recovery"]["blocked_until"] == stopped["blocked_until"]
+        assert store.get_active_workflow() is None
+        latest = store.get_latest_workflow_for_kinds(
+            ["grinder", "grinder_recovery"], terminal=True
+        )
+        assert latest is not None
+        assert latest["workflow_id"] == wf["workflow_id"]
+    finally:
+        store.close()
+
+    # Fresh root: active in_progress hydrates non-terminal recovery.
+    root2 = tmp_path / "active"
+    root2.mkdir()
+    active = {"in_progress": True, "started_at": 1.0, "owner": "legacy"}
+    (root2 / "grinder-rest-state.json").write_text(json.dumps(active), encoding="utf-8")
+    storage.migrate_legacy_state(root2)
+    store2 = storage.StateStore(root2)
+    try:
+        act = store2.get_active_workflow()
+        assert act is not None
+        assert act["kind"] == "grinder_recovery"
+        assert act["state"] == "recovery_imported"
+        assert act["terminal_at"] is None
+        assert act["recovery"]["in_progress"] is True
+    finally:
+        store2.close()
+
+    # Reserve-without-stop is also non-terminal.
+    root3 = tmp_path / "reserve"
+    root3.mkdir()
+    reserved = {
+        "reserved_at": 1.0,
+        "runtime_s": 10.0,
+        "blocked_until": 9_999_999_999.0,
+    }
+    (root3 / "grinder-rest-state.json").write_text(
+        json.dumps(reserved), encoding="utf-8"
+    )
+    storage.migrate_legacy_state(root3)
+    store3 = storage.StateStore(root3)
+    try:
+        act = store3.get_active_workflow()
+        assert act is not None
+        assert act["state"] == "recovery_imported"
+        assert act["recovery"]["reserved_at"] == 1.0
+    finally:
+        store3.close()
+
+
+def test_get_latest_workflow_for_kinds_validates_kinds(tmp_path):
+    store = storage.StateStore(tmp_path)
+    try:
+        store.create_workflow(kind="grinder", state="running")
+        store.create_workflow(kind="water", state="running")
+        g = store.get_latest_workflow_for_kinds(["grinder"], terminal=False)
+        assert g is not None and g["kind"] == "grinder"
+        with pytest.raises(storage.StorageError, match="unknown workflow kind"):
+            store.get_latest_workflow_for_kinds(["not_a_kind"])
+        with pytest.raises(storage.StorageError, match="non-empty"):
+            store.get_latest_workflow_for_kinds([])
+    finally:
+        store.close()
 
 
 def test_foreign_key_and_parent_recipe_constraints(tmp_path):

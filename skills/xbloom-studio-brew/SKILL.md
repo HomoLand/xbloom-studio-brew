@@ -357,10 +357,10 @@ python <skill-dir>/scripts/xbloom.py grind --size 62 --rpm 100 --seconds 10 \
   --confirm-ready beans-cup-clear
 ```
 
-Respect the persisted 60-second rest lock; do not delete it to retry. Standalone water is a
-hot-water action and uses the hot-water owner gate. Require a suitable centered vessel, available
-water at the selected source, the correct water path, and clear surroundings in the current
-interaction:
+Respect the durable 60-second grinder rest (`grinder_guard` in `state.db`); never invent or delete
+a JSON rest file to retry. Standalone water is a hot-water action and uses the hot-water owner
+gate. Require a suitable centered vessel, available water at the selected source, the correct
+water path, and clear surroundings in the current interaction:
 
 ```text
 python <skill-dir>/scripts/xbloom.py water --volume 250 --temp 85 --flow 3.5 \
@@ -386,9 +386,10 @@ python <skill-dir>/scripts/xbloom.py bridge resume
 ```
 
 For bridge grinder control, a missing start/pause/resume ACK triggers fail-closed STOP/QUIT and
-must not be retried past the persisted rest lock. For bridge water, claim completion only when
-`last_operation.result` is `complete`. A result of `completion_unconfirmed` or
-`safety_timeout_stopped`, or a phase of `control_unconfirmed`/`stop_unconfirmed`, requires
+must not be retried past the durable SQLite rest guard. Unconfirmed STOP retains recovery and the
+BLE link; prompt release runs only after a confirmed durable terminal. For bridge water, claim
+completion only when `last_operation.result` is `complete`. A result of `completion_unconfirmed`
+or `safety_timeout_stopped`, or a phase of `control_unconfirmed`/`stop_unconfirmed`, requires
 recovery and physical verification.
 
 The decoded FreeSolo live-temperature and live-pattern commands are intentionally separate from
@@ -480,7 +481,9 @@ instead of silently omitting it. Read `references/catalog.md` for the full repre
   or `cancel`; do not retry start (retry protection is bridge-owned).
 - Active durable tea workflow (tea_loaded/unconfirmed): start with `--workflow-id` while currently
   ready, or cancel. Authoritative state is `state.db`, not `tea-loaded-state.json` (import-only).
-- Grinder cooldown active: wait for the reported remainder; never bypass the rest record.
+- Grinder cooldown/recovery active: wait for `status.grinder_guard` remainder (or recover first).
+  Authoritative state is `state.db` via bridge `grinder_guard` (`ready` / `cooldown` /
+  `recovery_required` / `unavailable`); never invent or delete a JSON rest file.
 - Bridge activity uncertain: keep the vessel in place and use `cancel` / `bridge cancel` or the
   machine's physical control before `bridge stop --force`. Top-level hardware commands already use
   the daemon; they do not open a second direct BLE connection.

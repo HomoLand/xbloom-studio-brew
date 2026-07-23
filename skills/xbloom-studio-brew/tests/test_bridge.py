@@ -87,6 +87,7 @@ class FakeBridgeClient:
         self.disconnect_listeners = set()
         self.calls = []
         self.fail_grinder_pause = False
+        self.fail_grinder_stop = False
         self.fail_coffee_start = False
         self.fail_coffee_load = False
         self.fail_tea_load = False
@@ -317,6 +318,8 @@ class FakeBridgeClient:
 
     async def stop_grinder_session(self):
         self.calls.append("grinder_stop")
+        if self.fail_grinder_stop:
+            raise RuntimeError("simulated grinder STOP/QUIT ACK loss")
         await asyncio.sleep(0)
         return _event(command=3505)
 
@@ -1017,8 +1020,9 @@ def test_freesolo_water_live_adjust_is_separately_gated(tmp_path):
     assert ("water_pattern", "spiral") in fake.calls
 
 
-def test_grinder_pause_extends_timer_and_stop_persists_cooldown(tmp_path):
+def test_grinder_pause_extends_timer_and_stop_persists_durable_cooldown(tmp_path):
     core, fake = _core(tmp_path)
+    json_path = tmp_path / "grinder-rest-state.json"
 
     async def go():
         started = await core.rpc(
@@ -1032,6 +1036,7 @@ def test_grinder_pause_extends_timer_and_stop_persists_cooldown(tmp_path):
                 }
             ),
         )
+        assert started.get("rest_seconds") == bridge_mod.GRINDER_REST_SECONDS
         wid = started["workflow_id"]
         await asyncio.sleep(0.03)
         await core.rpc("pause", _with_ids(workflow_id=wid))
@@ -1040,8 +1045,17 @@ def test_grinder_pause_extends_timer_and_stop_persists_cooldown(tmp_path):
         await core.rpc("resume", _with_ids(workflow_id=wid))
         await asyncio.sleep(0.16)
         assert core.status()["activity"] is None
-        record = core.grinder_state_file.read_text(encoding="utf-8")
-        assert '"in_progress": false' in record
+        assert not json_path.exists()
+        guard = core.status()["grinder_guard"]
+        assert guard["state"] == "cooldown"
+        assert guard["rest_seconds"] == bridge_mod.GRINDER_REST_SECONDS
+        assert guard["remaining_s"] is not None and guard["remaining_s"] > 0
+        assert guard["cooldown_until"] is not None
+        last = core.status()["last_operation"]
+        assert last["grinder_rest_seconds"] == bridge_mod.GRINDER_REST_SECONDS
+        assert last["grinder_cooldown_until"] == guard["cooldown_until"]
+        wf = core.store.get_workflow(wid)
+        assert wf is not None and wf["terminal_at"] is not None
         await core.shutdown()
 
     asyncio.run(go())
@@ -1052,6 +1066,7 @@ def test_grinder_pause_extends_timer_and_stop_persists_cooldown(tmp_path):
 def test_grinder_pause_ack_loss_forces_confirmed_stop(tmp_path):
     core, fake = _core(tmp_path)
     fake.fail_grinder_pause = True
+    json_path = tmp_path / "grinder-rest-state.json"
 
     async def go():
         started = await core.rpc(
@@ -1070,13 +1085,329 @@ def test_grinder_pause_ack_loss_forces_confirmed_stop(tmp_path):
             await core.rpc("pause", _with_ids(workflow_id=wid))
         assert core.status()["activity"] is None
         assert core.status()["last_operation"]["result"] == "pause_failed_stopped"
-        assert '"in_progress": false' in core.grinder_state_file.read_text(
-            encoding="utf-8"
-        )
+        assert not json_path.exists()
+        assert core.status()["grinder_guard"]["state"] == "cooldown"
         await core.shutdown()
 
     asyncio.run(go())
     assert "grinder_stop" in fake.calls
+
+
+def test_grinder_start_stop_no_json_cooldown_blocks_fresh_request(tmp_path):
+    """Confirmed stop creates durable cooldown; fresh start blocked pre-BLE; same id cached."""
+
+    core, fake = _core(tmp_path)
+    json_path = tmp_path / "grinder-rest-state.json"
+    start_req = _rid("grind_cool")
+    params = {
+        "size": 50,
+        "rpm": 100,
+        "seconds": 0.2,
+        "confirmation": GRINDER_READY_SENTINEL,
+    }
+
+    async def go():
+        first = await core.rpc(
+            "grinder.start", _with_ids(params, request_id=start_req)
+        )
+        await core.rpc("cancel", _with_ids(workflow_id=first["workflow_id"]))
+        await _drain_release(core)
+        assert not json_path.exists()
+        guard = core.grinder_guard()
+        assert guard["state"] == "cooldown"
+        # Exact completed request_id returns cache before cooldown gate.
+        before = list(fake.calls)
+        cached = await core.rpc(
+            "grinder.start", _with_ids(params, request_id=start_req)
+        )
+        assert cached["workflow_id"] == first["workflow_id"]
+        assert fake.calls == before
+        # Fresh request blocked before connect/write.
+        connect_before = fake.connect_count
+        with pytest.raises(BridgeError, match="rest interval active"):
+            await core.rpc("grinder.start", _with_ids(params, request_id=_rid("new")))
+        assert fake.connect_count == connect_before
+        assert sum(1 for c in fake.calls if c[0] == "grinder_start") == 1
+        await core.shutdown(force=True)
+
+    asyncio.run(go())
+
+    # Expired durable cooldown allows a new start (SQLite recovery/event authority).
+    core2, fake2 = _core(tmp_path)
+    past = time.time() - 5.0
+    # Supercede the prior cooldown by inserting a newer terminal grinder with past until.
+    wf = core2.store.create_workflow(
+        kind="grinder",
+        state="running",
+        metadata={"targets": {"size": 50}},
+    )
+    core2.store.commit_workflow_terminal(
+        wf["workflow_id"],
+        state="stopped",
+        event_payload={
+            "result": "stopped",
+            "grinder_cooldown_until": past,
+            "grinder_stopped_at": past - 60,
+            "grinder_rest_seconds": 60,
+        },
+        recovery={
+            "grinder_cooldown_until": past,
+            "blocked_until": past,
+        },
+    )
+    assert core2.grinder_guard()["state"] == "ready"
+
+    async def go2():
+        started = await core2.rpc(
+            "grinder.start",
+            _with_ids(
+                {
+                    "size": 50,
+                    "rpm": 100,
+                    "seconds": 0.15,
+                    "confirmation": GRINDER_READY_SENTINEL,
+                }
+            ),
+        )
+        assert started["status"] == "running"
+        assert fake2.connect_count == 1
+        await core2.rpc("cancel", _with_ids(workflow_id=started["workflow_id"]))
+        await _drain_release(core2)
+        assert core2.connected is False
+        assert core2.release_pending is False
+        await core2.shutdown()
+
+    asyncio.run(go2())
+
+
+def test_stale_unmigrated_grinder_json_ignored(tmp_path):
+    core, fake = _core(tmp_path)
+    path = tmp_path / "grinder-rest-state.json"
+    path.write_text(
+        json.dumps({"in_progress": True, "blocked_until": 9_999_999_999}),
+        encoding="utf-8",
+    )
+    original = path.read_bytes()
+
+    async def go():
+        # Unmigrated JSON is not a gate; start proceeds (no durable recovery).
+        assert core.grinder_guard()["state"] == "ready"
+        started = await core.rpc(
+            "grinder.start",
+            _with_ids(
+                {
+                    "size": 50,
+                    "rpm": 100,
+                    "seconds": 0.15,
+                    "confirmation": GRINDER_READY_SENTINEL,
+                }
+            ),
+        )
+        assert started["status"] == "running"
+        assert path.read_bytes() == original
+        await core.rpc("cancel", _with_ids(workflow_id=started["workflow_id"]))
+        assert path.read_bytes() == original
+        # Runtime property must not exist on BridgeCore (SQLite sole authority).
+        assert "grinder_state_file" not in BridgeCore.__dict__
+        assert not hasattr(BridgeCore, "grinder_state_file")
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_grinder_guard_event_read_storage_error_fail_closed(tmp_path):
+    """Terminal cooldown only in event: list_workflow_events StorageError -> unavailable.
+
+    Fail closed before reserve/connect/BLE; status/events remain non-connecting.
+    """
+
+    core, fake = _core(tmp_path)
+    future = time.time() + 3600.0
+    # Cooldown lives only on the terminal event (recovery cleared by default).
+    wf = core.store.create_workflow(
+        kind="grinder",
+        state="running",
+        metadata={"targets": {"size": 50}},
+    )
+    core.store.commit_workflow_terminal(
+        wf["workflow_id"],
+        state="stopped",
+        event_payload={
+            "result": "stopped",
+            "grinder_cooldown_until": future,
+            "grinder_stopped_at": future - 60,
+            "grinder_rest_seconds": 60,
+        },
+    )
+    # Sanity: successful event read with defensible timestamp -> cooldown.
+    assert core.grinder_guard()["state"] == "cooldown"
+    assert fake.connect_count == 0
+    assert fake.calls == []
+
+    original_list = core.store.list_workflow_events
+
+    def _raise_storage_error(workflow_id, *, since_seq=0):
+        raise storage.StorageError("simulated workflow event read failure")
+
+    core.store.list_workflow_events = _raise_storage_error  # type: ignore[method-assign]
+    try:
+        # StorageError must not be swallowed as ready; public state is unavailable.
+        guard = core.grinder_guard()
+        assert guard["state"] == "unavailable"
+        status = core.status()
+        assert status["grinder_guard"]["state"] == "unavailable"
+        assert fake.connect_count == 0
+        assert fake.calls == []
+
+        async def go():
+            await core.rpc("events", {"since": 0})
+            assert fake.connect_count == 0
+            assert fake.calls == []
+            fail_req = _rid("grind_fail_closed")
+            with pytest.raises(
+                BridgeError,
+                match="unavailable|fail closed|durable state unreadable",
+            ):
+                await core.rpc(
+                    "grinder.start",
+                    _with_ids(
+                        {
+                            "size": 50,
+                            "rpm": 100,
+                            "seconds": 0.2,
+                            "confirmation": GRINDER_READY_SENTINEL,
+                        },
+                        request_id=fail_req,
+                    ),
+                )
+            assert fake.connect_count == 0
+            assert (
+                sum(
+                    1
+                    for c in fake.calls
+                    if c == "grinder_start"
+                    or (isinstance(c, tuple) and c[0] == "grinder_start")
+                )
+                == 0
+            )
+            assert "connect" not in fake.calls
+            assert core.store.get_idempotency(fail_req) is None
+            await core.shutdown(force=True)
+
+        asyncio.run(go())
+    finally:
+        core.store.list_workflow_events = original_list  # type: ignore[method-assign]
+
+
+def test_daemon_restart_active_grinder_no_auto_ble_cancel_reconnects(tmp_path):
+    """Abrupt daemon loss: seed durable nonterminal grinder; reconstruct does zero BLE."""
+
+    env = {
+        REMOTE_GRINDER_ENV: REMOTE_GRINDER_SENTINEL,
+        REMOTE_START_ENV: REMOTE_START_SENTINEL,
+    }
+    # Simulate abrupt process loss: durable nonterminal workflow only (no graceful
+    # shutdown(force=True), which intentionally STOP/terminalizes).
+    seed = storage.StateStore(tmp_path)
+    try:
+        wf = seed.create_workflow(
+            kind="grinder",
+            state="running",
+            metadata={
+                "machine_address": "AA:BB:CC:DD:EE:FF",
+                "targets": {"size": 55, "rpm": 100, "runtime_s": 30},
+            },
+        )
+        wid = str(wf["workflow_id"])
+    finally:
+        seed.close()
+
+    clients: list[FakeBridgeClient] = []
+
+    def factory(address: str) -> FakeBridgeClient:
+        c = FakeBridgeClient(address)
+        clients.append(c)
+        return c
+
+    core2 = BridgeCore(
+        state_dir=tmp_path,
+        environ=env,
+        client_factory=factory,
+        default_address="AA:BB:CC:DD:EE:FF",
+    )
+    assert core2.activity == "grinder"
+    assert core2.active_workflow_id == wid
+    assert core2._recovery_required is True
+    assert core2.connected is False
+    assert core2.grinder_guard()["state"] == "recovery_required"
+    # Construction does zero BLE.
+    assert clients == []
+
+    async def go():
+        cancelled = await core2.rpc("cancel", _with_ids(workflow_id=wid))
+        assert cancelled["status"] == "stopped"
+        assert len(clients) == 1
+        assert clients[0].connect_count == 1
+        assert clients[0].calls.count("connect") == 1
+        assert clients[0].calls.count("grinder_stop") == 1
+        assert (
+            sum(
+                1
+                for c in clients[0].calls
+                if c == "grinder_start"
+                or (isinstance(c, tuple) and c[0] == "grinder_start")
+            )
+            == 0
+        )
+        terminal = core2.store.get_workflow(wid)
+        assert terminal is not None and terminal["terminal_at"] is not None
+        assert core2.activity is None
+        assert core2.grinder_guard()["state"] == "cooldown"
+        await _drain_release(core2)
+        assert core2.release_pending is False
+        assert core2.connected is False
+        await core2.shutdown(force=True)
+
+    asyncio.run(go())
+
+
+def test_grinder_unconfirmed_stop_retains_recovery(tmp_path):
+    core, fake = _core(tmp_path)
+    fake.fail_grinder_stop = True
+
+    async def go():
+        started = await core.rpc(
+            "grinder.start",
+            _with_ids(
+                {
+                    "size": 50,
+                    "rpm": 100,
+                    "seconds": 10,
+                    "confirmation": GRINDER_READY_SENTINEL,
+                }
+            ),
+        )
+        wid = started["workflow_id"]
+        with pytest.raises(BridgeError, match="STOP/QUIT is unconfirmed"):
+            await core.rpc("cancel", _with_ids(workflow_id=wid))
+        status = core.status()
+        assert status["activity"] == "grinder"
+        assert status["phase"] == "stop_unconfirmed"
+        assert status["connected"] is True
+        assert status["recovery"]["required"] is True
+        assert status["grinder_guard"]["state"] == "recovery_required"
+        assert core.active_workflow_id == wid
+        # Clear injected failure; explicit cancel terminalizes without re-failing.
+        fake.fail_grinder_stop = False
+        stopped = await core.rpc("cancel", _with_ids(workflow_id=wid))
+        assert stopped["status"] == "stopped"
+        assert core.store.get_workflow(wid)["terminal_at"] is not None
+        await _drain_release(core)
+        assert core.release_pending is False
+        assert core.connected is False
+        await core.shutdown()
+
+    asyncio.run(go())
 
 
 def test_natural_water_stop_requires_metered_target(tmp_path):
@@ -4703,12 +5034,10 @@ def test_no_coffee_tea_json_created_across_load_start_unconfirmed_terminal(tmp_p
     asyncio.run(go())
 
 
-def test_explicit_migration_imports_coffee_tea_json_byte_identical(tmp_path):
-    """migrate_legacy_state imports recovery JSON without modifying originals.
+def test_explicit_migration_imports_single_coffee_json_byte_identical(tmp_path):
+    """migrate_legacy_state imports one recovery JSON without modifying originals.
 
-    Lossless / public StateStore import verification only. Runtime no-auto-
-    connect and cancel-with-imported-address behavior is covered by the
-    single-record parametrized migration recovery test.
+    Multi non-terminal recovery files roll back (see storage multi-active test).
     """
 
     armed = {
@@ -4717,46 +5046,173 @@ def test_explicit_migration_imports_coffee_tea_json_byte_identical(tmp_path):
         "recipe_sha256": "deadbeef",
         "owner": "legacy",
     }
-    tea = {"address": "AA:BB", "status": "tea_loaded", "recipe_path": "/tmp/x.yaml"}
     coffee_path = tmp_path / "armed-state.json"
-    tea_path = tmp_path / "tea-loaded-state.json"
     coffee_path.write_text(json.dumps(armed, indent=2), encoding="utf-8")
-    tea_path.write_text(json.dumps(tea, indent=2), encoding="utf-8")
     coffee_bytes = coffee_path.read_bytes()
-    tea_bytes = tea_path.read_bytes()
 
     result = storage.migrate_legacy_state(tmp_path)
     assert result["status"] == "completed"
     assert coffee_path.read_bytes() == coffee_bytes
-    assert tea_path.read_bytes() == tea_bytes
 
     coffee_sha = storage.sha256_bytes(coffee_bytes)
-    tea_sha = storage.sha256_bytes(tea_bytes)
     coffee_wid = f"legacy_recovery_armed_{coffee_sha[:16]}"
-    tea_wid = f"legacy_recovery_tea_{tea_sha[:16]}"
 
     store = storage.StateStore(tmp_path)
     try:
         assert store.count_legacy_imports("recovery_armed") == 1
-        assert store.count_legacy_imports("recovery_tea") == 1
         coffee_wf = store.get_workflow(coffee_wid)
-        tea_wf = store.get_workflow(tea_wid)
         assert coffee_wf is not None
-        assert tea_wf is not None
         assert coffee_wf["kind"] == "coffee_recovery"
-        assert tea_wf["kind"] == "tea_recovery"
         assert coffee_wf["state"] == "recovery_imported"
-        assert tea_wf["state"] == "recovery_imported"
         assert coffee_wf["source"] == "legacy_migration"
-        assert tea_wf["source"] == "legacy_migration"
         assert coffee_wf["recovery"] == armed
-        assert tea_wf["recovery"] == tea
         assert coffee_wf["snapshot"] is None
-        assert tea_wf["snapshot"] is None
         assert (coffee_wf.get("metadata") or {}).get("legacy_sha256") == coffee_sha
-        assert (tea_wf.get("metadata") or {}).get("legacy_sha256") == tea_sha
     finally:
         store.close()
+
+
+def test_migrated_grinder_stopped_blocks_until_exact_blocked_until(tmp_path):
+    """Terminal cooldown_imported uses exact blocked_until; past until allows start."""
+
+    future = time.time() + 3600.0
+    stopped = {
+        "in_progress": False,
+        "stopped_at": future - 60.0,
+        "blocked_until": future,
+        "owner": "legacy",
+    }
+    path = tmp_path / "grinder-rest-state.json"
+    path.write_text(json.dumps(stopped), encoding="utf-8")
+    original = path.read_bytes()
+    storage.migrate_legacy_state(tmp_path)
+    assert path.read_bytes() == original
+
+    core, fake = _core(tmp_path)
+    guard = core.grinder_guard()
+    assert guard["state"] == "cooldown"
+    assert guard["cooldown_until"] == future
+    remaining = float(guard["remaining_s"])
+    assert remaining > 3500.0
+    assert remaining <= 3600.0
+
+    async def blocked():
+        with pytest.raises(BridgeError, match="rest interval active"):
+            await core.rpc(
+                "grinder.start",
+                _with_ids(
+                    {
+                        "size": 50,
+                        "rpm": 100,
+                        "seconds": 0.2,
+                        "confirmation": GRINDER_READY_SENTINEL,
+                    }
+                ),
+            )
+        assert fake.connect_count == 0
+        await core.shutdown(force=True)
+
+    asyncio.run(blocked())
+
+    # Past blocked_until allows start.
+    past = time.time() - 10.0
+    root2 = tmp_path / "past"
+    root2.mkdir()
+    (root2 / "grinder-rest-state.json").write_text(
+        json.dumps(
+            {
+                "in_progress": False,
+                "stopped_at": past - 60.0,
+                "blocked_until": past,
+            }
+        ),
+        encoding="utf-8",
+    )
+    storage.migrate_legacy_state(root2)
+    core2, fake2 = _core(root2)
+    assert core2.grinder_guard()["state"] == "ready"
+
+    async def allowed():
+        started = await core2.rpc(
+            "grinder.start",
+            _with_ids(
+                {
+                    "size": 50,
+                    "rpm": 100,
+                    "seconds": 0.15,
+                    "confirmation": GRINDER_READY_SENTINEL,
+                }
+            ),
+        )
+        assert started["status"] == "running"
+        await core2.rpc("cancel", _with_ids(workflow_id=started["workflow_id"]))
+        await _drain_release(core2)
+        assert core2.connected is False
+        assert core2.release_pending is False
+        await core2.shutdown()
+
+    asyncio.run(allowed())
+
+
+def test_grinder_guard_stopped_at_only_future_and_expired(tmp_path):
+    """Migrated terminal with stopped_at but no blocked_until derives rest window."""
+
+    future_stop = time.time() - 10.0  # stopped 10s ago -> ~50s remaining
+    path = tmp_path / "grinder-rest-state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "in_progress": False,
+                "stopped_at": future_stop,
+                # no blocked_until / grinder_cooldown_until
+                "owner": "legacy",
+            }
+        ),
+        encoding="utf-8",
+    )
+    storage.migrate_legacy_state(tmp_path)
+    core, fake = _core(tmp_path)
+    try:
+        guard = core.grinder_guard()
+        assert guard["state"] == "cooldown"
+        expected_until = future_stop + bridge_mod.GRINDER_REST_SECONDS
+        assert guard["cooldown_until"] == expected_until
+        remaining = float(guard["remaining_s"])
+        assert 40.0 < remaining <= 60.0
+        assert fake.connect_count == 0
+    finally:
+        core.store.close()
+
+    # Expired stopped_at-only: rest fully elapsed -> ready.
+    root2 = tmp_path / "expired"
+    root2.mkdir()
+    past_stop = time.time() - 120.0
+    (root2 / "grinder-rest-state.json").write_text(
+        json.dumps({"in_progress": False, "stopped_at": past_stop}),
+        encoding="utf-8",
+    )
+    storage.migrate_legacy_state(root2)
+    core2, fake2 = _core(root2)
+    try:
+        assert core2.grinder_guard()["state"] == "ready"
+        assert fake2.connect_count == 0
+    finally:
+        core2.store.close()
+
+    # Terminal status with no timestamps: no defensible deadline -> ready.
+    root3 = tmp_path / "unknown"
+    root3.mkdir()
+    (root3 / "grinder-rest-state.json").write_text(
+        json.dumps({"in_progress": False, "status": "rest"}),
+        encoding="utf-8",
+    )
+    storage.migrate_legacy_state(root3)
+    core3, fake3 = _core(root3)
+    try:
+        assert core3.grinder_guard()["state"] == "ready"
+        assert fake3.connect_count == 0
+    finally:
+        core3.store.close()
 
 
 @pytest.mark.parametrize(

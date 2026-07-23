@@ -32,6 +32,7 @@ from xbloom_paths import (
 )
 from xbloom_storage import (
     CLEAR_RECOVERY,
+    GRINDER_WORKFLOW_KINDS,
     IDEM_COMPLETED,
     IDEM_FAILED,
     IDEM_PENDING,
@@ -102,9 +103,12 @@ BRIDGE_HOST = "127.0.0.1"
 BRIDGE_RECORD_NAME = "bridge.json"
 BRIDGE_LOCK_NAME = "bridge.lock"
 BRIDGE_LOG_NAME = "bridge.log"
+# Legacy filename constants for import-only path properties (coffee/tea tests
+# and migration docs). Runtime never reads/writes these files. Grinder rest
+# JSON is also import-only; its path lives only in xbloom_storage migration
+# constants (GRINDER_REST_STATE_REL).
 COFFEE_STATE_NAME = "armed-state.json"
 TEA_STATE_NAME = "tea-loaded-state.json"
-GRINDER_STATE_NAME = "grinder-rest-state.json"
 
 # Methods that may run without a prior compatible hello (diagnostics only).
 DIAGNOSTIC_METHODS = frozenset({"hello", "ping", "status"})
@@ -172,7 +176,7 @@ class BridgeLockError(BridgeError):
 
 # Connect failures that often mean the phone/app or another client owns the
 # radio. Unavailable vs already-connected vs GATT busy cannot always be
-# distinguished from Bleak text alone — surface one stable category.
+# distinguished from Bleak text alone -- surface one stable category.
 _DEVICE_BUSY_EXTERNAL_MARKERS = (
     "already connected",
     "already in use",
@@ -620,7 +624,7 @@ class BridgeCore:
         self._idle_orphan_deadline: float | None = None
         self._idle_orphan_task: asyncio.Task[Any] | None = None
         # Client identity for disconnect callbacks: ignore stale expected drops
-        # after terminal release so they cannot rewrite terminal → recovery.
+        # after terminal release so they cannot rewrite terminal -> recovery.
         self._client_generation: int = 0
         self._bound_client_generation: int = 0
         # Reconstruct durable workflow identity without auto-connect / start.
@@ -637,10 +641,6 @@ class BridgeCore:
         """Legacy path name only (import-only via migrate). Runtime never reads/writes it."""
 
         return self.state_dir / TEA_STATE_NAME
-
-    @property
-    def grinder_state_file(self) -> Path:
-        return self.state_dir / GRINDER_STATE_NAME
 
     @property
     def connected(self) -> bool:
@@ -731,7 +731,7 @@ class BridgeCore:
         # Targets from metadata when available (best-effort; no BLE).
         if isinstance(meta.get("targets"), dict):
             self.targets = dict(meta["targets"])
-        # Hydrate address for later explicit reconnect/cancel only — never
+        # Hydrate address for later explicit reconnect/cancel only -- never
         # auto-connect. Prefer durable machine_address, then metadata.address,
         # then the active recovery payload address (migrated armed/tea JSON).
         recovery = active.get("recovery")
@@ -1235,7 +1235,7 @@ class BridgeCore:
                 "do not load/start; ownership retained"
             )
 
-        # Query fresh state only — no load, start, or control writes.
+        # Query fresh state only -- no load, start, or control writes.
         timeout = self.machine_info_timeout
         generation_before = self._state_notify_generation
         self._state_notify_event.clear()
@@ -1278,7 +1278,7 @@ class BridgeCore:
         fresh = self.machine_state
         activity = self.activity
 
-        # Loaded tea: no positive protocol marker → remain recovery_required.
+        # Loaded tea: no positive protocol marker -> remain recovery_required.
         # Must run before terminal matching: idle/ready is not proof the tea
         # recipe finished (it may never have started).
         if activity == "tea" and self.phase == "loaded":
@@ -1315,7 +1315,7 @@ class BridgeCore:
                 "link kept; do not start; never re-load"
             )
 
-        # Loaded coffee: fresh armed → reattach monitoring, clear recovery after durable.
+        # Loaded coffee: fresh armed -> reattach monitoring, clear recovery after durable.
         if activity == "coffee" and fresh in _RECONCILE_LOADED_COFFEE_STATES:
             try:
                 self.store.transition_workflow(
@@ -1700,34 +1700,16 @@ class BridgeCore:
         except StorageError:
             return None
 
-    def _grinder_is_recovery(self) -> bool:
-        """True only for in-progress or unreadable grinder records.
-
-        Completed cooldown records (``in_progress=false`` with ``blocked_until``)
-        intentionally persist and must not mark the daemon non-idle.
-        """
-
-        path = self.grinder_state_file
-        if not path.exists():
-            return False
-        try:
-            state = _read_json(path)
-        except BridgeError:
-            return True
-        return bool(state.get("in_progress"))
-
     def recovery_record_names(self) -> list[str]:
-        """Names of recovery markers that block idle restart.
+        """Legacy file-marker names for protocol compatibility.
 
-        Coffee/tea legacy JSON files are import-only and never consulted here.
-        Durable coffee/tea recovery is reflected via active workflow / activity.
-        Grinder rest JSON remains a runtime recovery marker (not this batch).
+        Coffee/tea/grinder ``*-state.json`` files are import-only and never
+        consulted at runtime. Durable recovery is reflected via activity,
+        ``active_workflow_id``, ``recovery``, and ``grinder_guard``. Always
+        returns an empty list.
         """
 
-        names: list[str] = []
-        if self._grinder_is_recovery():
-            names.append(GRINDER_STATE_NAME)
-        return names
+        return []
 
     def is_idle(self) -> bool:
         """True when phase is safe, no activity, and no durable ownership/recovery."""
@@ -1745,12 +1727,157 @@ class BridgeCore:
             return False
         if self._recovery_required:
             return False
-        if self._grinder_is_recovery():
-            return False
+        # Cooldown alone does not block idle restart (no active ownership).
         return True
 
     def has_recovery_records(self) -> bool:
         return bool(self.recovery_record_names())
+
+    @staticmethod
+    def _cooldown_until_from_mapping(payload: Mapping[str, Any] | None) -> float | None:
+        """Extract a cooldown epoch from recovery/terminal payloads.
+
+        ``blocked_until`` / ``grinder_cooldown_until`` / ``cooldown_until`` are
+        authoritative when present. Otherwise a numeric ``stopped_at`` /
+        ``grinder_stopped_at`` derives ``stopped_at + GRINDER_REST_SECONDS`` so
+        migrated terminal imports without an explicit until still enforce the
+        remaining 60-second rest. Unknown/no-timestamp terminals yield None
+        (ready: no defensible deadline).
+        """
+
+        if not isinstance(payload, Mapping):
+            return None
+        for key in (
+            "grinder_cooldown_until",
+            "blocked_until",
+            "cooldown_until",
+        ):
+            raw = payload.get(key)
+            if raw is None:
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+        for key in ("grinder_stopped_at", "stopped_at"):
+            raw = payload.get(key)
+            if raw is None:
+                continue
+            try:
+                stopped = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if stopped > 0:
+                return stopped + float(GRINDER_REST_SECONDS)
+        return None
+
+    def _grinder_cooldown_until_from_workflow(
+        self, workflow: Mapping[str, Any]
+    ) -> float | None:
+        """Resolve cooldown epoch from recovery payload or latest terminal event."""
+
+        until = self._cooldown_until_from_mapping(
+            workflow.get("recovery") if isinstance(workflow.get("recovery"), Mapping) else None
+        )
+        if until is not None:
+            return until
+        workflow_id = str(workflow.get("workflow_id") or "")
+        if not workflow_id:
+            return None
+        # Do not catch StorageError here: let it reach grinder_guard so public
+        # state becomes unavailable (fail closed). Successful reads with no
+        # defensible timestamp still return None -> ready.
+        events = self.store.list_workflow_events(workflow_id)
+        for event in reversed(events):
+            if str(event.get("event_type") or "") != "terminal":
+                continue
+            payload = event.get("payload")
+            until = self._cooldown_until_from_mapping(
+                payload if isinstance(payload, Mapping) else None
+            )
+            if until is not None:
+                return until
+            break
+        return None
+
+    def grinder_guard(self) -> dict[str, Any]:
+        """Public durable grinder cooldown/recovery guard (SQLite sole authority).
+
+        States:
+        - ``ready``: no active grinder ownership and no active cooldown
+        - ``cooldown``: confirmed stop rest interval still active
+        - ``recovery_required``: non-terminal grinder/grinder_recovery workflow
+        - ``unavailable``: storage error (fail closed)
+        """
+
+        base: dict[str, Any] = {
+            "state": "ready",
+            "workflow_id": None,
+            "rest_seconds": GRINDER_REST_SECONDS,
+            "remaining_s": None,
+            "cooldown_until": None,
+        }
+        try:
+            active = self.store.get_latest_workflow_for_kinds(
+                sorted(GRINDER_WORKFLOW_KINDS),
+                terminal=False,
+            )
+            if active is not None:
+                base["state"] = "recovery_required"
+                base["workflow_id"] = str(active.get("workflow_id") or "") or None
+                # Surface known remaining cooldown only if recovery payload has it
+                # (e.g. reserved interval); active motor ownership still fails closed.
+                until = self._grinder_cooldown_until_from_workflow(active)
+                if until is not None:
+                    remaining = until - time.time()
+                    base["cooldown_until"] = until
+                    base["remaining_s"] = max(0.0, remaining)
+                return base
+            terminal = self.store.get_latest_workflow_for_kinds(
+                sorted(GRINDER_WORKFLOW_KINDS),
+                terminal=True,
+            )
+            if terminal is None:
+                return base
+            until = self._grinder_cooldown_until_from_workflow(terminal)
+            wid = str(terminal.get("workflow_id") or "") or None
+            base["workflow_id"] = wid
+            if until is None:
+                return base
+            remaining = until - time.time()
+            base["cooldown_until"] = until
+            base["remaining_s"] = max(0.0, remaining)
+            if remaining > 0:
+                base["state"] = "cooldown"
+            return base
+        except StorageError:
+            base["state"] = "unavailable"
+            return base
+
+    def _check_grinder_rest(self) -> None:
+        """Block grinder start using durable SQLite guard (never JSON files)."""
+
+        guard = self.grinder_guard()
+        state = str(guard.get("state") or "unavailable")
+        if state == "unavailable":
+            raise BridgeError(
+                "grinder guard unavailable (durable state unreadable); "
+                "fail closed before BLE"
+            )
+        if state == "recovery_required":
+            wid = guard.get("workflow_id")
+            raise BridgeError(
+                "a previous grinder session lacks a verified stop"
+                + (f" (workflow_id={wid})" if wid else "")
+                + "; cancel/recover before grinding"
+            )
+        if state == "cooldown":
+            remaining = float(guard.get("remaining_s") or 0.0)
+            raise BridgeError(
+                f"grinder rest interval active; wait {int(remaining + 0.999)} more seconds"
+            )
 
     def _event_dict(self, event: StatusEvent) -> dict[str, Any]:
         self._event_seq += 1
@@ -2021,7 +2148,7 @@ class BridgeCore:
             "finished_at": round(time.time(), 3),
             **details,
         }
-        # Coffee/tea legacy JSON is import-only; never unlink or rewrite it here.
+        # Coffee/tea/grinder legacy JSON is import-only; never unlink or rewrite it.
         if previous == "grinder":
             self._cancel_grinder_timer()
         if previous == "water":
@@ -2140,6 +2267,7 @@ class BridgeCore:
                     "workflow_id": self.active_workflow_id,
                 },
             }
+        grinder_guard = self.grinder_guard()
         return {
             "protocol_version": BRIDGE_PROTOCOL_VERSION,
             "rpc_protocol_min": RPC_PROTOCOL_MIN,
@@ -2188,6 +2316,7 @@ class BridgeCore:
             "active_workflow_id": self.active_workflow_id,
             "workflow": workflow_summary,
             "recovery": recovery_state,
+            "grinder_guard": grinder_guard,
             "live_adjust": {
                 "protocol_available": True,
                 "hardware_verified": False,
@@ -2520,7 +2649,7 @@ class BridgeCore:
         With an active durable workflow, retain activity and workflow identity,
         persist ``ble_disconnected`` recovery, and surface recovery_required.
         With no activity/workflow, settle to disconnected without inventing recovery.
-        Recovery may only reconnect/query/reconcile later via explicit RPC —
+        Recovery may only reconnect/query/reconcile later via explicit RPC --
         never load, start, or other uncertain machine actions here.
         """
 
@@ -2588,7 +2717,7 @@ class BridgeCore:
             self.phase = "loaded"
             recovery_payload["loaded_needs_reconcile"] = True
         elif prior_phase == "loaded" and self.activity == "tea":
-            # Tea has no positive loaded marker — fail-closed.
+            # Tea has no positive loaded marker -- fail-closed.
             self._loaded_needs_reconcile = True
             self.phase = "loaded"
             recovery_payload["tea_fail_closed"] = True
@@ -2621,7 +2750,7 @@ class BridgeCore:
                 self.store.transition_workflow(
                     wid,
                     # Do not force durable state to recovery_required for
-                    # running/paused — keep prior non-terminal state when active.
+                    # running/paused -- keep prior non-terminal state when active.
                     state=(
                         prior_phase
                         if prior_phase
@@ -2700,7 +2829,7 @@ class BridgeCore:
             raise
         client = self.client_factory(address)
         try:
-            # One connect attempt only — no retry / preemption / background reconnect.
+            # One connect attempt only -- no retry / preemption / background reconnect.
             # Bind disconnect listeners only after the link is up so a connect-time
             # failure cannot race as unexpected recovery against a half-owned client.
             await client.connect()
@@ -4520,47 +4649,15 @@ class BridgeCore:
             )
         return result
 
-    def _check_grinder_rest(self) -> None:
-        if not self.grinder_state_file.exists():
-            return
-        try:
-            state = _read_json(self.grinder_state_file)
-        except BridgeError as exc:
-            raise BridgeError(
-                "grinder rest record is unreadable; inspect it before running the motor"
-            ) from exc
-        if state.get("in_progress"):
-            raise BridgeError("a previous grinder bridge session lacks a verified stop")
-        remaining = float(state.get("blocked_until", 0)) - time.time()
-        if remaining > 0:
-            raise BridgeError(
-                f"grinder rest interval active; wait {int(remaining + 0.999)} more seconds"
-            )
+    def _grinder_cooldown_fields(self, *, now: float | None = None) -> dict[str, Any]:
+        """Fields written into durable terminal event / last_operation on confirmed STOP."""
 
-    def _write_grinder_running_record(self, seconds: float) -> None:
-        _atomic_json(
-            self.grinder_state_file,
-            {
-                "in_progress": True,
-                "started_at": time.time(),
-                "requested_runtime_s": float(seconds),
-                "owner": "bridge",
-            },
-            private=True,
-        )
-
-    def _write_grinder_stopped_record(self) -> None:
-        now = time.time()
-        _atomic_json(
-            self.grinder_state_file,
-            {
-                "in_progress": False,
-                "stopped_at": now,
-                "blocked_until": now + GRINDER_REST_SECONDS,
-                "owner": "bridge",
-            },
-            private=True,
-        )
+        stopped_at = time.time() if now is None else float(now)
+        return {
+            "grinder_stopped_at": stopped_at,
+            "grinder_cooldown_until": stopped_at + GRINDER_REST_SECONDS,
+            "grinder_rest_seconds": GRINDER_REST_SECONDS,
+        }
 
     def _cancel_grinder_timer(self) -> None:
         task = self._grinder_timer
@@ -4609,6 +4706,7 @@ class BridgeCore:
         if not 0.1 <= seconds <= 30:
             raise BridgeError("grinder runtime must be 0.1-30 seconds")
         self._ensure_no_loaded_record()
+        # Durable cooldown/recovery gate before any BLE connect/write.
         self._check_grinder_rest()
         reserved = self._reserve_request("grinder.start", params, workflow_id=None)
         if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
@@ -4632,7 +4730,7 @@ class BridgeCore:
         )
         workflow_id = str(wf["workflow_id"])
         self.active_workflow_id = workflow_id
-        self._write_grinder_running_record(seconds)
+        # Durable non-terminal workflow is the sole recovery marker (no JSON).
         self.activity = "grinder"
         self.phase = "starting"
         if self.connection_scope != "explicit":
@@ -4659,6 +4757,7 @@ class BridgeCore:
             "workflow_id": workflow_id,
             "kind": "grinder",
             "snapshot_sha256": wf.get("snapshot_sha256"),
+            "rest_seconds": GRINDER_REST_SECONDS,
             **self.targets,
         }
         self._complete_request(request_id, result)
@@ -4676,12 +4775,35 @@ class BridgeCore:
             self.last_error = (
                 f"grinder {operation} failed and STOP/QUIT is unconfirmed: {stop_exc}"
             )
+            self._set_workflow_state(
+                "stop_unconfirmed",
+                recovery={
+                    "reason": "grinder_stop_unconfirmed",
+                    "operation": operation,
+                    "error": str(stop_exc),
+                },
+            )
+            self._recovery_required = True
+            self._recovery_detail = {
+                "reason": "grinder_stop_unconfirmed",
+                "operation": operation,
+                "workflow_id": self.active_workflow_id,
+                "error": str(stop_exc),
+            }
             raise BridgeError(self.last_error) from stop_exc
-        self._write_grinder_stopped_record()
+        cooldown = self._grinder_cooldown_fields()
         self._finish_activity(
             f"{operation}_failed_stopped",
             release_reason="grinder_confirmed_stop",
+            **cooldown,
         )
+        if self.phase == "recovery_required" or self._recovery_required:
+            # Confirmed STOP on machine but durable terminal failed: keep recovery.
+            self.last_error = (
+                f"grinder {operation} failed; STOP/QUIT confirmed but durable "
+                "terminal commit failed; recovery_required; BLE withheld"
+            )
+            raise BridgeError(self.last_error) from cause
         self.last_error = f"grinder {operation} failed; STOP/QUIT was confirmed"
         raise BridgeError(self.last_error) from cause
 
@@ -5029,23 +5151,48 @@ class BridgeCore:
         request_id: str | None = None,
         emergency: bool = False,
         workflow_id: str | None = None,
+        connect_params: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.phase = "stopping"
         self._cancel_grinder_timer()
+        # Explicit cancel/stop after daemon restart must reconnect once when
+        # disconnected, using durable machine_address / recovery address.
+        if not self.connected:
+            await self._ensure_connected(
+                dict(connect_params or {}),
+                scope="one-shot",
+            )
         try:
             event = await self.client.stop_grinder_session()
         except Exception as exc:
             self.phase = "stop_unconfirmed"
             self.last_error = f"grinder STOP/QUIT is unconfirmed: {exc}"
+            self._set_workflow_state(
+                "stop_unconfirmed",
+                workflow_id=workflow_id or self.active_workflow_id,
+                recovery={
+                    "reason": "grinder_stop_unconfirmed",
+                    "error": str(exc),
+                },
+            )
+            self._recovery_required = True
+            self._recovery_detail = {
+                "reason": "grinder_stop_unconfirmed",
+                "workflow_id": workflow_id or self.active_workflow_id,
+                "error": str(exc),
+            }
             if request_id:
                 self._fail_request(request_id, str(exc), keep_pending=True)
+            # Unconfirmed stop retains active recovery and connection (no release).
             raise BridgeError(self.last_error) from exc
-        self._write_grinder_stopped_record()
+        cooldown = self._grinder_cooldown_fields()
         result = {
             "status": "stopped",
             "activity": "grinder",
             "ack": event.command_code,
             "workflow_id": workflow_id or self.active_workflow_id,
+            "rest_seconds": GRINDER_REST_SECONDS,
+            **cooldown,
         }
         if emergency:
             result["emergency"] = True
@@ -5055,6 +5202,7 @@ class BridgeCore:
             emergency=emergency,
             request_id=request_id,
             idempotency_result=result if request_id else None,
+            **cooldown,
         )
         if request_id and self.phase == "recovery_required":
             raise BridgeError(
@@ -5227,6 +5375,7 @@ class BridgeCore:
                 request_id=request_id,
                 emergency=used_emergency,
                 workflow_id=workflow_id or None,
+                connect_params=params,
             )
             return result
         if self.activity == "water":

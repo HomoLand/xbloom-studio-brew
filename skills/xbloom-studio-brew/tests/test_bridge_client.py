@@ -667,8 +667,6 @@ def test_no_five_minute_loaded_helpers():
 
 def test_cancel_does_not_silently_become_emergency(monkeypatch, tmp_path):
     monkeypatch.setenv("XBLOOM_STATE_DIR", str(tmp_path))
-    monkeypatch.setattr(xbloom, "STATE_FILE", tmp_path / "coffee.json")
-    monkeypatch.setattr(xbloom, "TEA_STATE_FILE", tmp_path / "tea.json")
     calls = []
 
     class FakeTyped:
@@ -701,9 +699,6 @@ def test_cli_error_json_includes_category(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(xbloom, "make_bridge_client", lambda _a: Boom())
     monkeypatch.setattr(xbloom, "reexec_in_local_runtime", lambda: None)
     monkeypatch.setattr(xbloom, "require_runtime", lambda: None)
-    # STATE files absent so probe gate passes.
-    monkeypatch.setattr(xbloom, "STATE_FILE", tmp_path / "no-coffee.json")
-    monkeypatch.setattr(xbloom, "TEA_STATE_FILE", tmp_path / "no-tea.json")
     rc = xbloom.main(["probe"])
     assert rc == 2
     out = capsys.readouterr().out

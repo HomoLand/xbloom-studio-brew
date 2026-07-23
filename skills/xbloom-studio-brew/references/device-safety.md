@@ -227,10 +227,27 @@ python scripts/xbloom.py grind --size 62 --rpm 100 --seconds 10 \
   --confirm-ready beans-cup-clear
 ```
 
-Each run is limited to 30 seconds. The wrapper records a conservative runtime-plus-60-second block
-under the state directory before sending START. Do not delete or relocate that record to bypass a
-cooldown. STOP and QUIT are attempted from a `finally` block on normal errors or interruption;
-physical controls remain the final fallback if the process or BLE adapter fails completely.
+Each run is limited to 30 seconds. Authority for ownership and the post-stop rest lives only in
+SQLite `state.db` (bridge `status.grinder_guard`). There is no runtime CLI/wrapper
+`grinder-rest-state.json` reserve/`in_progress` file:
+
+1. **Before any motor write:** create a durable nonterminal grinder workflow (snapshot +
+   `workflow_id`). That row is the sole recovery marker if the daemon dies mid-grind.
+2. **Confirmed STOP:** terminal event/last_operation include `grinder_stopped_at`,
+   `grinder_cooldown_until` (or `blocked_until` on migrated payloads), and
+   `grinder_rest_seconds` (60). `grinder_guard.state` becomes `cooldown` until the deadline.
+3. **60-second guard:** a fresh `grinder.start` is blocked pre-BLE while `grinder_guard` is
+   `cooldown` or `recovery_required`. Exact completed `request_id` duplicates still return the
+   SQLite-cached result **before** cooldown/activity/BLE gates (no second motor write).
+4. **Unconfirmed STOP:** retain `recovery_required`, keep the active workflow and BLE link; do
+   not prompt-release. Physical stop is the final fallback if the process or adapter fails.
+5. **Prompt BLE release:** only after a confirmed durable terminal commit (cooldown fields
+   recorded). Restart cancel of a reconstructed nonterminal grinder reconnects once for STOP
+   only (no auto-start).
+
+`grinder_guard` states: `ready`, `cooldown`, `recovery_required`, `unavailable` (fail closed).
+Legacy `grinder-rest-state.json` is import-only via explicit `state migrate`; runtime never
+reads or writes it.
 
 ## Recovery
 
@@ -251,15 +268,16 @@ Use the least invasive recovery path:
 For a bridge-owned activity, inspect `bridge status` and `bridge events` first, then use
 `bridge cancel`. An idle `bridge stop` is clean; `bridge stop --force` may send a physical stop and
 must be treated as an action, not process cleanup. If the bridge process crashes during grinding,
-its persisted `in_progress` rest record intentionally blocks another run until the operator has
-confirmed the machine stopped and the conservative cooldown has elapsed.
+the durable nonterminal grinder workflow surfaces as `grinder_guard.state=recovery_required` and
+blocks another start until the operator cancel/recovers (one-shot reconnect for STOP only) and any
+confirmed 60-second cooldown has elapsed.
 
-Durable coffee/tea workflows and immutable snapshots live in SQLite `state.db`. Legacy coffee/tea
-JSON (`armed-state.json`, `tea-loaded-state.json`) is import-only via explicit migration and is
-never written by runtime. Grinder-rest JSON, bridge endpoint/token, bridge log, and the external
-Python runtime also live under `~/.xbloom-studio-brew/` by default. Override the directory with
-`XBLOOM_STATE_DIR` (canonical) or legacy `XBLOOM_SKILL_STATE_DIR` for tests or managed deployments;
-`XBLOOM_SKILL_RUNTIME_DIR` can override only the virtual environment. The bridge binds only to
-loopback, holds a lifecycle `bridge.lock`, and authenticates each JSON-line request with its random
-local token (never exposed via `status`/`hello`); this is local process isolation, not a remotely
-exposed security boundary.
+Durable coffee/tea/grinder workflows and immutable snapshots live in SQLite `state.db`. Legacy
+`*-state.json` (`armed-state.json`, `tea-loaded-state.json`, `grinder-rest-state.json`) is
+import-only via explicit migration and is never read or written by runtime. Bridge endpoint/token,
+bridge log, and the external Python runtime also live under `~/.xbloom-studio-brew/` by default.
+Override the directory with `XBLOOM_STATE_DIR` (canonical) or legacy `XBLOOM_SKILL_STATE_DIR` for
+tests or managed deployments; `XBLOOM_SKILL_RUNTIME_DIR` can override only the virtual environment.
+The bridge binds only to loopback, holds a lifecycle `bridge.lock`, and authenticates each
+JSON-line request with its random local token (never exposed via `status`/`hello`); this is local
+process isolation, not a remotely exposed security boundary.

@@ -125,11 +125,9 @@ def preferred_runtime_python(
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE_DIR = skill_state_dir()
-# Legacy coffee/tea JSON path names only (import-only via xbloom-state migrate).
-# Skill runtime never reads, writes, or unlinks these files.
-STATE_FILE = STATE_DIR / "armed-state.json"
-TEA_STATE_FILE = STATE_DIR / "tea-loaded-state.json"
-GRINDER_STATE_FILE = STATE_DIR / "grinder-rest-state.json"
+# Runtime state is SQLite state.db via the bridge/StateStore. Legacy
+# armed-state.json / tea-loaded-state.json / grinder-rest-state.json are
+# import-only via xbloom-state migrate and are never read/written by the CLI.
 CATALOG_FILE = STATE_DIR / "catalog" / "catalog.json"
 HISTORY_FILE = STATE_DIR / "brew-history.jsonl"
 CATALOG_PATH_ENV = "XBLOOM_CATALOG_PATH"
@@ -151,7 +149,6 @@ READY_SENTINEL = "cup-filter-water-beans"
 WATER_READY_SENTINEL = "vessel-water-clear"
 GRINDER_READY_SENTINEL = "beans-cup-clear"
 TEA_READY_SENTINEL = "tea-brewer-water-cup-clear"
-GRINDER_REST_SECONDS = 60
 FIRMWARE_RE = re.compile(rb"V\d+(?:\.\d+[A-Za-z]?)+")
 SUPPORTED_FIRMWARE = frozenset({"V12.0D.500"})
 UNTESTED_FIRMWARE_ENV = "XBLOOM_ALLOW_UNTESTED_FIRMWARE"
@@ -230,52 +227,6 @@ def require_runtime() -> None:
         raise RuntimeError("BLE runtime missing; run: python scripts/bootstrap.py")
 
 
-def state_write(data: dict[str, Any], path: Path | None = None) -> None:
-    """Write a grinder (or other non-coffee/tea) rest record.
-
-    Coffee/tea compatibility JSON is never written; default path is grinder only
-    when callers pass an explicit path. Do not use for armed-state/tea-loaded.
-    """
-
-    if path is None:
-        raise RuntimeError(
-            "state_write requires an explicit path; coffee/tea JSON is import-only"
-        )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(".tmp")
-    temp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    temp.replace(path)
-
-
-def state_read(path: Path | None = None) -> dict[str, Any]:
-    """Read a grinder (or other non-coffee/tea) rest record."""
-
-    if path is None:
-        raise RuntimeError(
-            "state_read requires an explicit path; coffee/tea JSON is import-only"
-        )
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
-        raise RuntimeError(f"no valid state record at {path}") from exc
-    if not isinstance(data, dict):
-        raise RuntimeError(f"state record at {path} is invalid")
-    return data
-
-
-def state_clear(path: Path | None = None) -> None:
-    """Clear a grinder (or other non-coffee/tea) rest record."""
-
-    if path is None:
-        raise RuntimeError(
-            "state_clear requires an explicit path; coffee/tea JSON is import-only"
-        )
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
-
-
 def history_path() -> Path:
     """Deprecated state-root selector path (legacy JSONL location).
 
@@ -336,67 +287,6 @@ def account_password_for_catalog(action: str) -> str:
     import getpass
 
     return getpass.getpass("xBloom account password: ")
-
-
-def ensure_no_loaded_workflow(client: Any | None = None) -> None:
-    """Refuse new one-shot work when bridge owns an active durable workflow.
-
-    Does not inspect legacy armed-state.json / tea-loaded-state.json (import-only).
-    When ``client`` is omitted the bridge ownership gate is applied by the RPC.
-    """
-
-    if client is None:
-        return
-    try:
-        status = client.status(require_hello=False)
-    except Exception:
-        return
-    activity = status.get("activity")
-    active_wf = status.get("active_workflow_id")
-    if activity is not None or active_wf:
-        raise RuntimeError(
-            f"bridge owns activity={activity!r} workflow_id={active_wf!r}; "
-            "cancel before changing modes"
-        )
-    if status.get("idle") is False and (
-        status.get("recovery") or status.get("recovery_records")
-    ):
-        raise RuntimeError(
-            "bridge is not idle (recovery or active ownership); cancel first"
-        )
-
-
-def require_grinder_rest() -> None:
-    if not GRINDER_STATE_FILE.exists():
-        return
-    try:
-        data = state_read(GRINDER_STATE_FILE)
-    except RuntimeError as exc:
-        raise RuntimeError(
-            "grinder rest record is unreadable; do not grind until an owner inspects it"
-        ) from exc
-    if data.get("in_progress"):
-        raise RuntimeError(
-            "a previous grinder session has no verified stop; inspect/recover before grinding"
-        )
-    remaining = float(data.get("blocked_until", 0)) - time.time()
-    if remaining > 0:
-        raise RuntimeError(
-            f"grinder rest interval active; wait {int(remaining + 0.999)} more seconds"
-        )
-
-
-def reserve_grinder_rest(seconds: float) -> None:
-    # Reserve before sending START. If the process is killed and cannot write a
-    # completion timestamp, the conservative block still covers runtime + rest.
-    state_write(
-        {
-            "reserved_at": time.time(),
-            "runtime_s": float(seconds),
-            "blocked_until": time.time() + float(seconds) + GRINDER_REST_SECONDS,
-        },
-        GRINDER_STATE_FILE,
-    )
 
 
 def redact_machine_info(machine_info: dict[str, object]) -> dict[str, object]:
@@ -627,7 +517,6 @@ def require_settings_write_gate(confirmation: str, expected: str) -> None:
 async def async_settings(args: argparse.Namespace) -> int:
     """Read persistent user settings without changing the machine."""
 
-    ensure_no_loaded_workflow()
     client = make_bridge_client(args)
     result = client.settings_read(
         address=args.address, scan_timeout=float(args.scan_timeout)
@@ -652,7 +541,6 @@ async def async_set_settings(args: argparse.Namespace) -> int:
     }
     if not requested:
         raise RuntimeError("set-settings needs at least one setting option")
-    ensure_no_loaded_workflow()
     client = make_bridge_client(args)
     result = client.settings_write(
         confirmation=args.confirm_write,
@@ -667,7 +555,6 @@ async def async_set_settings(args: argparse.Namespace) -> int:
 async def async_advanced(args: argparse.Namespace) -> int:
     """Read APK-defined mechanical tuning values."""
 
-    ensure_no_loaded_workflow()
     client = make_bridge_client(args)
     result = client.advanced_read(
         address=args.address, scan_timeout=float(args.scan_timeout)
@@ -682,7 +569,6 @@ async def async_set_advanced(args: argparse.Namespace) -> int:
     require_settings_write_gate(args.confirm_write, ADVANCED_CONFIRM_SENTINEL)
     if args.pour_radius_level is None and args.vibration_level is None:
         raise RuntimeError("set-advanced needs at least one level option")
-    ensure_no_loaded_workflow()
     client = make_bridge_client(args)
     result = client.advanced_write(
         confirmation=args.confirm_write,
@@ -1527,7 +1413,6 @@ async def async_scale(args: argparse.Namespace) -> int:
         raise RuntimeError("scale --interval must be 0.05-10 seconds")
     if not 0.1 <= float(args.duration) <= 3600:
         raise RuntimeError("scale --duration must be 0.1-3600 seconds")
-    ensure_no_loaded_workflow()
     client = make_bridge_client(args)
     emit(
         {
@@ -1569,9 +1454,8 @@ async def async_grind(args: argparse.Namespace) -> int:
         raise RuntimeError("grind --rpm must be 60-120")
     if not 0.1 <= float(args.seconds) <= 30.0:
         raise RuntimeError("grind --seconds must be 0.1-30")
-    ensure_no_loaded_workflow()
-    require_grinder_rest()
-    reserve_grinder_rest(args.seconds)
+    # Ownership, recovery, and 60s cooldown gates live solely on the bridge
+    # (durable SQLite grinder_guard). CLI never reads/writes *-state.json.
     client = make_bridge_client(args)
     result = client.grinder_start(
         size=int(args.size),
@@ -1588,7 +1472,7 @@ async def async_grind(args: argparse.Namespace) -> int:
             "size": args.size,
             "rpm": args.rpm,
             "seconds": args.seconds,
-            "rest_seconds": GRINDER_REST_SECONDS,
+            "rest_seconds": result.get("rest_seconds"),
             "workflow_id": result.get("workflow_id"),
             **result,
         }
@@ -1613,7 +1497,6 @@ async def async_water(args: argparse.Namespace) -> int:
         raise RuntimeError("water --flow must be 3.0-3.5 ml/s in 0.1 steps")
     if args.timeout is not None and not 5 <= float(args.timeout) <= 600:
         raise RuntimeError("water --timeout must be 5-600 seconds")
-    ensure_no_loaded_workflow()
     client = make_bridge_client(args)
     result = client.water_start(
         volume_ml=float(args.volume),
@@ -1879,7 +1762,6 @@ async def async_save_slots(args: argparse.Namespace) -> int:
     loaded = [load_recipe(path) for path in args.recipes]
     for _path, recipe, _summary in loaded:
         validate_slot_compatible(recipe)
-    ensure_no_loaded_workflow()
     client = make_bridge_client(args)
     scale = [value == "on" for value in args.scale]
     result = client.presets_save(

@@ -421,24 +421,20 @@ def test_monitor_idle_foreign_last_op_no_global_fields(monkeypatch, tmp_path):
 
 
 def test_load_rejects_empty_workflow_id(monkeypatch, tmp_path):
-    """Exact-workflow contract: missing workflow_id refuses success and state write."""
+    """Exact-workflow contract: missing workflow_id refuses success; no JSON write."""
 
     _isolate_history(monkeypatch, tmp_path)
-    state_path = tmp_path / "coffee.json"
-    monkeypatch.setattr(xbloom, "STATE_FILE", state_path)
-    monkeypatch.setattr(xbloom, "TEA_STATE_FILE", tmp_path / "tea.json")
-    wrote = {"n": 0}
+    json_paths = [
+        tmp_path / "armed-state.json",
+        tmp_path / "tea-loaded-state.json",
+        tmp_path / "grinder-rest-state.json",
+    ]
 
     class FakeTyped:
         def coffee_load(self, **kwargs):
             return {"status": "armed", "workflow_id": ""}
 
-    def capture_write(state, path=None):
-        wrote["n"] += 1
-        raise AssertionError("must not write compatibility state without workflow_id")
-
     monkeypatch.setattr(xbloom, "make_bridge_client", lambda _a: FakeTyped())
-    monkeypatch.setattr(xbloom, "state_write", capture_write)
     monkeypatch.setattr(
         xbloom,
         "load_recipe",
@@ -454,31 +450,22 @@ def test_load_rejects_empty_workflow_id(monkeypatch, tmp_path):
             },
         ),
     )
-    monkeypatch.setattr(xbloom, "ensure_no_loaded_workflow", lambda: None)
     args = xbloom.build_parser().parse_args(["load", "recipe.yaml"])
     with pytest.raises(RuntimeError, match="no workflow_id"):
         asyncio.run(xbloom.async_load(args))
-    assert wrote["n"] == 0
-    assert not state_path.exists()
+    for path in json_paths:
+        assert not path.exists()
 
 
 def test_tea_load_rejects_missing_workflow_id(monkeypatch, tmp_path):
     _isolate_history(monkeypatch, tmp_path)
-    tea_state = tmp_path / "tea.json"
-    monkeypatch.setattr(xbloom, "STATE_FILE", tmp_path / "coffee.json")
-    monkeypatch.setattr(xbloom, "TEA_STATE_FILE", tea_state)
-    wrote = {"n": 0}
+    tea_json = tmp_path / "tea-loaded-state.json"
 
     class FakeTyped:
         def tea_load(self, **kwargs):
             return {"status": "tea_loaded"}  # workflow_id absent
 
-    def capture_write(state, path=None):
-        wrote["n"] += 1
-        raise AssertionError("must not write tea state without workflow_id")
-
     monkeypatch.setattr(xbloom, "make_bridge_client", lambda _a: FakeTyped())
-    monkeypatch.setattr(xbloom, "state_write", capture_write)
     monkeypatch.setattr(
         xbloom,
         "load_tea_recipe",
@@ -491,12 +478,10 @@ def test_tea_load_rejects_missing_workflow_id(monkeypatch, tmp_path):
             },
         ),
     )
-    monkeypatch.setattr(xbloom, "ensure_no_loaded_workflow", lambda: None)
     args = xbloom.build_parser().parse_args(["tea-load", "tea.yaml"])
     with pytest.raises(RuntimeError, match="no workflow_id"):
         asyncio.run(xbloom.async_tea_load(args))
-    assert wrote["n"] == 0
-    assert not tea_state.exists()
+    assert not tea_json.exists()
 
 
 def test_water_timeout_is_observation_bound_no_side_effects(monkeypatch, tmp_path):
@@ -504,8 +489,6 @@ def test_water_timeout_is_observation_bound_no_side_effects(monkeypatch, tmp_pat
 
     _isolate_history(monkeypatch, tmp_path)
     monkeypatch.setenv(xbloom.REMOTE_START_ENV, xbloom.REMOTE_START_SENTINEL)
-    monkeypatch.setattr(xbloom, "STATE_FILE", tmp_path / "coffee.json")
-    monkeypatch.setattr(xbloom, "TEA_STATE_FILE", tmp_path / "tea.json")
     side_effects = []
     emitted = []
 
@@ -553,7 +536,6 @@ def test_water_timeout_is_observation_bound_no_side_effects(monkeypatch, tmp_pat
 
     monkeypatch.setattr(xbloom, "make_bridge_client", lambda _a: FakeTyped())
     monkeypatch.setattr(xbloom, "emit", emitted.append)
-    monkeypatch.setattr(xbloom, "ensure_no_loaded_workflow", lambda: None)
     args = xbloom.build_parser().parse_args(
         [
             "water",
@@ -585,8 +567,6 @@ def test_water_timeout_is_observation_bound_no_side_effects(monkeypatch, tmp_pat
 
 def test_water_rejects_empty_workflow_id_before_monitor(monkeypatch, tmp_path):
     monkeypatch.setenv(xbloom.REMOTE_START_ENV, xbloom.REMOTE_START_SENTINEL)
-    monkeypatch.setattr(xbloom, "STATE_FILE", tmp_path / "coffee.json")
-    monkeypatch.setattr(xbloom, "TEA_STATE_FILE", tmp_path / "tea.json")
     monitor_calls = []
 
     class FakeTyped:
@@ -599,7 +579,6 @@ def test_water_rejects_empty_workflow_id_before_monitor(monkeypatch, tmp_path):
 
     monkeypatch.setattr(xbloom, "make_bridge_client", lambda _a: FakeTyped())
     monkeypatch.setattr(xbloom, "async_monitor", boom_monitor)
-    monkeypatch.setattr(xbloom, "ensure_no_loaded_workflow", lambda: None)
     args = xbloom.build_parser().parse_args(
         [
             "water",

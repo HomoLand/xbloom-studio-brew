@@ -104,6 +104,39 @@ ACTIVE_WORKFLOW_STATES = frozenset(
         "recovery",
         "recovery_required",
         "recovering",
+        "recovery_imported",
+    }
+)
+
+# Validated workflow kinds for structured queries (no ad hoc SQL outside storage).
+KNOWN_WORKFLOW_KINDS = frozenset(
+    {
+        "coffee",
+        "tea",
+        "grinder",
+        "water",
+        "scale",
+        "settings",
+        "advanced",
+        "presets",
+        "coffee_recovery",
+        "tea_recovery",
+        "grinder_recovery",
+    }
+)
+GRINDER_WORKFLOW_KINDS = frozenset({"grinder", "grinder_recovery"})
+RECOVERY_WORKFLOW_KINDS = frozenset(
+    {"coffee_recovery", "tea_recovery", "grinder_recovery"}
+)
+# Legacy grinder-rest JSON status/phase values that mean confirmed stop / rest.
+LEGACY_GRINDER_TERMINAL_STATUSES = frozenset(
+    {
+        "rest",
+        "stopped",
+        "complete",
+        "completed",
+        "idle",
+        "cancelled",
     }
 )
 
@@ -3173,7 +3206,7 @@ class StateStore:
             """
             SELECT * FROM workflows
             WHERE terminal_at IS NULL
-            ORDER BY updated_at DESC, created_at DESC
+            ORDER BY updated_at DESC, created_at DESC, rowid DESC
             LIMIT 1
             """
         ).fetchone()
@@ -3188,9 +3221,62 @@ class StateStore:
         row = self._connect().execute(
             """
             SELECT workflow_id FROM workflows
-            ORDER BY updated_at DESC, created_at DESC
+            ORDER BY updated_at DESC, created_at DESC, rowid DESC
             LIMIT 1
             """
+        ).fetchone()
+        if row is None:
+            return None
+        return self.get_workflow(str(row["workflow_id"]))
+
+    def get_latest_workflow_for_kinds(
+        self,
+        kinds: Sequence[str],
+        *,
+        terminal: bool | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the newest workflow among a validated set of kinds.
+
+        Ordering is deterministic: ``updated_at`` DESC, ``created_at`` DESC,
+        then SQLite ``rowid`` DESC as a final insertion-identity tie-breaker.
+        ``utc_now()`` is second-resolution, so two terminal commits in the same
+        second would otherwise be non-deterministic without ``rowid``.
+
+        ``terminal`` filters:
+        - ``True``: only rows with ``terminal_at`` set
+        - ``False``: only non-terminal rows
+        - ``None``: either
+        """
+
+        if not kinds:
+            raise StorageError("kinds must be a non-empty sequence")
+        seen: set[str] = set()
+        normalized: list[str] = []
+        for raw in kinds:
+            if not isinstance(raw, str) or not raw.strip():
+                raise StorageError(f"invalid workflow kind {raw!r}")
+            kind = raw.strip()
+            if kind not in KNOWN_WORKFLOW_KINDS:
+                raise StorageError(f"unknown workflow kind {kind!r}")
+            if kind not in seen:
+                seen.add(kind)
+                normalized.append(kind)
+        placeholders = ", ".join("?" for _ in normalized)
+        if terminal is True:
+            terminal_clause = "AND terminal_at IS NOT NULL"
+        elif terminal is False:
+            terminal_clause = "AND terminal_at IS NULL"
+        else:
+            terminal_clause = ""
+        self.ensure_schema()
+        row = self._connect().execute(
+            f"""
+            SELECT workflow_id FROM workflows
+            WHERE kind IN ({placeholders}) {terminal_clause}
+            ORDER BY updated_at DESC, created_at DESC, rowid DESC
+            LIMIT 1
+            """,
+            tuple(normalized),
         ).fetchone()
         if row is None:
             return None
@@ -3204,7 +3290,7 @@ class StateStore:
             """
             SELECT workflow_id FROM workflows
             WHERE terminal_at IS NULL
-            ORDER BY updated_at DESC, created_at DESC
+            ORDER BY updated_at DESC, created_at DESC, rowid DESC
             """
         ).fetchall()
         result: list[dict[str, Any]] = []
@@ -4603,6 +4689,38 @@ def _write_migration_receipt(
     )
 
 
+def _classify_legacy_grinder_recovery(
+    payload: Mapping[str, Any],
+) -> tuple[bool, str]:
+    """Classify legacy grinder-rest JSON into terminal cooldown vs active recovery.
+
+    Terminal (``cooldown_imported``) when:
+    - ``in_progress`` is explicitly false, or
+    - ``stopped_at`` is present, or
+    - status/phase is a known terminal rest/stop/complete/idle/cancelled token.
+
+    Non-terminal (``recovery_imported``, fail-closed) when:
+    - ``in_progress`` is true, or
+    - a reserve-style record (``reserved_at`` without confirmed stop), or
+    - semantic state is unknown/malformed for a safe cooldown claim.
+    """
+
+    if payload.get("in_progress") is True:
+        return False, "recovery_imported"
+    if payload.get("in_progress") is False:
+        return True, "cooldown_imported"
+    if payload.get("stopped_at") is not None:
+        return True, "cooldown_imported"
+    status = str(payload.get("status") or payload.get("phase") or "").strip().lower()
+    if status in LEGACY_GRINDER_TERMINAL_STATUSES:
+        return True, "cooldown_imported"
+    # Reserve-before-start records lack confirmed stop; fail closed.
+    if payload.get("reserved_at") is not None and payload.get("stopped_at") is None:
+        return False, "recovery_imported"
+    # Unknown / empty semantic state: never claim a confirmed cooldown.
+    return False, "recovery_imported"
+
+
 def _import_recovery(
     store: StateStore,
     conn: sqlite3.Connection,
@@ -4634,39 +4752,82 @@ def _import_recovery(
     if not inserted:
         return stats
 
-    # Surface recovery as a workflow row so later Phase A can inspect it.
+    # Surface recovery as a workflow row. Coffee/tea always non-terminal
+    # recovery_imported. Grinder may be terminal cooldown_imported when the
+    # legacy record already encodes a confirmed stop / rest interval.
     workflow_kind = {
         "recovery_armed": "coffee_recovery",
         "recovery_tea": "tea_recovery",
         "recovery_grinder": "grinder_recovery",
     }.get(kind, kind)
     wid = f"legacy_{kind}_{file_sha[:16]}"
+    if kind == "recovery_grinder":
+        is_terminal, state = _classify_legacy_grinder_recovery(payload)
+    else:
+        is_terminal, state = False, "recovery_imported"
+    terminal_at = imported_at if is_terminal else None
     conn.execute(
         """
         INSERT OR IGNORE INTO workflows (
             workflow_id, kind, state, recipe_revision_id, snapshot_json,
             snapshot_sha256, source, owner, machine_phase, recovery_json,
             created_at, updated_at, terminal_at, metadata_json
-        ) VALUES (?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL, ?, ?, ?, NULL, ?)
+        ) VALUES (?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL, ?, ?, ?, ?, ?)
         """,
         (
             wid,
             workflow_kind,
-            "recovery_imported",
+            state,
             "legacy_migration",
             canonical_json(payload),
             imported_at,
             imported_at,
+            terminal_at,
             canonical_json(
                 {
                     "legacy_path": str(path),
                     "legacy_sha256": file_sha,
                     "source_kind": kind,
+                    "import_classification": state,
                 }
             ),
         ),
     )
+    stats["terminal"] = 1 if is_terminal else 0
+    stats["state"] = state
     return stats
+
+
+def _assert_single_nonterminal_recovery(
+    conn: sqlite3.Connection,
+) -> None:
+    """Fail closed when import would leave multiple concurrent recovery activities."""
+
+    rows = conn.execute(
+        f"""
+        SELECT workflow_id, kind, metadata_json FROM workflows
+        WHERE terminal_at IS NULL
+          AND kind IN ({", ".join("?" for _ in RECOVERY_WORKFLOW_KINDS)})
+        ORDER BY created_at ASC, workflow_id ASC
+        """,
+        tuple(sorted(RECOVERY_WORKFLOW_KINDS)),
+    ).fetchall()
+    if len(rows) <= 1:
+        return
+    source_kinds: list[str] = []
+    for row in rows:
+        meta_raw = row["metadata_json"] or "{}"
+        try:
+            meta = json.loads(meta_raw)
+        except json.JSONDecodeError:
+            meta = {}
+        source = meta.get("source_kind") if isinstance(meta, dict) else None
+        source_kinds.append(str(source or row["kind"]))
+    raise StorageError(
+        "legacy migration would leave more than one non-terminal recovery "
+        f"workflow from source kinds {source_kinds}; refuse to choose one "
+        "activity (entire import rolled back; originals and backup remain)"
+    )
 
 
 def _runtime_truth_full() -> dict[str, str]:
@@ -4936,6 +5097,9 @@ def migrate_legacy_state(
                             imported_at=imported_at,
                         )
                     _maybe_fault(f"after_{kind}")
+
+                # Never leave multiple concurrent recovery activities after import.
+                _assert_single_nonterminal_recovery(conn)
 
                 # All receipts + imported rows commit atomically.
                 _write_migration_receipt(
@@ -5212,18 +5376,22 @@ __all__ = [
     "DB_FILE_NAME",
     "DEFAULT_HISTORY_LIST_LIMIT",
     "DEFAULT_RECIPE_LIST_LIMIT",
+    "GRINDER_WORKFLOW_KINDS",
     "HISTORY_SOURCE_APP",
     "HISTORY_SOURCE_LOCAL",
     "HISTORY_VALID_OUTCOMES",
     "IDEM_COMPLETED",
     "IDEM_FAILED",
     "IDEM_PENDING",
+    "KNOWN_WORKFLOW_KINDS",
     "LEGACY_CATALOG_CUTOVER_NAME",
+    "LEGACY_GRINDER_TERMINAL_STATUSES",
     "LEGACY_HISTORY_CUTOVER_NAME",
     "LEGACY_MIGRATION_NAME",
     "MAX_HISTORY_LIST_LIMIT",
     "MAX_HISTORY_NOTE_CHARS",
     "MAX_RECIPE_LIST_LIMIT",
+    "RECOVERY_WORKFLOW_KINDS",
     "SCHEMA_VERSION",
     "StateStore",
     "StorageConflictError",

@@ -242,8 +242,10 @@ Optional `--scale on off on` configures the three on-brew scale flags in A/B/C o
 - The tested firmware allowlist currently contains `V12.0D.500`; other firmware requires an explicit
   owner-level compatibility override.
 - Every external or generated recipe must pass the same validator.
-- Grinder runs are limited to 30 seconds with a persisted 60-second rest lock; stop/quit cleanup is
-  attempted even on ordinary interruption.
+- Grinder runs are limited to 30 seconds with a durable SQLite 60-second cooldown/recovery guard
+  (`state.db` / `grinder_guard`); stop/quit cleanup is attempted even on ordinary interruption.
+  Unconfirmed STOP retains recovery and the BLE link until a confirmed terminal; legacy
+  `*-state.json` is import-only.
 - The persistent bridge binds only to loopback, authenticates local requests with a random token,
   owns one BLE connection, and serializes writes. Starting it alone does not connect or actuate.
 - Interactive grinder control fails closed to STOP/QUIT on missing ACKs. Interactive water has a

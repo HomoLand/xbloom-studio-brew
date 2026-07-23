@@ -280,28 +280,64 @@ def test_persistent_setting_writes_require_owner_and_per_call_gates(monkeypatch)
     )
 
 
-def test_grinder_rest_interval_is_persisted(monkeypatch, tmp_path):
-    path = tmp_path / "grinder.json"
-    monkeypatch.setattr(xbloom, "GRINDER_STATE_FILE", path)
-    xbloom.reserve_grinder_rest(10)
-    with pytest.raises(RuntimeError, match="rest interval active"):
-        xbloom.require_grinder_rest()
+def test_cli_never_writes_or_reads_local_state_json(monkeypatch, tmp_path):
+    """CLI owns no *-state.json; grind validates then calls typed bridge only."""
 
+    # Isolate state root so we can assert no legacy JSON is created.
+    monkeypatch.setenv("XBLOOM_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(xbloom, "STATE_DIR", tmp_path)
+    monkeypatch.setenv(xbloom.REMOTE_GRINDER_ENV, xbloom.REMOTE_GRINDER_SENTINEL)
+    # Legacy path constants and local rest helpers are gone.
+    assert not hasattr(xbloom, "STATE_FILE")
+    assert not hasattr(xbloom, "TEA_STATE_FILE")
+    assert not hasattr(xbloom, "GRINDER_STATE_FILE")
+    assert not hasattr(xbloom, "state_write")
+    assert not hasattr(xbloom, "state_read")
+    assert not hasattr(xbloom, "state_clear")
+    assert not hasattr(xbloom, "require_grinder_rest")
+    assert not hasattr(xbloom, "reserve_grinder_rest")
+    assert not hasattr(xbloom, "ensure_no_loaded_workflow")
 
-def test_corrupt_grinder_rest_record_blocks_motor(monkeypatch, tmp_path):
-    path = tmp_path / "grinder.json"
-    path.write_text("{not-json", encoding="utf-8")
-    monkeypatch.setattr(xbloom, "GRINDER_STATE_FILE", path)
-    with pytest.raises(RuntimeError, match="rest record is unreadable"):
-        xbloom.require_grinder_rest()
+    calls: list[dict] = []
 
+    class FakeTyped:
+        def grinder_start(self, **kwargs):
+            calls.append(dict(kwargs))
+            return {
+                "status": "running",
+                "workflow_id": "wf_cli_grind",
+                "rest_seconds": 60,
+                "size": kwargs["size"],
+                "rpm": kwargs["rpm"],
+                "runtime_s": kwargs["seconds"],
+            }
 
-def test_unverified_bridge_grinder_stop_record_blocks_motor(monkeypatch, tmp_path):
-    path = tmp_path / "grinder.json"
-    path.write_text('{"in_progress": true}', encoding="utf-8")
-    monkeypatch.setattr(xbloom, "GRINDER_STATE_FILE", path)
-    with pytest.raises(RuntimeError, match="no verified stop"):
-        xbloom.require_grinder_rest()
+    monkeypatch.setattr(xbloom, "make_bridge_client", lambda _a: FakeTyped())
+    args = xbloom.build_parser().parse_args(
+        [
+            "grind",
+            "--size",
+            "62",
+            "--rpm",
+            "100",
+            "--seconds",
+            "5",
+            "--confirm-ready",
+            xbloom.GRINDER_READY_SENTINEL,
+        ]
+    )
+    assert asyncio.run(xbloom.async_grind(args)) == 0
+    assert len(calls) == 1
+    assert calls[0]["size"] == 62
+    assert calls[0]["seconds"] == 5.0
+    # No legacy state JSON under the isolated state root.
+    for name in (
+        "armed-state.json",
+        "tea-loaded-state.json",
+        "grinder-rest-state.json",
+    ):
+        assert not (tmp_path / name).exists()
+        assert not (xbloom.STATE_DIR / name).exists()
 
 
 def test_hardware_commands_no_longer_refuse_running_bridge(monkeypatch):

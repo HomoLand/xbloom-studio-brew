@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -1287,37 +1288,69 @@ def test_lifecycle_client_ready_contract(tmp_path, monkeypatch):
     stop_bridge_daemon(state_root=tmp_path)
 
 
-def test_completed_grinder_rest_not_recovery(tmp_path):
+def test_durable_grinder_cooldown_not_recovery_marker(tmp_path):
+    """Cooldown terminal cooldown does not mark idle-restart recovery file markers.
+
+    Unmigrated grinder JSON is ignored; SQLite grinder_guard is the sole gate.
+    """
+
     core = BridgeCore(state_dir=tmp_path, environ={})
-    # Completed cooldown record persists intentionally.
-    (tmp_path / "grinder-rest-state.json").write_text(
-        json.dumps(
-            {
-                "in_progress": False,
-                "blocked_until": 9_999_999_999,
-                "owner": "bridge",
-            }
-        ),
-        encoding="utf-8",
-    )
-    assert core._grinder_is_recovery() is False
-    assert core.is_idle() is True
-    assert "grinder-rest-state.json" not in core.recovery_record_names()
-    # File preserved (not deleted by idle checks).
-    assert (tmp_path / "grinder-rest-state.json").is_file()
+    try:
+        # Stale unmigrated JSON never surfaces as recovery_record_names or non-idle.
+        (tmp_path / "grinder-rest-state.json").write_text(
+            json.dumps(
+                {
+                    "in_progress": True,
+                    "blocked_until": 9_999_999_999,
+                    "owner": "legacy",
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert core.recovery_record_names() == []
+        assert core.is_idle() is True
+        assert core.grinder_guard()["state"] == "ready"
+        assert (tmp_path / "grinder-rest-state.json").is_file()
 
-    # In-progress is recovery / non-idle.
-    (tmp_path / "grinder-rest-state.json").write_text(
-        json.dumps({"in_progress": True, "owner": "bridge"}),
-        encoding="utf-8",
-    )
-    assert core._grinder_is_recovery() is True
-    assert core.is_idle() is False
+        # Durable terminal cooldown: not idle-blocking recovery_records, but guard cools down.
+        past = time.time() - 1.0
+        future = time.time() + 3600.0
+        wf = core.store.create_workflow(kind="grinder", state="running")
+        core.store.commit_workflow_terminal(
+            wf["workflow_id"],
+            state="stopped",
+            event_payload={
+                "grinder_cooldown_until": future,
+                "grinder_stopped_at": past,
+                "grinder_rest_seconds": 60,
+            },
+            recovery={"blocked_until": future, "grinder_cooldown_until": future},
+        )
+        assert core.recovery_record_names() == []
+        assert core.is_idle() is True
+        guard = core.grinder_guard()
+        assert guard["state"] == "cooldown"
+        assert guard["cooldown_until"] == future
 
-    # Unreadable is recovery.
-    (tmp_path / "grinder-rest-state.json").write_text("{not-json", encoding="utf-8")
-    assert core._grinder_is_recovery() is True
-    assert core.is_idle() is False
+        # Active grinder recovery workflow blocks idle.
+        active = core.store.create_workflow(
+            kind="grinder_recovery", state="recovery_imported"
+        )
+        core2 = BridgeCore(state_dir=tmp_path, environ={})
+        try:
+            assert core2.is_idle() is False
+            assert core2.activity == "grinder"
+            assert core2.active_workflow_id == active["workflow_id"]
+            assert core2.grinder_guard()["state"] == "recovery_required"
+            # Close stores without actuating a client (no force stop / BLE).
+            assert core2.connected is False
+            assert core2.client is None
+        finally:
+            if core2._store_owned:
+                core2.store.close()
+    finally:
+        if core._store_owned:
+            core.store.close()
 
 
 def test_preowned_lock_ownership_is_deterministic(tmp_path):

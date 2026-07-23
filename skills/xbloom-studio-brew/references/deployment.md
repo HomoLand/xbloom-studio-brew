@@ -245,7 +245,7 @@ State layout under `~/.xbloom-studio-brew/` (or `XBLOOM_STATE_DIR` / legacy
 | `bridge.log` | Daemon stdout/stderr |
 | legacy `catalog/` | Import-only after catalog cutover; runtime never rewrites `catalog.json` |
 | legacy `brew-history.jsonl` | Import-only after history cutover; runtime never appends/rewrites it |
-| legacy `*-state.json` | Compatibility armed/tea/grinder files; optional explicit import via `state migrate` |
+| legacy `*-state.json` | Import-only armed/tea/grinder files (`armed-state.json`, `tea-loaded-state.json`, `grinder-rest-state.json`) via explicit `state migrate`; runtime never reads or writes any coffee/tea/grinder JSON |
 
 ### Explicit state migration (no auto-migrate on daemon start)
 
