@@ -261,6 +261,54 @@ def test_typed_client_injects_request_id_and_requires_workflow(monkeypatch, brid
         client._call("coffee.start", {"confirmation": "cup-filter-water-beans"})
 
 
+def test_typed_recipe_loads_support_revision_only_without_fake_paths(
+    monkeypatch, bridge_env
+):
+    calls: list[tuple[str, dict]] = []
+    ensures: list[int] = []
+
+    def fake_call(method, params=None, **_kwargs):
+        body = dict(params or {})
+        calls.append((method, body))
+        return {
+            "status": "loaded",
+            "workflow_id": f"wf_{len(calls)}",
+            "request_id": body.get("request_id"),
+        }
+
+    monkeypatch.setattr("xbloom_ble.bridge_client.bridge_call", fake_call)
+    monkeypatch.setattr(
+        "xbloom_ble.bridge_client.ensure_bridge_daemon",
+        lambda **_kwargs: ensures.append(1)
+        or {"running": True, "client_ready": True},
+    )
+    client = TypedBridgeClient(state_root=bridge_env, auto_ensure=True)
+
+    client.coffee_load(recipe_revision_id="rev_coffee")
+    client.tea_load(recipe_revision_id="rev_tea", request_id="req_tea")
+
+    assert calls[0][0] == "coffee.load"
+    assert calls[0][1]["recipe_revision_id"] == "rev_coffee"
+    assert calls[0][1]["request_id"]
+    assert "recipe" not in calls[0][1]
+    assert calls[1] == (
+        "tea.load",
+        {
+            "request_id": "req_tea",
+            "scan_timeout": 8.0,
+            "recipe_revision_id": "rev_tea",
+        },
+    )
+    assert ensures == [1, 1]
+
+    with pytest.raises(BridgeError, match="recipe path or recipe_revision_id"):
+        client.coffee_load()
+    with pytest.raises(BridgeError, match="recipe path or recipe_revision_id"):
+        client.tea_load(recipe="  ", recipe_revision_id="")
+    assert len(calls) == 2
+    assert ensures == [1, 1]
+
+
 def test_status_events_do_not_ensure_daemon(monkeypatch, bridge_env):
     ensured = {"n": 0}
 

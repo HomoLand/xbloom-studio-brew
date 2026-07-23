@@ -425,6 +425,206 @@ pours:
     return path
 
 
+def _stored_coffee_content(name: str = "Stored coffee") -> dict:
+    return {
+        "name": name,
+        "kind": "hot",
+        "dose_g": 16,
+        "grind": 55,
+        "pours": [
+            {
+                "ml": 40,
+                "temp_c": 92,
+                "pattern": "spiral",
+                "pause_s": 30,
+                "rpm": 100,
+                "flow_ml_s": 3.0,
+            },
+            {
+                "ml": 100,
+                "temp_c": 92,
+                "pattern": "spiral",
+                "pause_s": 5,
+                "rpm": 100,
+                "flow_ml_s": 3.0,
+            },
+            {
+                "ml": 100,
+                "temp_c": 92,
+                "pattern": "spiral",
+                "pause_s": 5,
+                "rpm": 100,
+                "flow_ml_s": 3.0,
+            },
+        ],
+    }
+
+
+def _stored_tea_content(name: str = "Stored tea") -> dict:
+    return {
+        "name": name,
+        "kind": "tea",
+        "leaf_g": 4,
+        "output_ml_per_steep": 100,
+        "pours": [
+            {
+                "ml": 80,
+                "temp_c": 90,
+                "pattern": "circular",
+                "pause_s": 20,
+                "flow_ml_s": 3.5,
+            },
+            {
+                "ml": 80,
+                "temp_c": 90,
+                "pattern": "circular",
+                "pause_s": 20,
+                "flow_ml_s": 3.5,
+            },
+        ],
+    }
+
+
+def _string_values(value):
+    if isinstance(value, dict):
+        for child in value.values():
+            yield from _string_values(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            yield from _string_values(child)
+    elif isinstance(value, str):
+        yield value
+
+
+def test_revision_only_coffee_and_tea_load_and_start_without_paths(tmp_path):
+    core, fake = _core(tmp_path)
+    coffee = core.store.create_recipe_with_revision(_stored_coffee_content())
+    tea = core.store.create_recipe_with_revision(_stored_tea_content())
+    coffee_revision = coffee["revision"]
+    tea_revision = tea["revision"]
+
+    async def go():
+        loaded_coffee = await core.rpc(
+            "coffee.load",
+            _with_ids(
+                {"recipe_revision_id": coffee_revision["revision_id"]}
+            ),
+        )
+        coffee_workflow = core.store.get_workflow(loaded_coffee["workflow_id"])
+        coffee_state = json.loads(
+            core.coffee_state_file.read_text(encoding="utf-8")
+        )
+        assert loaded_coffee["recipe_revision_id"] == coffee_revision["revision_id"]
+        assert coffee_workflow["recipe_revision_id"] == coffee_revision["revision_id"]
+        assert coffee_workflow["snapshot"] == coffee_revision["content"]
+        assert coffee_workflow["snapshot_sha256"] == coffee_revision["content_sha256"]
+        assert all(
+            str(tmp_path) not in value
+            for value in _string_values(
+                {
+                    "result": loaded_coffee,
+                    "workflow": coffee_workflow,
+                    "state": coffee_state,
+                }
+            )
+        )
+        assert fake.connect_count == 1
+        assert fake.calls.count(("load_recipe", "Stored coffee")) == 1
+
+        await core.rpc(
+            "cancel", _with_ids(workflow_id=loaded_coffee["workflow_id"])
+        )
+        await _drain_release(core)
+
+        loaded_tea = await core.rpc(
+            "tea.load",
+            _with_ids({"recipe_revision_id": tea_revision["revision_id"]}),
+        )
+        tea_workflow = core.store.get_workflow(loaded_tea["workflow_id"])
+        tea_state = json.loads(core.tea_state_file.read_text(encoding="utf-8"))
+        assert loaded_tea["recipe_revision_id"] == tea_revision["revision_id"]
+        assert tea_workflow["recipe_revision_id"] == tea_revision["revision_id"]
+        assert tea_workflow["snapshot"] == tea_revision["content"]
+        assert tea_workflow["snapshot_sha256"] == tea_revision["content_sha256"]
+        assert all(
+            str(tmp_path) not in value
+            for value in _string_values(
+                {
+                    "result": loaded_tea,
+                    "workflow": tea_workflow,
+                    "state": tea_state,
+                }
+            )
+        )
+        assert fake.connect_count == 2
+        assert fake.calls.count(("tea_load", "Stored tea")) == 1
+
+        await core.rpc(
+            "tea.start",
+            _with_ids(
+                {"confirmation": TEA_READY_SENTINEL},
+                workflow_id=loaded_tea["workflow_id"],
+            ),
+        )
+        assert fake.connect_count == 2
+        assert fake.calls.count("tea_start") == 1
+        await core.rpc(
+            "cancel", _with_ids(workflow_id=loaded_tea["workflow_id"])
+        )
+        await core.shutdown(force=True)
+
+    asyncio.run(go())
+
+
+def test_revision_only_rejects_unknown_malformed_and_cross_kind_pre_ble(tmp_path):
+    core, fake = _core(tmp_path)
+    coffee = core.store.create_recipe_with_revision(_stored_coffee_content())
+    tea = core.store.create_recipe_with_revision(_stored_tea_content())
+
+    bad_coffee = core.store.upsert_recipe(
+        recipe_id="rcp_bad_coffee", kind="coffee", name="Bad coffee"
+    )
+    bad_coffee_revision = core.store.add_recipe_revision(
+        bad_coffee["recipe_id"], {"name": "Bad coffee", "pours": []}
+    )
+    bad_tea = core.store.upsert_recipe(
+        recipe_id="rcp_bad_tea", kind="tea", name="Bad tea"
+    )
+    bad_tea_revision = core.store.add_recipe_revision(
+        bad_tea["recipe_id"], {"name": "Bad tea", "kind": "tea", "pours": []}
+    )
+
+    async def go():
+        cases = (
+            ("coffee.load", "rev_missing", "unknown"),
+            ("coffee.load", tea["revision"]["revision_id"], "does not match"),
+            ("tea.load", coffee["revision"]["revision_id"], "does not match"),
+            (
+                "coffee.load",
+                bad_coffee_revision["revision_id"],
+                "validation",
+            ),
+            ("tea.load", bad_tea_revision["revision_id"], "validation"),
+        )
+        for method, revision_id, message in cases:
+            with pytest.raises(BridgeError, match=message) as exc_info:
+                await core.rpc(
+                    method,
+                    _with_ids({"recipe_revision_id": revision_id}),
+                )
+            assert exc_info.value.category in {"invalid_request", "validation_error"}
+            assert core.store.get_active_workflow() is None
+        assert fake.connect_count == 0
+        assert "connect" not in fake.calls
+        assert not any(
+            isinstance(call, tuple) and call[0] in {"load_recipe", "tea_load"}
+            for call in fake.calls
+        )
+        await core.shutdown(force=True)
+
+    asyncio.run(go())
+
+
 def test_coffee_lifecycle_uses_one_held_client(tmp_path):
     core, fake = _core(tmp_path)
     recipe = _recipe(tmp_path / "recipe.yaml")

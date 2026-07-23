@@ -1598,6 +1598,33 @@ class BridgeCore:
 
         return {k: v for k, v in snapshot.items() if not str(k).startswith("_")}
 
+    @staticmethod
+    def _recipe_kind_matches_load(recipe_kind: Any, load_kind: str) -> bool:
+        """True when stored recipe_kind is valid for a coffee/tea load.
+
+        High-level storage kinds are ``coffee`` / ``tea``. Coffee content may
+        also use serving kinds such as ``hot`` and ``flash-brew``.
+        """
+
+        if recipe_kind is None:
+            return False
+        kind_norm = str(recipe_kind).strip().lower()
+        if not kind_norm:
+            return False
+        load = str(load_kind).strip().lower()
+        if load == "tea":
+            return kind_norm == "tea"
+        if load == "coffee":
+            return kind_norm in {
+                "coffee",
+                "hot",
+                "ice",
+                "iced",
+                "flash",
+                "flash-brew",
+            }
+        return kind_norm == load
+
     def _resolve_recipe_revision_id(
         self,
         params: Mapping[str, Any],
@@ -1614,24 +1641,24 @@ class BridgeCore:
             rid = str(rev_id).strip()
             existing = self.store.get_recipe_revision(rid)
             if existing is None:
-                raise BridgeError(f"unknown recipe_revision_id {rid!r}")
+                raise BridgeError(
+                    f"unknown recipe_revision_id {rid!r}",
+                    category="invalid_request",
+                )
             # When a local path is also provided, revision must match the
             # validated canonical snapshot (kind + content hash) before BLE.
             if path_provided:
                 recipe_kind = existing.get("recipe_kind") or (
                     (existing.get("content") or {}).get("kind")
                 )
-                # Coffee snapshots may omit kind; treat coffee/hot/ice as coffee.
-                if recipe_kind is not None:
-                    kind_norm = str(recipe_kind).lower()
-                    expected_kinds = {kind.lower()}
-                    if kind.lower() == "coffee":
-                        expected_kinds.update({"hot", "ice", "flash"})
-                    if kind_norm not in expected_kinds and kind_norm != kind.lower():
-                        raise BridgeError(
-                            f"recipe_revision_id {rid!r} kind {recipe_kind!r} "
-                            f"does not match load kind {kind!r}"
-                        )
+                if recipe_kind is not None and not self._recipe_kind_matches_load(
+                    recipe_kind, kind
+                ):
+                    raise BridgeError(
+                        f"recipe_revision_id {rid!r} kind {recipe_kind!r} "
+                        f"does not match load kind {kind!r}",
+                        category="invalid_request",
+                    )
                 existing_sha = existing.get("content_sha256")
                 if existing_sha and existing_sha != expected_sha:
                     # Also accept direct content equality when hash encoding differs.
@@ -1639,7 +1666,8 @@ class BridgeCore:
                     if content_sha256(content) != expected_sha:
                         raise BridgeError(
                             f"recipe_revision_id {rid!r} content hash does not "
-                            "match the validated local recipe snapshot"
+                            "match the validated local recipe snapshot",
+                            category="validation_error",
                         )
             return rid
         # Path-only compatibility: best-effort durable revision (no redesign).
@@ -3442,25 +3470,59 @@ class BridgeCore:
             )
         raw_path = params.get("recipe")
         rev_param = params.get("recipe_revision_id")
-        if not raw_path and not rev_param:
+        has_path = raw_path is not None and str(raw_path).strip() != ""
+        has_rev = rev_param is not None and str(rev_param).strip() != ""
+        if not has_path and not has_rev:
             raise BridgeError(
-                "coffee.load requires a local recipe path or recipe_revision_id"
+                "coffee.load requires a local recipe path or recipe_revision_id",
+                category="invalid_request",
             )
-        from xbloom_safety import load_strict_recipe, recipe_summary
+        from xbloom_safety import (
+            SafetyError,
+            load_strict_recipe,
+            recipe_summary,
+            strict_validate,
+        )
+        from .recipe import Recipe, RecipeError
 
         path: Path | None = None
-        if raw_path:
+        if has_path:
             path = Path(str(raw_path)).expanduser().resolve(strict=True)
             recipe = load_strict_recipe(path)
             summary = recipe_summary(recipe, path)
         else:
-            revision = self.store.get_recipe_revision(str(rev_param).strip())
+            # Revision-only: require coffee kind + core strict validation
+            # before any durable workflow create, connect, or BLE write.
+            rid = str(rev_param).strip()
+            revision = self.store.get_recipe_revision(rid)
             if revision is None:
-                raise BridgeError(f"unknown recipe_revision_id {rev_param!r}")
-            from .recipe import Recipe
-
-            recipe = Recipe.from_dict(revision["content"])
-            # Synthetic pathless summary.
+                raise BridgeError(
+                    f"unknown recipe_revision_id {rid!r}",
+                    category="invalid_request",
+                )
+            recipe_kind = revision.get("recipe_kind")
+            if recipe_kind is None:
+                content_hint = revision.get("content") or {}
+                if isinstance(content_hint, Mapping):
+                    recipe_kind = content_hint.get("kind")
+            if not self._recipe_kind_matches_load(recipe_kind, "coffee"):
+                raise BridgeError(
+                    f"recipe_revision_id {rid!r} kind {recipe_kind!r} "
+                    "does not match load kind 'coffee'",
+                    category="invalid_request",
+                )
+            try:
+                content = revision.get("content")
+                if not isinstance(content, Mapping):
+                    raise RecipeError("revision content must be a mapping")
+                recipe = Recipe.from_dict(dict(content))
+                strict_validate(recipe)
+            except (RecipeError, SafetyError, TypeError, ValueError, KeyError) as exc:
+                raise BridgeError(
+                    f"recipe_revision_id {rid!r} failed coffee validation: {exc}",
+                    category="validation_error",
+                ) from exc
+            # Pathless summary: never invent a local recipe path.
             summary = {
                 "name": recipe.name,
                 "kind": (recipe.kind or "hot"),
@@ -3488,7 +3550,7 @@ class BridgeCore:
             kind="coffee",
             snapshot=snapshot,
             name=recipe.name,
-            path_provided=bool(raw_path),
+            path_provided=has_path,
         )
 
         reserved = self._reserve_request(
@@ -3829,12 +3891,54 @@ class BridgeCore:
                 f"active workflow {self.active_workflow_id} still owns the bridge"
             )
         raw_path = params.get("recipe")
-        if not raw_path:
-            raise BridgeError("tea.load requires a local recipe path")
-        path = Path(str(raw_path)).expanduser().resolve(strict=True)
-        from .tea import TeaRecipe
+        rev_param = params.get("recipe_revision_id")
+        has_path = raw_path is not None and str(raw_path).strip() != ""
+        has_rev = rev_param is not None and str(rev_param).strip() != ""
+        if not has_path and not has_rev:
+            raise BridgeError(
+                "tea.load requires a local recipe path or recipe_revision_id",
+                category="invalid_request",
+            )
+        from .tea import TeaRecipe, TeaRecipeError
 
-        recipe = TeaRecipe.from_yaml(path)
+        path: Path | None = None
+        revision_content_sha: str | None = None
+        if has_path:
+            path = Path(str(raw_path)).expanduser().resolve(strict=True)
+            recipe = TeaRecipe.from_yaml(path)
+        else:
+            # Revision-only parity with coffee.load: resolve from StateStore,
+            # require tea kind, validate TeaRecipe before any BLE action.
+            # Never invent a temporary file path.
+            rid = str(rev_param).strip()
+            revision = self.store.get_recipe_revision(rid)
+            if revision is None:
+                raise BridgeError(
+                    f"unknown recipe_revision_id {rid!r}",
+                    category="invalid_request",
+                )
+            recipe_kind = revision.get("recipe_kind")
+            if recipe_kind is None:
+                content_hint = revision.get("content") or {}
+                if isinstance(content_hint, Mapping):
+                    recipe_kind = content_hint.get("kind")
+            if not self._recipe_kind_matches_load(recipe_kind, "tea"):
+                raise BridgeError(
+                    f"recipe_revision_id {rid!r} kind {recipe_kind!r} "
+                    "does not match load kind 'tea'",
+                    category="invalid_request",
+                )
+            try:
+                content = revision.get("content")
+                if not isinstance(content, Mapping):
+                    raise TeaRecipeError("revision content must be a mapping")
+                recipe = TeaRecipe.from_dict(dict(content))
+            except (TeaRecipeError, TypeError, ValueError, KeyError) as exc:
+                raise BridgeError(
+                    f"recipe_revision_id {rid!r} failed tea validation: {exc}",
+                    category="validation_error",
+                ) from exc
+            revision_content_sha = revision.get("content_sha256")
         snapshot = self._snapshot_tea_recipe(recipe, path)
         source = str(params.get("source") or "bridge")
 
@@ -3843,11 +3947,12 @@ class BridgeCore:
             kind="tea",
             snapshot=snapshot,
             name=recipe.name,
-            path_provided=True,
+            path_provided=has_path,
         )
         reserved = self._reserve_request("tea.load", params, workflow_id=None)
         if reserved.get("cached") and reserved.get("status") == IDEM_COMPLETED:
             return dict(reserved.get("result") or {})
+        recipe_name = path.name if path is not None else recipe.name
         wf = self._create_durable_workflow(
             kind="tea",
             snapshot=snapshot,
@@ -3855,7 +3960,10 @@ class BridgeCore:
             source=source,
             owner="bridge",
             recipe_revision_id=revision_id,
-            metadata={"recipe_path": str(path), "recipe_name": path.name},
+            metadata={
+                "recipe_path": str(path) if path is not None else None,
+                "recipe_name": recipe_name,
+            },
         )
         workflow_id = str(wf["workflow_id"])
         self.active_workflow_id = workflow_id
@@ -3926,8 +4034,10 @@ class BridgeCore:
         state = {
             "address": self.address,
             "machine": self.machine_name,
-            "recipe_path": str(path),
-            "recipe_sha256": _sha256(path),
+            "recipe_path": str(path) if path is not None else None,
+            "recipe_sha256": (
+                _sha256(path) if path is not None else revision_content_sha
+            ),
             "loaded_at": time.time(),
             "status": "tea_loaded",
             "firmware": firmware,
@@ -3945,7 +4055,7 @@ class BridgeCore:
         if self.connection_scope != "explicit":
             self.connection_scope = "workflow"
         self.targets = {
-            "recipe": path.name,
+            "recipe": recipe_name,
             "target_dispensed_water_ml": sum(pour.ml for pour in recipe.pours),
             "leaf_g": recipe.leaf_g,
             "steeps": len(recipe.pours),
@@ -3956,8 +4066,8 @@ class BridgeCore:
             workflow_id=workflow_id,
             machine_phase="loaded",
             metadata={
-                "recipe_path": str(path),
-                "recipe_name": path.name,
+                "recipe_path": str(path) if path is not None else None,
+                "recipe_name": recipe_name,
                 "machine_address": self.address,
                 "targets": dict(self.targets),
             },
@@ -3973,7 +4083,7 @@ class BridgeCore:
             "recipe_revision_id": revision_id,
             "snapshot_sha256": wf.get("snapshot_sha256"),
             "source": source,
-            "recipe": path.name,
+            "recipe": recipe_name,
             "firmware": firmware,
             "ack": event.command_code,
             "summary": recipe.summary(),
@@ -4021,15 +4131,22 @@ class BridgeCore:
                 "status": "tea_loaded",
             }
             self._loaded_needs_reconcile = True
-        path = Path(str(state.get("recipe_path") or ""))
-        if not path.is_file() or (
-            state.get("recipe_sha256")
-            and _sha256(path) != state.get("recipe_sha256")
-        ):
-            self._fail_request(
-                request_id, "tea recipe changed or disappeared", keep_pending=False
-            )
-            raise BridgeError("tea recipe changed or disappeared since it was loaded")
+        # Pathless revision-only loads store null recipe_path; only re-check a
+        # local file when Skill/MCP provided one at load time.
+        if state.get("recipe_path"):
+            path = Path(str(state.get("recipe_path") or ""))
+            if not path.is_file() or (
+                state.get("recipe_sha256")
+                and _sha256(path) != state.get("recipe_sha256")
+            ):
+                self._fail_request(
+                    request_id,
+                    "tea recipe changed or disappeared",
+                    keep_pending=False,
+                )
+                raise BridgeError(
+                    "tea recipe changed or disappeared since it was loaded"
+                )
         if not self.connected:
             await self._ensure_connected(params, scope="workflow")
         if self._loaded_needs_reconcile:

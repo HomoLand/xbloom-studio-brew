@@ -391,24 +391,41 @@ class TypedBridgeClient:
     def coffee_load(
         self,
         *,
-        recipe: str,
+        recipe: str | None = None,
         request_id: str | None = None,
         address: str | None = None,
         scan_timeout: float = 8.0,
         recipe_revision_id: str | None = None,
     ) -> dict[str, Any]:
-        params = self._with_address(
-            {
-                "recipe": recipe,
-                "request_id": request_id,
-                "scan_timeout": float(scan_timeout),
-            }
+        """Load a coffee recipe by local path and/or durable revision id.
+
+        Browser/Web callers must pass ``recipe_revision_id`` only (no local
+        path). Skill/MCP keep path-only and path-plus-revision compatibility.
+        Revision-only RPC params omit the ``recipe`` key entirely.
+        """
+
+        has_recipe = recipe is not None and str(recipe).strip() != ""
+        has_rev = (
+            recipe_revision_id is not None
+            and str(recipe_revision_id).strip() != ""
         )
+        if not has_recipe and not has_rev:
+            raise BridgeError(
+                "coffee.load requires a local recipe path or recipe_revision_id",
+                category="invalid_request",
+            )
+        params: dict[str, Any] = {
+            "request_id": request_id,
+            "scan_timeout": float(scan_timeout),
+        }
+        # Revision-only: omit recipe key so bridge never sees a fake path.
+        if has_recipe:
+            params["recipe"] = str(recipe)
+        if has_rev:
+            params["recipe_revision_id"] = str(recipe_revision_id).strip()
         if address:
             params["address"] = address
-        if recipe_revision_id is not None:
-            params["recipe_revision_id"] = recipe_revision_id
-        return self._call("coffee.load", params)
+        return self._call("coffee.load", self._with_address(params))
 
     def coffee_start(
         self,
@@ -431,21 +448,40 @@ class TypedBridgeClient:
     def tea_load(
         self,
         *,
-        recipe: str,
+        recipe: str | None = None,
         request_id: str | None = None,
         address: str | None = None,
         scan_timeout: float = 8.0,
+        recipe_revision_id: str | None = None,
     ) -> dict[str, Any]:
-        params = self._with_address(
-            {
-                "recipe": recipe,
-                "request_id": request_id,
-                "scan_timeout": float(scan_timeout),
-            }
+        """Load a tea recipe by local path and/or durable revision id.
+
+        Browser/Web callers must pass ``recipe_revision_id`` only (no local
+        path). Skill/MCP keep path-only and path-plus-revision compatibility.
+        Revision-only RPC params omit the ``recipe`` key entirely.
+        """
+
+        has_recipe = recipe is not None and str(recipe).strip() != ""
+        has_rev = (
+            recipe_revision_id is not None
+            and str(recipe_revision_id).strip() != ""
         )
+        if not has_recipe and not has_rev:
+            raise BridgeError(
+                "tea.load requires a local recipe path or recipe_revision_id",
+                category="invalid_request",
+            )
+        params: dict[str, Any] = {
+            "request_id": request_id,
+            "scan_timeout": float(scan_timeout),
+        }
+        if has_recipe:
+            params["recipe"] = str(recipe)
+        if has_rev:
+            params["recipe_revision_id"] = str(recipe_revision_id).strip()
         if address:
             params["address"] = address
-        return self._call("tea.load", params)
+        return self._call("tea.load", self._with_address(params))
 
     def tea_start(
         self,
