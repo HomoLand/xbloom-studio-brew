@@ -1552,15 +1552,19 @@ def test_schema_fresh_is_v5_with_archive_history_beans(tmp_path):
     # Fresh open must not re-apply migrations (single row per version).
     store.close()
     store2 = storage.StateStore(tmp_path)
-    assert store2.ensure_schema() == 4
+    assert store2.ensure_schema() == 5
     v3_rows = store2._connect().execute(
         "SELECT COUNT(*) AS n FROM schema_migrations WHERE version = 3"
     ).fetchone()
     v4_rows = store2._connect().execute(
         "SELECT COUNT(*) AS n FROM schema_migrations WHERE version = 4"
     ).fetchone()
+    v5_rows = store2._connect().execute(
+        "SELECT COUNT(*) AS n FROM schema_migrations WHERE version = 5"
+    ).fetchone()
     assert v3_rows["n"] == 1
     assert v4_rows["n"] == 1
+    assert v5_rows["n"] == 1
     assert store2.integrity_check()["ok"] is True
     store2.close()
 
