@@ -496,3 +496,7 @@ LAN 模式规则：
 Phase 0–C 与 A11 核心真机路径完成后的工作（博采众家之长、豆库/口味闭环、**Home Assistant only**）见：
 
 → **[`docs/ROADMAP-NEXT.md`](./ROADMAP-NEXT.md)**（Homebridge/Siri 已取消）
+
+**Web 产品线（渐进）**：Chrome 近场 **纯 Web + Web Bluetooth**（可不依赖本机 bridge）见：
+
+→ **[`docs/ADR-WEB-BLUETOOTH.md`](./ADR-WEB-BLUETOOTH.md)**（W0–W4 已在 `xbloom-studio-web` 落地：decode/load/start/cancel、能力可用时默认 `web-bluetooth`；W5 可选延后；真机 supervised 仍建议用户侧验收）

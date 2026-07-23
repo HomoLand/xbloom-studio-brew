@@ -196,6 +196,7 @@ HA 轮询 status **不得**延长 BLE。
 | H1 | A11 补测 pause/resume | 低 |
 | H2 | hardware-validation H00–H08 | 按需 |
 | H3 | Web 真机 + LAN 手机拍照闭环 | 中（你已说可后测） |
+| H3b | **纯 Web + Web Bluetooth（Chrome）渐进**：driver 双轨 → 直连 GATT 冲煮 | **W0–W4 已落地**（见 `docs/ADR-WEB-BLUETOOTH.md`）；真机 supervised 可选 |
 | H4 | 上游 `Janczykkkko` / `ryunana` 定期 diff | 持续 |
 | H5 | pourpilot 式「证据/来源」UI 抛光 | 中 |
 | H6 | share-link 导入对照 cryptofishbug | 低 |
