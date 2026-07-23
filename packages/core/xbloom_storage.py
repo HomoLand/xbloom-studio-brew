@@ -1,8 +1,10 @@
 """Transactional SQLite storage for catalog, workflows, and idempotency.
 
 Phase 0 baseline: schema, primitives, integrity, online backup, and a one-time
-lossless import of legacy JSON/JSONL state. Physical BLE workflow semantics
-remain in the bridge; this module does not rewrite them.
+lossless import of legacy JSON/JSONL state. Phase B B8 adds typed recipe/
+revision APIs (create/edit/list/archive) with optimistic concurrency, domain
+validation, and safe provenance. SQLite/WAL is the authoritative revision
+store for Web B9. Physical BLE workflow semantics remain in the bridge.
 """
 
 from __future__ import annotations
@@ -10,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -20,13 +23,22 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from xbloom_ble.recipe import Recipe, RecipeError
+from xbloom_ble.tea import TeaRecipe, TeaRecipeError
 from xbloom_paths import normalize_state_root, state_dir as resolve_state_dir
+from xbloom_safety import SafetyError, strict_validate
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DB_FILE_NAME = "state.db"
 BUSY_TIMEOUT_MS = 5000
+# Cross-connection fresh-DB bootstrap: exclusive lock + busy retries (not a
+# process-global mutex). Windows WAL create races commonly need several attempts.
+SCHEMA_INIT_MAX_ATTEMPTS = 40
+SCHEMA_INIT_BASE_DELAY_S = 0.01
 DEFAULT_BACKUP_DIRNAME = "backups"
 LEGACY_MIGRATION_NAME = "legacy_json_v1"
+DEFAULT_RECIPE_LIST_LIMIT = 50
+MAX_RECIPE_LIST_LIMIT = 500
 
 # Non-terminal workflow states that may still own recovery / connection scope.
 ACTIVE_WORKFLOW_STATES = frozenset(
@@ -82,12 +94,133 @@ LEGACY_SOURCES: tuple[tuple[str, Path], ...] = (
     ("recovery_grinder", GRINDER_REST_STATE_REL),
 )
 
-# Injected failure hook for tests: callable taking stage name, may raise.
+# Injected failure hooks for tests: callable taking stage name, may raise.
 _migration_fault_hook: Any = None
+_recipe_write_fault_hook: Any = None
+
+# Provenance keys rejected at high-level recipe APIs (semantic token match).
+# Low-level upsert_recipe / add_recipe_revision remain permissive for legacy
+# import and bridge-internal writes that need extensible fields.
+#
+# Image *material* is forbidden (raw bytes, base64, paths, bare image/photo
+# fields). Harmless image *facts* such as used_image / image_present (booleans)
+# are allowed because Web B9 needs them for design-service provenance.
+_FORBIDDEN_PROVENANCE_KEYS = frozenset(
+    {
+        "image",
+        "images",
+        "image_base64",
+        "image_bytes",
+        "image_data",
+        "image_payload",
+        "photo",
+        "photos",
+        "api_key",
+        "apikey",
+        "api_token",
+        "token",
+        "access_token",
+        "refresh_token",
+        "session_token",
+        "password",
+        "secret",
+        "authorization",
+        "auth_header",
+        "chain_of_thought",
+        "reasoning",
+        "reasoning_content",
+        "raw_reasoning",
+        "thinking",
+        "cot",
+        "raw_thinking",
+        "raw_image",
+        "path",
+        "file_path",
+        "filepath",
+        "local_path",
+        "local_file",
+        "image_path",
+        "recipe_path",
+        "source_path",
+    }
+)
+# Single semantic tokens that are always forbidden when present as whole words
+# after snake/kebab/space/camelCase splitting (not substring matches).
+# "image"/"photo" tokens are handled separately via an allowlist so safe
+# scalar metadata (used_image, image_present) is not a false positive while
+# raw forms (image_base64, raw_image, bare image, etc.) stay rejected.
+_FORBIDDEN_PROVENANCE_TOKENS = frozenset(
+    {
+        "password",
+        "secret",
+        "token",
+        "authorization",
+        "reasoning",
+        "thinking",
+        "cot",
+        "path",
+        "filepath",
+    }
+)
+# Image/photo material tokens: forbidden unless the full key is a safe
+# image-use metadata fact (see _SAFE_IMAGE_METADATA_KEYS).
+_IMAGE_MATERIAL_TOKENS = frozenset(
+    {
+        "image",
+        "images",
+        "photo",
+        "photos",
+    }
+)
+# Adjacent token pairs treated as one forbidden concept (raw image material).
+_FORBIDDEN_PROVENANCE_TOKEN_PAIRS = frozenset(
+    {
+        ("api", "key"),
+        ("api", "token"),
+        ("access", "token"),
+        ("refresh", "token"),
+        ("session", "token"),
+        ("auth", "header"),
+        ("image", "base64"),
+        ("image", "bytes"),
+        ("image", "data"),
+        ("image", "payload"),
+        ("image", "path"),
+        ("raw", "image"),
+        ("raw", "thinking"),
+        ("raw", "reasoning"),
+        ("file", "path"),
+        ("local", "path"),
+        ("local", "file"),
+        ("recipe", "path"),
+        ("source", "path"),
+        ("chain", "thought"),  # after dropping filler "of"
+    }
+)
+# Safe image-use metadata keys (boolean facts only, not material).
+_SAFE_IMAGE_METADATA_KEYS = frozenset(
+    {
+        "used_image",
+        "image_present",
+    }
+)
+_CAMEL_BOUNDARY_RE = re.compile(
+    r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+"
+)
+_PROVENANCE_BINARY_TYPES = (bytes, bytearray, memoryview)
+_ALTER_ADD_COLUMN_RE = re.compile(
+    r"^\s*ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+ADD\s+COLUMN\s+"
+    r"([A-Za-z_][A-Za-z0-9_]*)\b",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 class StorageError(RuntimeError):
     """Raised for storage, migration, or integrity failures."""
+
+
+class StorageConflictError(StorageError):
+    """Optimistic concurrency conflict (stale parent / expected revision)."""
 
 
 def utc_now() -> str:
@@ -135,6 +268,223 @@ def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
     return {key: row[key] for key in row.keys()}
+
+
+def _maybe_recipe_write_fault(stage: str) -> None:
+    hook = _recipe_write_fault_hook
+    if hook is not None:
+        hook(stage)
+
+
+def _is_sqlite_locked_error(exc: BaseException) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
+def _provenance_key_tokens(key: str) -> list[str]:
+    """Split a provenance key into semantic tokens (snake/kebab/space/camelCase)."""
+
+    tokens: list[str] = []
+    for chunk in re.split(r"[^A-Za-z0-9]+", str(key)):
+        if not chunk:
+            continue
+        pieces = _CAMEL_BOUNDARY_RE.findall(chunk)
+        if pieces:
+            tokens.extend(piece.lower() for piece in pieces)
+        else:
+            tokens.append(chunk.lower())
+    return tokens
+
+
+def _is_safe_image_metadata_key(key: str) -> bool:
+    """Return True for boolean image-use facts such as used_image."""
+
+    tokens = _provenance_key_tokens(key)
+    if not tokens:
+        return False
+    joined = "_".join(tokens)
+    compact = "".join(tokens)
+    return joined in _SAFE_IMAGE_METADATA_KEYS or compact in _SAFE_IMAGE_METADATA_KEYS
+
+
+def _is_forbidden_provenance_key(key: str) -> bool:
+    """Return True when *key* names a forbidden provenance concept.
+
+    Uses whole-token semantics so ``tokenizer`` and ``pathway`` are not
+    rejected as false positives for ``token`` / ``path``. Safe image-use
+    metadata keys (``used_image``, ``image_present``) are not forbidden;
+    any other key with an image/photo token is treated as raw material.
+    """
+
+    tokens = _provenance_key_tokens(key)
+    if not tokens:
+        return False
+    if _is_safe_image_metadata_key(key):
+        return False
+    # Any non-allowlisted key containing image/photo material tokens is forbidden.
+    if any(token in _IMAGE_MATERIAL_TOKENS for token in tokens):
+        return True
+    joined = "_".join(tokens)
+    compact = "".join(tokens)
+    if joined in _FORBIDDEN_PROVENANCE_KEYS or compact in _FORBIDDEN_PROVENANCE_KEYS:
+        return True
+    if any(token in _FORBIDDEN_PROVENANCE_TOKENS for token in tokens):
+        return True
+    # Drop common filler words for multi-token phrases (chain of thought).
+    core = [t for t in tokens if t not in {"of", "the", "a", "an"}]
+    for index in range(len(core) - 1):
+        if (core[index], core[index + 1]) in _FORBIDDEN_PROVENANCE_TOKEN_PAIRS:
+            return True
+    for index in range(len(tokens) - 1):
+        if (tokens[index], tokens[index + 1]) in _FORBIDDEN_PROVENANCE_TOKEN_PAIRS:
+            return True
+    return False
+
+
+def reject_forbidden_provenance(value: Any, *, path: str = "provenance") -> None:
+    """Raise StorageError if *value* contains forbidden provenance fields.
+
+    Rejects raw image / secret / token / reasoning / local-path keys recursively
+    (snake_case, kebab-case, spaces, camelCase) and binary payload values
+    (bytes, bytearray, memoryview) even under neutral keys. Never strips silently.
+
+    Safe image-use facts (``used_image``, ``image_present``) are accepted only
+    as JSON scalars; raw image material keys remain forbidden.
+    """
+
+    if isinstance(value, _PROVENANCE_BINARY_TYPES):
+        raise StorageError(f"forbidden binary provenance payload at {path}")
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            key_s = str(key)
+            child_path = f"{path}.{key_s}"
+            if _is_forbidden_provenance_key(key_s):
+                raise StorageError(
+                    f"forbidden provenance field {key_s!r} at {child_path}"
+                )
+            if _is_safe_image_metadata_key(key_s) and not isinstance(child, bool):
+                raise StorageError(
+                    f"forbidden non-boolean image metadata at {child_path}"
+                )
+            reject_forbidden_provenance(child, path=child_path)
+        return
+    if isinstance(value, (list, tuple)):
+        for index, child in enumerate(value):
+            reject_forbidden_provenance(child, path=f"{path}[{index}]")
+
+
+def sanitize_recipe_provenance(
+    provenance: Mapping[str, Any] | None = None,
+    *,
+    parent_revision_id: str | None = None,
+    creation_source: str | None = None,
+) -> dict[str, Any]:
+    """Return a safe, JSON-ready provenance dict for high-level recipe APIs.
+
+    Allowed extensible fields pass through when harmless. Forbidden keys raise.
+
+    Trusted lineage is never spoofable by caller provenance:
+
+    - ``parent_revision_id`` is always forced from the trusted argument.
+      Pass the real DB parent for edits; pass ``None`` for a first revision
+      so a forged parent is omitted (never preserved).
+    - When ``creation_source`` is supplied as an explicit argument, it
+      overrides any conflicting value in *provenance*.
+    """
+
+    if provenance is not None and not isinstance(provenance, Mapping):
+        raise StorageError("provenance must be a mapping")
+    out = dict(provenance or {})
+    # Explicit method-arg creation_source always wins over caller provenance.
+    if creation_source is not None:
+        out["creation_source"] = creation_source
+    # Trusted parent always wins: set real parent, or drop a forged first-rev parent.
+    if parent_revision_id is not None:
+        out["parent_revision_id"] = parent_revision_id
+    else:
+        out.pop("parent_revision_id", None)
+    reject_forbidden_provenance(out)
+    return out
+
+
+def _tea_to_canonical_dict(recipe: TeaRecipe) -> dict[str, Any]:
+    pours: list[dict[str, Any]] = []
+    for pour in recipe.pours:
+        item: dict[str, Any] = {
+            "ml": int(pour.ml),
+            "temp_c": int(pour.temp_c),
+            "pattern": pour.pattern,
+            "pause_s": int(pour.pause_s),
+            "flow_ml_s": float(pour.flow_ml_s),
+        }
+        if pour.label is not None:
+            item["label"] = pour.label
+        pours.append(item)
+    return {
+        "name": recipe.name,
+        "kind": "tea",
+        "leaf_g": float(recipe.leaf_g),
+        "output_ml_per_steep": int(recipe.output_ml_per_steep),
+        "pours": pours,
+    }
+
+
+def canonicalize_recipe_content(
+    content: Any,
+) -> tuple[dict[str, Any], str]:
+    """Validate and canonicalize recipe content using core domain rules.
+
+    Returns ``(canonical_content, storage_kind)`` where *storage_kind* is
+    ``\"coffee\"`` or ``\"tea\"`` (catalog kind, not coffee serving kind).
+
+    Coffee: :meth:`Recipe.from_dict` + :func:`strict_validate`.
+    Tea: :meth:`TeaRecipe.from_dict` (includes validate).
+    Rejects file paths and non-mapping content before any storage write.
+    """
+
+    if isinstance(content, (str, Path)):
+        raise StorageError(
+            "recipe content must be a JSON object mapping, not a local file path"
+        )
+    if not isinstance(content, Mapping):
+        raise StorageError(
+            "recipe content must be a JSON object mapping, not a scalar or sequence"
+        )
+    data = dict(content)
+    kind_hint = str(data.get("kind", "")).strip().lower()
+    looks_tea = kind_hint == "tea" or (
+        "leaf_g" in data and "dose_g" not in data and kind_hint not in {"hot", "flash-brew"}
+    )
+    if looks_tea:
+        try:
+            tea = TeaRecipe.from_dict(data)
+        except TeaRecipeError as exc:
+            raise StorageError(f"invalid tea recipe: {exc}") from exc
+        return _tea_to_canonical_dict(tea), "tea"
+    try:
+        recipe = Recipe.from_dict(data)
+        strict_validate(recipe)
+    except (RecipeError, SafetyError) as exc:
+        raise StorageError(f"invalid coffee recipe: {exc}") from exc
+    return recipe.to_dict(), "coffee"
+
+
+def _parse_recipe_row(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
+    data = _row_to_dict(row) if isinstance(row, sqlite3.Row) else dict(row)
+    data["provenance"] = json.loads(data.pop("provenance_json") or "{}")
+    data["metadata"] = json.loads(data.pop("metadata_json") or "{}")
+    if "archived_at" not in data:
+        data["archived_at"] = None
+    return data
+
+
+def _parse_revision_row(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
+    data = _row_to_dict(row) if isinstance(row, sqlite3.Row) else dict(row)
+    data["content"] = json.loads(data.pop("content_json"))
+    data["provenance"] = json.loads(data.pop("provenance_json") or "{}")
+    return data
 
 
 SCHEMA_STATEMENTS: tuple[str, ...] = (
@@ -243,6 +593,10 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
 # SCHEMA_VERSION. Each entry is (target_version, name, statements).
 # Version 1 was create-only baseline (SCHEMA_STATEMENTS). Version 2 adds
 # active-workflow and idempotency-status indexes used by Phase A bridge APIs.
+# Version 3 adds non-destructive recipe archive + listing indexes (Phase B B8).
+# Do not fold v3 columns into SCHEMA_STATEMENTS CREATE: fresh DBs apply CREATE
+# then run migrations once; putting archived_at in CREATE would make ALTER fail
+# or require dual-path schema init.
 SCHEMA_MIGRATIONS: tuple[tuple[int, str, tuple[str, ...]], ...] = (
     (
         2,
@@ -254,6 +608,21 @@ SCHEMA_MIGRATIONS: tuple[tuple[int, str, tuple[str, ...]], ...] = (
             "ON workflows(terminal_at, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_idempotency_status "
             "ON idempotency(status, created_at)",
+        ),
+    ),
+    (
+        3,
+        "phase_b_recipe_archive_list_indexes_v3",
+        (
+            "ALTER TABLE recipes ADD COLUMN archived_at TEXT",
+            "CREATE INDEX IF NOT EXISTS idx_recipes_updated_at "
+            "ON recipes(updated_at)",
+            "CREATE INDEX IF NOT EXISTS idx_recipes_kind_updated "
+            "ON recipes(kind, updated_at)",
+            "CREATE INDEX IF NOT EXISTS idx_recipes_archived_updated "
+            "ON recipes(archived_at, updated_at)",
+            "CREATE INDEX IF NOT EXISTS idx_recipe_revisions_recipe_number "
+            "ON recipe_revisions(recipe_id, revision_number)",
         ),
     ),
 )
@@ -307,11 +676,116 @@ class StateStore:
             conn.close()
             self._local.conn = None
 
+    @staticmethod
+    def _migration_version(conn: sqlite3.Connection) -> int:
+        row = conn.execute(
+            "SELECT MAX(version) AS v FROM schema_migrations"
+        ).fetchone()
+        return int(row["v"] or 0)
+
+    @staticmethod
+    def _execute_schema_ddl(conn: sqlite3.Connection, statement: str) -> None:
+        """Run one schema DDL statement with idempotent ALTER TABLE ADD COLUMN."""
+
+        match = _ALTER_ADD_COLUMN_RE.match(statement)
+        if match is not None:
+            table_name, column_name = match.group(1), match.group(2)
+            existing = {
+                str(row[1])
+                for row in conn.execute(
+                    f"PRAGMA table_info({table_name})"
+                ).fetchall()
+            }
+            if column_name in existing:
+                return
+        conn.execute(statement)
+
+    def _bootstrap_schema_once(self) -> int:
+        """Apply baseline + migrations with exclusive locks and version re-check.
+
+        Each version still commits in its own transaction (fault rolls back only
+        the in-flight step). Concurrent StateStore instances re-read version
+        after BEGIN IMMEDIATE so only one applies each step; ALTER ADD COLUMN
+        is also idempotent as defense in depth.
+        """
+
+        conn = self._connect()
+
+        # Base objects + optional baseline v1 row.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in SCHEMA_STATEMENTS:
+                conn.execute(statement)
+            current = self._migration_version(conn)
+            if current == 0:
+                checksum = sha256_text(
+                    "\n".join(s.strip() for s in SCHEMA_STATEMENTS)
+                )
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO schema_migrations
+                        (version, name, applied_at, checksum)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (1, "baseline_v1", utc_now(), checksum),
+                )
+                current = self._migration_version(conn)
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+
+        if current > SCHEMA_VERSION:
+            raise StorageError(
+                f"database schema version {current} is newer than "
+                f"supported {SCHEMA_VERSION}"
+            )
+
+        for target_version, name, statements in SCHEMA_MIGRATIONS:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                current = self._migration_version(conn)
+                if current >= target_version:
+                    conn.execute("COMMIT")
+                    continue
+                if target_version != current + 1:
+                    raise StorageError(
+                        f"schema migration gap: at {current}, next is {target_version}"
+                    )
+                checksum = sha256_text("\n".join(s.strip() for s in statements))
+                for statement in statements:
+                    self._execute_schema_ddl(conn, statement)
+                conn.execute(
+                    """
+                    INSERT INTO schema_migrations
+                        (version, name, applied_at, checksum)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (target_version, name, utc_now(), checksum),
+                )
+                conn.execute("COMMIT")
+                current = target_version
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+
+        return self._migration_version(conn)
+
     def ensure_schema(self) -> int:
         """Create/migrate schema to SCHEMA_VERSION. Returns current version.
 
         Existing v1 databases are upgraded in place via SCHEMA_MIGRATIONS rather
         than assuming create-only. Each version is recorded in schema_migrations.
+
+        Safe across independent connections: exclusive BEGIN IMMEDIATE, version
+        re-check, idempotent ALTER ADD COLUMN, and busy/locked retries. Does not
+        use a process-global lock.
         """
 
         with self._init_lock:
@@ -321,70 +795,29 @@ class StateStore:
                 ).fetchone()
                 return int(row["v"] or 0)
 
-            conn = self._connect()
-            # Always ensure base objects exist (IF NOT EXISTS is idempotent).
-            for statement in SCHEMA_STATEMENTS:
-                conn.execute(statement)
-
-            row = conn.execute(
-                "SELECT MAX(version) AS v FROM schema_migrations"
-            ).fetchone()
-            current = int(row["v"] or 0)
-
-            # Fresh DB: no migration rows yet. Record baseline v1 first so
-            # upgrades from older on-disk DBs and fresh opens share one path.
-            if current == 0:
-                checksum = sha256_text("\n".join(s.strip() for s in SCHEMA_STATEMENTS))
-                conn.execute("BEGIN IMMEDIATE")
+            last_error: BaseException | None = None
+            for attempt in range(SCHEMA_INIT_MAX_ATTEMPTS):
                 try:
-                    conn.execute(
-                        """
-                        INSERT OR IGNORE INTO schema_migrations
-                            (version, name, applied_at, checksum)
-                        VALUES (?, ?, ?, ?)
-                        """,
-                        (1, "baseline_v1", utc_now(), checksum),
-                    )
-                    conn.execute("COMMIT")
-                except Exception:
-                    conn.execute("ROLLBACK")
-                    raise
-                current = 1
-
-            if current > SCHEMA_VERSION:
-                raise StorageError(
-                    f"database schema version {current} is newer than "
-                    f"supported {SCHEMA_VERSION}"
+                    current = self._bootstrap_schema_once()
+                    self._initialized = True
+                    return current
+                except sqlite3.OperationalError as exc:
+                    last_error = exc
+                    if not _is_sqlite_locked_error(exc):
+                        raise
+                except sqlite3.IntegrityError as exc:
+                    # Concurrent migration insert: re-read after backoff.
+                    last_error = exc
+                self.close()
+                delay = min(
+                    SCHEMA_INIT_BASE_DELAY_S * (2 ** min(attempt, 6)),
+                    0.25,
                 )
+                time.sleep(delay)
 
-            for target_version, name, statements in SCHEMA_MIGRATIONS:
-                if current >= target_version:
-                    continue
-                if target_version != current + 1:
-                    raise StorageError(
-                        f"schema migration gap: at {current}, next is {target_version}"
-                    )
-                checksum = sha256_text("\n".join(s.strip() for s in statements))
-                conn.execute("BEGIN IMMEDIATE")
-                try:
-                    for statement in statements:
-                        conn.execute(statement)
-                    conn.execute(
-                        """
-                        INSERT INTO schema_migrations
-                            (version, name, applied_at, checksum)
-                        VALUES (?, ?, ?, ?)
-                        """,
-                        (target_version, name, utc_now(), checksum),
-                    )
-                    conn.execute("COMMIT")
-                except Exception:
-                    conn.execute("ROLLBACK")
-                    raise
-                current = target_version
-
-            self._initialized = True
-            return current
+            raise StorageError(
+                "schema initialization failed after concurrent access retries"
+            ) from last_error
 
     def schema_version(self) -> int:
         self.ensure_schema()
@@ -436,10 +869,7 @@ class StateStore:
         ).fetchone()
         if row is None:
             return None
-        data = _row_to_dict(row) or {}
-        data["provenance"] = json.loads(data.pop("provenance_json") or "{}")
-        data["metadata"] = json.loads(data.pop("metadata_json") or "{}")
-        return data
+        return _parse_recipe_row(row)
 
     def upsert_recipe(
         self,
@@ -456,6 +886,10 @@ class StateStore:
         When ``provenance`` / ``metadata`` are omitted (``None``), existing JSON
         columns are left unchanged on update (SQL COALESCE). The return value is
         the actual stored row after the write.
+
+        Low-level primitive: does not validate content or sanitize provenance
+        (used by legacy import / bridge). Prefer
+        :meth:`create_recipe_with_revision` for catalog writes.
         """
 
         rid = recipe_id or f"rcp_{uuid4().hex}"
@@ -506,10 +940,7 @@ class StateStore:
                 "SELECT * FROM recipes WHERE recipe_id = ?",
                 (rid,),
             ).fetchone()
-        data = _row_to_dict(row) or {}
-        data["provenance"] = json.loads(data.pop("provenance_json") or "{}")
-        data["metadata"] = json.loads(data.pop("metadata_json") or "{}")
-        return data
+        return _parse_recipe_row(row)
 
     def add_recipe_revision(
         self,
@@ -520,6 +951,12 @@ class StateStore:
         parent_revision_id: str | None = None,
         provenance: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """Low-level revision insert without domain validation or OCC.
+
+        Prefer :meth:`create_recipe_revision` for Web/catalog edits (validates
+        content, requires expected parent, updates recipe display fields).
+        """
+
         rev_id = revision_id or f"rev_{uuid4().hex}"
         content_json = canonical_json(dict(content))
         digest = sha256_text(content_json)
@@ -599,10 +1036,433 @@ class StateStore:
         ).fetchone()
         if row is None:
             return None
-        data = _row_to_dict(row) or {}
-        data["content"] = json.loads(data.pop("content_json"))
-        data["provenance"] = json.loads(data.pop("provenance_json") or "{}")
-        return data
+        return _parse_revision_row(row)
+
+    # ------------------------------------------------------------------
+    # High-level recipe / revision API (Phase B B8)
+    # ------------------------------------------------------------------
+
+    def create_recipe_with_revision(
+        self,
+        content: Mapping[str, Any] | Any,
+        *,
+        recipe_id: str | None = None,
+        name: str | None = None,
+        source: str | None = None,
+        provenance: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        creation_source: str | None = None,
+        revision_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically create one stable recipe and its first immutable revision.
+
+        Validates/canonicalizes content **before** opening a write transaction.
+        Returns ``{"recipe": ..., "revision": ...}``.
+        """
+
+        canonical, kind = canonicalize_recipe_content(content)
+        safe_prov = sanitize_recipe_provenance(
+            provenance, creation_source=creation_source
+        )
+        if metadata is not None and not isinstance(metadata, Mapping):
+            raise StorageError("metadata must be a mapping")
+        meta = dict(metadata or {})
+        display_name = (
+            str(name) if name is not None else str(canonical.get("name") or "Unnamed")
+        )
+        rid = recipe_id or f"rcp_{uuid4().hex}"
+        rev_id = revision_id or f"rev_{uuid4().hex}"
+        content_json = canonical_json(canonical)
+        digest = sha256_text(content_json)
+        prov_json = canonical_json(safe_prov)
+        meta_json = canonical_json(meta)
+        now = utc_now()
+
+        with self.transaction() as conn:
+            existing = conn.execute(
+                "SELECT recipe_id FROM recipes WHERE recipe_id = ?",
+                (rid,),
+            ).fetchone()
+            if existing is not None:
+                raise StorageConflictError(f"recipe_id already exists: {rid!r}")
+            _maybe_recipe_write_fault("before_recipe_insert")
+            conn.execute(
+                """
+                INSERT INTO recipes (
+                    recipe_id, kind, name, created_at, updated_at,
+                    source, provenance_json, metadata_json, archived_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    rid,
+                    kind,
+                    display_name,
+                    now,
+                    now,
+                    source,
+                    prov_json,
+                    meta_json,
+                ),
+            )
+            _maybe_recipe_write_fault("before_revision_insert")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO recipe_revisions (
+                        revision_id, recipe_id, revision_number, content_json,
+                        content_sha256, parent_revision_id, created_at, provenance_json
+                    ) VALUES (?, ?, 1, ?, ?, NULL, ?, ?)
+                    """,
+                    (rev_id, rid, content_json, digest, now, prov_json),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise StorageError(
+                    f"recipe revision integrity failure: {exc}"
+                ) from exc
+            recipe_row = conn.execute(
+                "SELECT * FROM recipes WHERE recipe_id = ?", (rid,)
+            ).fetchone()
+            rev_row = conn.execute(
+                "SELECT * FROM recipe_revisions WHERE revision_id = ?", (rev_id,)
+            ).fetchone()
+
+        return {
+            "recipe": _parse_recipe_row(recipe_row),
+            "revision": _parse_revision_row(rev_row),
+        }
+
+    def create_recipe_revision(
+        self,
+        recipe_id: str,
+        content: Mapping[str, Any] | Any,
+        *,
+        expected_parent_revision_id: str,
+        name: str | None = None,
+        source: str | None = None,
+        provenance: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        creation_source: str | None = None,
+        revision_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically create a new revision with mandatory expected-parent OCC.
+
+        Requires ``expected_parent_revision_id`` to match the current latest
+        revision. Updates recipe display fields / provenance / metadata in the
+        same ``BEGIN IMMEDIATE`` transaction. Raises
+        :class:`StorageConflictError` on stale parent (no lost update, no
+        duplicate ``revision_number``).
+        """
+
+        if not expected_parent_revision_id:
+            raise StorageError("expected_parent_revision_id is required")
+        canonical, kind = canonicalize_recipe_content(content)
+        safe_prov = sanitize_recipe_provenance(
+            provenance,
+            parent_revision_id=expected_parent_revision_id,
+            creation_source=creation_source,
+        )
+        if metadata is not None and not isinstance(metadata, Mapping):
+            raise StorageError("metadata must be a mapping")
+        display_name = (
+            str(name) if name is not None else str(canonical.get("name") or "Unnamed")
+        )
+        rev_id = revision_id or f"rev_{uuid4().hex}"
+        content_json = canonical_json(canonical)
+        digest = sha256_text(content_json)
+        prov_json = canonical_json(safe_prov)
+        now = utc_now()
+
+        with self.transaction() as conn:
+            recipe_row = conn.execute(
+                "SELECT * FROM recipes WHERE recipe_id = ?",
+                (recipe_id,),
+            ).fetchone()
+            if recipe_row is None:
+                raise StorageError(f"unknown recipe_id {recipe_id!r}")
+
+            latest = conn.execute(
+                """
+                SELECT revision_id, revision_number FROM recipe_revisions
+                WHERE recipe_id = ?
+                ORDER BY revision_number DESC
+                LIMIT 1
+                """,
+                (recipe_id,),
+            ).fetchone()
+            if latest is None:
+                raise StorageError(
+                    f"recipe {recipe_id!r} has no revisions; use "
+                    "create_recipe_with_revision"
+                )
+            if latest["revision_id"] != expected_parent_revision_id:
+                raise StorageConflictError(
+                    f"expected parent revision {expected_parent_revision_id!r} "
+                    f"but latest is {latest['revision_id']!r}"
+                )
+            number = int(latest["revision_number"]) + 1
+
+            meta_json: str | None
+            if metadata is not None:
+                meta_json = canonical_json(dict(metadata))
+            else:
+                meta_json = None
+
+            _maybe_recipe_write_fault("before_revision_insert")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO recipe_revisions (
+                        revision_id, recipe_id, revision_number, content_json,
+                        content_sha256, parent_revision_id, created_at, provenance_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        rev_id,
+                        recipe_id,
+                        number,
+                        content_json,
+                        digest,
+                        expected_parent_revision_id,
+                        now,
+                        prov_json,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                # Concurrent winner already took this revision_number.
+                raise StorageConflictError(
+                    f"recipe revision conflict for {recipe_id!r}: {exc}"
+                ) from exc
+
+            _maybe_recipe_write_fault("before_recipe_update")
+            conn.execute(
+                """
+                UPDATE recipes SET
+                    kind = ?,
+                    name = ?,
+                    updated_at = ?,
+                    source = COALESCE(?, source),
+                    provenance_json = ?,
+                    metadata_json = COALESCE(?, metadata_json)
+                WHERE recipe_id = ?
+                """,
+                (
+                    kind,
+                    display_name,
+                    now,
+                    source,
+                    prov_json,
+                    meta_json,
+                    recipe_id,
+                ),
+            )
+            recipe_out = conn.execute(
+                "SELECT * FROM recipes WHERE recipe_id = ?", (recipe_id,)
+            ).fetchone()
+            rev_out = conn.execute(
+                "SELECT * FROM recipe_revisions WHERE revision_id = ?", (rev_id,)
+            ).fetchone()
+
+        return {
+            "recipe": _parse_recipe_row(recipe_out),
+            "revision": _parse_revision_row(rev_out),
+        }
+
+    def get_latest_recipe_revision(self, recipe_id: str) -> dict[str, Any] | None:
+        """Return the latest revision for *recipe_id*, or None."""
+
+        self.ensure_schema()
+        row = self._connect().execute(
+            """
+            SELECT * FROM recipe_revisions
+            WHERE recipe_id = ?
+            ORDER BY revision_number DESC
+            LIMIT 1
+            """,
+            (recipe_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _parse_revision_row(row)
+
+    def list_recipe_revisions(self, recipe_id: str) -> list[dict[str, Any]]:
+        """List revisions for *recipe_id* in stable ``revision_number`` order."""
+
+        self.ensure_schema()
+        rows = self._connect().execute(
+            """
+            SELECT * FROM recipe_revisions
+            WHERE recipe_id = ?
+            ORDER BY revision_number ASC
+            """,
+            (recipe_id,),
+        ).fetchall()
+        return [_parse_revision_row(row) for row in rows]
+
+    def list_recipes(
+        self,
+        *,
+        kind: str | None = None,
+        query: str | None = None,
+        limit: int = DEFAULT_RECIPE_LIST_LIMIT,
+        offset: int = 0,
+        include_archived: bool = False,
+    ) -> list[dict[str, Any]]:
+        """List recipes with latest revision summary/content.
+
+        Filters: optional storage *kind* (``coffee``/``tea``), case-insensitive
+        name/id *query*, pagination bounds, and *include_archived*.
+        """
+
+        if not isinstance(limit, int) or not (1 <= limit <= MAX_RECIPE_LIST_LIMIT):
+            raise StorageError(
+                f"limit must be an integer 1..{MAX_RECIPE_LIST_LIMIT}, got {limit!r}"
+            )
+        if not isinstance(offset, int) or offset < 0:
+            raise StorageError(f"offset must be a non-negative integer, got {offset!r}")
+
+        self.ensure_schema()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if not include_archived:
+            clauses.append("r.archived_at IS NULL")
+        if kind is not None:
+            clauses.append("r.kind = ?")
+            params.append(kind)
+        if query is not None and str(query).strip():
+            like = f"%{str(query).strip()}%"
+            clauses.append("(r.name LIKE ? COLLATE NOCASE OR r.recipe_id LIKE ? COLLATE NOCASE)")
+            params.extend([like, like])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"""
+            SELECT r.*,
+                   rev.revision_id AS latest_revision_id,
+                   rev.revision_number AS latest_revision_number,
+                   rev.content_json AS latest_content_json,
+                   rev.content_sha256 AS latest_content_sha256,
+                   rev.parent_revision_id AS latest_parent_revision_id,
+                   rev.created_at AS latest_revision_created_at,
+                   rev.provenance_json AS latest_provenance_json
+            FROM recipes r
+            LEFT JOIN recipe_revisions rev
+              ON rev.recipe_id = r.recipe_id
+             AND rev.revision_number = (
+                    SELECT MAX(rr.revision_number)
+                    FROM recipe_revisions rr
+                    WHERE rr.recipe_id = r.recipe_id
+             )
+            {where}
+            ORDER BY r.updated_at DESC, r.recipe_id ASC
+            LIMIT ? OFFSET ?
+        """
+        params.extend([limit, offset])
+        rows = self._connect().execute(sql, params).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            data = _parse_recipe_row(row)
+            latest: dict[str, Any] | None = None
+            if data.get("latest_revision_id"):
+                latest = {
+                    "revision_id": data.pop("latest_revision_id"),
+                    "recipe_id": data["recipe_id"],
+                    "revision_number": data.pop("latest_revision_number"),
+                    "content": json.loads(data.pop("latest_content_json")),
+                    "content_sha256": data.pop("latest_content_sha256"),
+                    "parent_revision_id": data.pop("latest_parent_revision_id"),
+                    "created_at": data.pop("latest_revision_created_at"),
+                    "provenance": json.loads(
+                        data.pop("latest_provenance_json") or "{}"
+                    ),
+                }
+            else:
+                for key in (
+                    "latest_revision_id",
+                    "latest_revision_number",
+                    "latest_content_json",
+                    "latest_content_sha256",
+                    "latest_parent_revision_id",
+                    "latest_revision_created_at",
+                    "latest_provenance_json",
+                ):
+                    data.pop(key, None)
+            data["latest_revision"] = latest
+            result.append(data)
+        return result
+
+    def archive_recipe(
+        self,
+        recipe_id: str,
+        *,
+        expected_latest_revision_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Soft-archive a recipe without deleting revisions or breaking workflows.
+
+        When *expected_latest_revision_id* is provided it must match the current
+        latest revision (guards against archiving over a newer browser edit).
+        """
+
+        return self._set_recipe_archived(
+            recipe_id,
+            archived=True,
+            expected_latest_revision_id=expected_latest_revision_id,
+        )
+
+    def restore_recipe(
+        self,
+        recipe_id: str,
+        *,
+        expected_latest_revision_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Restore a previously archived recipe (revisions unchanged)."""
+
+        return self._set_recipe_archived(
+            recipe_id,
+            archived=False,
+            expected_latest_revision_id=expected_latest_revision_id,
+        )
+
+    def _set_recipe_archived(
+        self,
+        recipe_id: str,
+        *,
+        archived: bool,
+        expected_latest_revision_id: str | None,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM recipes WHERE recipe_id = ?",
+                (recipe_id,),
+            ).fetchone()
+            if row is None:
+                raise StorageError(f"unknown recipe_id {recipe_id!r}")
+            if expected_latest_revision_id is not None:
+                latest = conn.execute(
+                    """
+                    SELECT revision_id FROM recipe_revisions
+                    WHERE recipe_id = ?
+                    ORDER BY revision_number DESC
+                    LIMIT 1
+                    """,
+                    (recipe_id,),
+                ).fetchone()
+                latest_id = latest["revision_id"] if latest is not None else None
+                if latest_id != expected_latest_revision_id:
+                    raise StorageConflictError(
+                        f"expected latest revision {expected_latest_revision_id!r} "
+                        f"but latest is {latest_id!r}"
+                    )
+            archived_at = now if archived else None
+            conn.execute(
+                """
+                UPDATE recipes SET archived_at = ?, updated_at = ?
+                WHERE recipe_id = ?
+                """,
+                (archived_at, now, recipe_id),
+            )
+            out = conn.execute(
+                "SELECT * FROM recipes WHERE recipe_id = ?", (recipe_id,)
+            ).fetchone()
+        return _parse_recipe_row(out)
 
     @staticmethod
     def _encode_recovery_json(
@@ -2299,6 +3159,37 @@ def main(argv: list[str] | None = None) -> None:
     else:  # pragma: no cover
         parser.error(f"unknown command {args.command}")
     print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+
+
+__all__ = [
+    "ACTIVE_WORKFLOW_STATES",
+    "BUSY_TIMEOUT_MS",
+    "CLEAR_RECOVERY",
+    "DB_FILE_NAME",
+    "DEFAULT_RECIPE_LIST_LIMIT",
+    "IDEM_COMPLETED",
+    "IDEM_FAILED",
+    "IDEM_PENDING",
+    "LEGACY_MIGRATION_NAME",
+    "MAX_RECIPE_LIST_LIMIT",
+    "SCHEMA_VERSION",
+    "StateStore",
+    "StorageConflictError",
+    "StorageError",
+    "canonicalize_recipe_content",
+    "canonical_json",
+    "content_sha256",
+    "default_db_path",
+    "migrate_legacy_state",
+    "migration_status",
+    "open_store",
+    "reject_forbidden_provenance",
+    "sanitize_recipe_provenance",
+    "sha256_bytes",
+    "sha256_file",
+    "sha256_text",
+    "utc_now",
+]
 
 
 if __name__ == "__main__":

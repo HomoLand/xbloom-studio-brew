@@ -1040,3 +1040,805 @@ def test_create_workflow_with_event_atomic_and_transition(tmp_path, monkeypatch)
     after = store.list_active_workflows()
     assert len(after) == len(before)
     store.close()
+
+# ---------------------------------------------------------------------------
+# Phase B B8: typed recipe/revision store (schema v3, OCC, provenance)
+# ---------------------------------------------------------------------------
+
+_COFFEE_CONTENT = {
+    "name": "B8 Hot",
+    "kind": "hot",
+    "dripper": "Omni Dripper 2",
+    "dose_g": 15,
+    "grind": 58,
+    "ratio": 16,
+    "water_ml": 240,
+    "hot_water_ml": 240,
+    "pours": [
+        {
+            "label": "Bloom",
+            "ml": 45,
+            "temp_c": 92,
+            "pattern": "spiral",
+            "vibration": "after",
+            "pause_s": 35,
+            "rpm": 90,
+            "flow_ml_s": 3.0,
+        },
+        {
+            "label": "Main",
+            "ml": 105,
+            "temp_c": 92,
+            "pattern": "spiral",
+            "vibration": "none",
+            "pause_s": 10,
+            "rpm": 90,
+            "flow_ml_s": 3.2,
+        },
+        {
+            "label": "Finish",
+            "ml": 90,
+            "temp_c": 91,
+            "pattern": "circular",
+            "vibration": "none",
+            "pause_s": 0,
+            "rpm": 90,
+            "flow_ml_s": 3.2,
+        },
+    ],
+}
+
+_TEA_CONTENT = {
+    "name": "B8 Green",
+    "kind": "tea",
+    "leaf_g": 4,
+    "output_ml_per_steep": 120,
+    "pours": [
+        {
+            "label": "Steep 1",
+            "ml": 90,
+            "temp_c": 85,
+            "pattern": "circular",
+            "pause_s": 20,
+            "flow_ml_s": 3.5,
+        },
+        {
+            "label": "Steep 2",
+            "ml": 90,
+            "temp_c": 85,
+            "pattern": "center",
+            "pause_s": 15,
+            "flow_ml_s": 3.5,
+        },
+    ],
+}
+
+
+def _coffee_edit(**overrides):
+    data = json.loads(json.dumps(_COFFEE_CONTENT))
+    data.update(overrides)
+    return data
+
+
+def test_schema_fresh_is_v3_with_archive_column_and_indexes(tmp_path):
+    store = storage.StateStore(tmp_path)
+    version = store.ensure_schema()
+    assert version == 3
+    assert storage.SCHEMA_VERSION == 3
+    names = {row["name"] for row in store.list_migrations()}
+    assert "baseline_v1" in names
+    assert any("v2" in n for n in names)
+    assert any("v3" in n for n in names)
+    cols = {
+        r[1]
+        for r in store._connect().execute("PRAGMA table_info(recipes)").fetchall()
+    }
+    assert "archived_at" in cols
+    index_names = {
+        r[0]
+        for r in store._connect()
+        .execute("SELECT name FROM sqlite_master WHERE type='index'")
+        .fetchall()
+    }
+    assert "idx_recipes_updated_at" in index_names
+    assert "idx_recipes_kind_updated" in index_names
+    assert "idx_recipes_archived_updated" in index_names
+    assert "idx_recipe_revisions_recipe_number" in index_names
+    # Fresh open must not re-apply ALTER (single v3 migration row).
+    store.close()
+    store2 = storage.StateStore(tmp_path)
+    assert store2.ensure_schema() == 3
+    v3_rows = store2._connect().execute(
+        "SELECT COUNT(*) AS n FROM schema_migrations WHERE version = 3"
+    ).fetchone()
+    assert v3_rows["n"] == 1
+    assert store2.integrity_check()["ok"] is True
+    store2.close()
+
+
+def test_schema_migrates_v2_to_v3(tmp_path):
+    """v2-shaped DB (baseline + phase A indexes) upgrades to v3 once."""
+
+    db_path = tmp_path / "state.db"
+    conn = __import__("sqlite3").connect(str(db_path))
+    for statement in storage.SCHEMA_STATEMENTS:
+        conn.execute(statement)
+    for _target, name, statements in storage.SCHEMA_MIGRATIONS:
+        if _target > 2:
+            break
+        for statement in statements:
+            conn.execute(statement)
+    now = storage.utc_now()
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at, checksum) "
+        "VALUES (1, 'baseline_v1', ?, 'x')",
+        (now,),
+    )
+    conn.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at, checksum) "
+        "VALUES (2, 'phase_a_workflow_idempotency_indexes_v2', ?, 'y')",
+        (now,),
+    )
+    # Seed a recipe without archived_at column (v2 shape).
+    conn.execute(
+        "INSERT INTO recipes (recipe_id, kind, name, created_at, updated_at, "
+        "source, provenance_json, metadata_json) "
+        "VALUES ('rcp_v2', 'coffee', 'Legacy', ?, ?, 'test', '{}', '{}')",
+        (now, now),
+    )
+    conn.commit()
+    conn.close()
+
+    store = storage.StateStore(tmp_path)
+    assert store.ensure_schema() == 3
+    recipe = store.get_recipe("rcp_v2")
+    assert recipe is not None
+    assert recipe["name"] == "Legacy"
+    assert recipe.get("archived_at") is None
+    cols = {
+        r[1]
+        for r in store._connect().execute("PRAGMA table_info(recipes)").fetchall()
+    }
+    assert "archived_at" in cols
+    store.close()
+
+
+def test_canonicalize_coffee_and_tea_and_reject_unsafe(tmp_path):
+    coffee, kind_c = storage.canonicalize_recipe_content(_COFFEE_CONTENT)
+    assert kind_c == "coffee"
+    assert coffee["dose_g"] == 15
+    assert coffee["name"] == "B8 Hot"
+    # Stable hash for identical canonical content.
+    again, _ = storage.canonicalize_recipe_content(coffee)
+    assert storage.content_sha256(coffee) == storage.content_sha256(again)
+
+    tea, kind_t = storage.canonicalize_recipe_content(_TEA_CONTENT)
+    assert kind_t == "tea"
+    assert tea["kind"] == "tea"
+    assert tea["leaf_g"] == 4.0
+
+    with pytest.raises(storage.StorageError, match="file path|mapping"):
+        storage.canonicalize_recipe_content("/tmp/recipe.yaml")
+    with pytest.raises(storage.StorageError, match="file path|mapping"):
+        storage.canonicalize_recipe_content(Path("C:/recipes/demo.yaml"))
+    with pytest.raises(storage.StorageError, match="invalid coffee"):
+        storage.canonicalize_recipe_content(
+            {"name": "bad", "dose_g": 15, "grind": 50, "pours": []}
+        )
+    with pytest.raises(storage.StorageError, match="invalid tea"):
+        storage.canonicalize_recipe_content(
+            {
+                "name": "bad tea",
+                "kind": "tea",
+                "leaf_g": 99,
+                "output_ml_per_steep": 120,
+                "pours": [
+                    {"ml": 90, "temp_c": 85, "pattern": "circular", "pause_s": 20}
+                ],
+            }
+        )
+    # Unsafe coffee (strict_validate): dose too low.
+    with pytest.raises(storage.StorageError, match="invalid coffee"):
+        storage.canonicalize_recipe_content(
+            {
+                "name": "tiny",
+                "dose_g": 2,
+                "grind": 55,
+                "pours": [
+                    {
+                        "ml": 40,
+                        "temp_c": 92,
+                        "pattern": "spiral",
+                        "pause_s": 30,
+                        "rpm": 100,
+                        "flow_ml_s": 3.0,
+                    },
+                    {
+                        "ml": 200,
+                        "temp_c": 92,
+                        "pattern": "spiral",
+                        "pause_s": 5,
+                        "rpm": 100,
+                        "flow_ml_s": 3.0,
+                    },
+                ],
+            }
+        )
+
+
+def test_create_edit_list_get_canonical_coffee_tea(tmp_path):
+    store = storage.StateStore(tmp_path)
+    created = store.create_recipe_with_revision(
+        _COFFEE_CONTENT,
+        source="test",
+        provenance={
+            "knowledge_version": "1.0.0",
+            "knowledge_hash": "abc",
+            "provider": "openai-compatible",
+            "model": "grok-4.5",
+            "prompt_template_version": "pt-1",
+            "schema_version": "rs-1",
+            "candidate_hash": "cand1",
+        },
+        creation_source="unit-test",
+        metadata={"tags": ["b8"]},
+    )
+    recipe = created["recipe"]
+    rev = created["revision"]
+    assert recipe["kind"] == "coffee"
+    assert recipe["name"] == "B8 Hot"
+    assert recipe["archived_at"] is None
+    assert recipe["metadata"] == {"tags": ["b8"]}
+    assert rev["revision_number"] == 1
+    assert rev["parent_revision_id"] is None
+    assert rev["content"]["dose_g"] == 15
+    assert rev["provenance"]["creation_source"] == "unit-test"
+    assert rev["provenance"]["knowledge_version"] == "1.0.0"
+    assert rev["content_sha256"] == storage.content_sha256(rev["content"])
+
+    latest = store.get_latest_recipe_revision(recipe["recipe_id"])
+    assert latest is not None
+    assert latest["revision_id"] == rev["revision_id"]
+    assert latest["content_sha256"] == rev["content_sha256"]
+
+    tea = store.create_recipe_with_revision(_TEA_CONTENT, source="test")
+    assert tea["recipe"]["kind"] == "tea"
+    assert tea["revision"]["content"]["leaf_g"] == 4.0
+
+    edited = store.create_recipe_revision(
+        recipe["recipe_id"],
+        _coffee_edit(name="B8 Hot v2", note="tweaked"),
+        expected_parent_revision_id=rev["revision_id"],
+        provenance={"model": "grok-4.5", "candidate_hash": "cand2"},
+        source="editor",
+    )
+    assert edited["revision"]["revision_number"] == 2
+    assert edited["revision"]["parent_revision_id"] == rev["revision_id"]
+    assert edited["recipe"]["name"] == "B8 Hot v2"
+    assert edited["recipe"]["source"] == "editor"
+    assert edited["revision"]["provenance"]["parent_revision_id"] == rev["revision_id"]
+    # Content hash is stable for same canonical payload.
+    same_again, _ = storage.canonicalize_recipe_content(edited["revision"]["content"])
+    assert storage.content_sha256(same_again) == edited["revision"]["content_sha256"]
+
+    revs = store.list_recipe_revisions(recipe["recipe_id"])
+    assert [r["revision_number"] for r in revs] == [1, 2]
+    assert revs[0]["revision_id"] == rev["revision_id"]
+    assert revs[1]["revision_id"] == edited["revision"]["revision_id"]
+
+    listed = store.list_recipes(kind="coffee")
+    assert len(listed) == 1
+    assert listed[0]["latest_revision"]["revision_number"] == 2
+    assert listed[0]["latest_revision"]["content"]["name"] == "B8 Hot v2"
+
+    teas = store.list_recipes(kind="tea", query="Green")
+    assert len(teas) == 1
+    assert teas[0]["kind"] == "tea"
+
+    empty = store.list_recipes(query="does-not-match-zzz")
+    assert empty == []
+    with pytest.raises(storage.StorageError, match="limit"):
+        store.list_recipes(limit=0)
+    with pytest.raises(storage.StorageError, match="offset"):
+        store.list_recipes(offset=-1)
+
+    # Reject unsafe before opening write (no partial rows).
+    before_count = store._connect().execute(
+        "SELECT COUNT(*) AS n FROM recipes"
+    ).fetchone()["n"]
+    with pytest.raises(storage.StorageError, match="invalid coffee|file path"):
+        store.create_recipe_with_revision("C:/local/path.yaml")
+    with pytest.raises(storage.StorageError, match="invalid coffee"):
+        store.create_recipe_revision(
+            recipe["recipe_id"],
+            {"name": "x", "dose_g": 15, "grind": 50, "pours": []},
+            expected_parent_revision_id=edited["revision"]["revision_id"],
+        )
+    after_count = store._connect().execute(
+        "SELECT COUNT(*) AS n FROM recipes"
+    ).fetchone()["n"]
+    assert after_count == before_count
+    assert store.get_latest_recipe_revision(recipe["recipe_id"])["revision_number"] == 2
+    store.close()
+
+
+def test_forbidden_provenance_rejected_not_stripped(tmp_path):
+    store = storage.StateStore(tmp_path)
+    with pytest.raises(storage.StorageError, match="forbidden provenance"):
+        store.create_recipe_with_revision(
+            _COFFEE_CONTENT,
+            provenance={"image_base64": "AAAA", "model": "x"},
+        )
+    with pytest.raises(storage.StorageError, match="forbidden provenance"):
+        store.create_recipe_with_revision(
+            _COFFEE_CONTENT,
+            provenance={"nested": {"api_key": "sk-secret"}},
+        )
+    with pytest.raises(storage.StorageError, match="forbidden provenance"):
+        store.create_recipe_with_revision(
+            _COFFEE_CONTENT,
+            provenance={"reasoning": "step by step..."},
+        )
+    with pytest.raises(storage.StorageError, match="forbidden provenance"):
+        store.create_recipe_with_revision(
+            _COFFEE_CONTENT,
+            provenance={"local_path": "/home/user/bean.jpg"},
+        )
+    # Nested semantic keys that must be rejected recursively.
+    for payload in (
+        {"wrap": {"raw_image": "AAAA"}},
+        {"wrap": {"session_token": "sess"}},
+        {"wrap": {"source_path": "/tmp/bean.jpg"}},
+        {"wrap": {"raw_reasoning": "step by step"}},
+        {"API-Key": "sk"},
+        {"sessionToken": "sess"},
+        {"Raw Image": "x"},
+        {"sourcePath": "/tmp/x"},
+        {"rawReasoning": "think"},
+        {"payload": b"\x00\x01raw"},
+        {"nested": {"blob": bytearray(b"abc")}},
+        {"items": [{"buf": memoryview(b"xyz")}]},
+    ):
+        with pytest.raises(storage.StorageError, match="forbidden"):
+            store.create_recipe_with_revision(_COFFEE_CONTENT, provenance=payload)
+
+    # Nothing stored on rejection.
+    assert store.list_recipes() == []
+
+    # Allowed ordinary keys plus non-substring false positives.
+    # Forged parent_revision_id on first revision is omitted (not preserved).
+    allowed = store.create_recipe_with_revision(
+        _COFFEE_CONTENT,
+        provenance={
+            "knowledge_version": "1.0.0",
+            "knowledge_hash": "abc",
+            "provider": "openai-compatible",
+            "model": "grok-4.5",
+            "prompt_template_version": "pt-1",
+            "schema_version": "rs-1",
+            "candidate_hash": "cand1",
+            "creation_source": "unit-test",
+            "parent_revision_id": "rev_parent",
+            "evidence": ["note-a"],
+            "source_url": "https://example.com/recipe",
+            "tokenizer": "cl100k_base",
+            "pathway": "default",
+        },
+    )
+    prov = allowed["revision"]["provenance"]
+    assert prov["tokenizer"] == "cl100k_base"
+    assert prov["pathway"] == "default"
+    assert prov["source_url"] == "https://example.com/recipe"
+    assert "parent_revision_id" not in prov
+    assert allowed["revision"]["parent_revision_id"] is None
+
+    # Low-level path still accepts extensible provenance for legacy/bridge.
+    low = store.upsert_recipe(
+        recipe_id="rcp_legacy",
+        kind="coffee",
+        name="Legacy",
+        provenance={
+            "import_note": "from catalog.json",
+            "source": "legacy",
+            "raw_image": "still-allowed-low-level",
+            "session_token": "legacy-ok",
+        },
+    )
+    assert low["provenance"]["import_note"] == "from catalog.json"
+    assert low["provenance"]["raw_image"] == "still-allowed-low-level"
+    store.close()
+
+
+def test_provenance_safe_image_metadata_accepted_raw_rejected(tmp_path):
+    """B8/B9: boolean image-use metadata is allowed; raw image material is not."""
+
+    store = storage.StateStore(tmp_path)
+
+    # Safe design-service metadata (boolean facts, not material).
+    created = store.create_recipe_with_revision(
+        _COFFEE_CONTENT,
+        provenance={
+            "used_image": True,
+            "image_present": False,
+            "model": "grok-4.5",
+            "candidate_hash": "cand-img",
+            "tokenizer": "cl100k_base",
+            "pathway": "default",
+        },
+        creation_source="web-design",
+    )
+    prov = created["revision"]["provenance"]
+    assert prov["used_image"] is True
+    assert prov["image_present"] is False
+    assert prov["model"] == "grok-4.5"
+    assert prov["tokenizer"] == "cl100k_base"
+    assert prov["pathway"] == "default"
+
+    # Direct image/photo fields and raw material forms remain rejected.
+    for payload in (
+        {"image": "x"},
+        {"images": ["a"]},
+        {"photo": "x"},
+        {"raw_image": "AAAA"},
+        {"image_base64": "AAAA"},
+        {"image_bytes": "AAAA"},
+        {"image_data": "AAAA"},
+        {"image_payload": "AAAA"},
+        {"image_path": "/tmp/bean.jpg"},
+        {"imageBase64": "AAAA"},
+        {"imageData": "AAAA"},
+        {"imagePayload": "AAAA"},
+        {"imagePath": "/tmp/x"},
+        {"rawImage": "x"},
+        {"wrap": {"image_base64": "AAAA"}},
+        {"used_image": {"nested": "not-scalar"}},
+        {"image_present": ["not", "scalar"]},
+        {"used_image": "data:image/png;base64,AAAA"},
+        {"image_present": 1},
+        {"blob": b"\x00\x01"},
+    ):
+        with pytest.raises(storage.StorageError, match="forbidden"):
+            store.create_recipe_with_revision(_COFFEE_CONTENT, provenance=payload)
+
+    # Only the one successful create above was stored.
+    assert len(store.list_recipes()) == 1
+    store.close()
+
+
+def test_provenance_trusted_lineage_not_spoofable(tmp_path):
+    """parent_revision_id and creation_source must follow trusted store values."""
+
+    store = storage.StateStore(tmp_path)
+
+    # First revision: forged parent is dropped; method creation_source wins.
+    first = store.create_recipe_with_revision(
+        _COFFEE_CONTENT,
+        provenance={
+            "parent_revision_id": "rev_forged_parent",
+            "creation_source": "caller-spoof",
+            "model": "grok-4.5",
+        },
+        creation_source="trusted-create",
+    )
+    first_rev = first["revision"]
+    first_prov = first_rev["provenance"]
+    assert first_rev["parent_revision_id"] is None
+    assert "parent_revision_id" not in first_prov
+    assert first_prov["creation_source"] == "trusted-create"
+    assert first_prov["model"] == "grok-4.5"
+
+    # Edit: provenance parent is forced to the real expected parent even if
+    # the caller supplies a conflicting value; method creation_source wins.
+    edited = store.create_recipe_revision(
+        first["recipe"]["recipe_id"],
+        _coffee_edit(name="B8 Hot spoof-guard", note="lineage"),
+        expected_parent_revision_id=first_rev["revision_id"],
+        provenance={
+            "parent_revision_id": "rev_totally_wrong",
+            "creation_source": "caller-spoof-edit",
+            "candidate_hash": "cand-edit",
+        },
+        creation_source="trusted-edit",
+    )
+    edit_rev = edited["revision"]
+    edit_prov = edit_rev["provenance"]
+    assert edit_rev["parent_revision_id"] == first_rev["revision_id"]
+    assert edit_prov["parent_revision_id"] == first_rev["revision_id"]
+    assert edit_prov["parent_revision_id"] != "rev_totally_wrong"
+    assert edit_prov["creation_source"] == "trusted-edit"
+    assert edit_prov["candidate_hash"] == "cand-edit"
+
+    # Without an explicit creation_source method arg, provenance value is kept.
+    edited2 = store.create_recipe_revision(
+        first["recipe"]["recipe_id"],
+        _coffee_edit(name="B8 Hot keep-src", note="keep"),
+        expected_parent_revision_id=edit_rev["revision_id"],
+        provenance={
+            "creation_source": "from-provenance-only",
+            "parent_revision_id": "still-forged",
+        },
+    )
+    assert edited2["revision"]["provenance"]["creation_source"] == "from-provenance-only"
+    assert (
+        edited2["revision"]["provenance"]["parent_revision_id"]
+        == edit_rev["revision_id"]
+    )
+    store.close()
+
+
+def test_provenance_classifier_direct_unit():
+    """Semantic classifier: case/style variants, false positives, binary values."""
+
+    storage.reject_forbidden_provenance(
+        {
+            "knowledge_version": "1",
+            "tokenizer": "x",
+            "pathway": "y",
+            "used_image": True,
+            "image_present": False,
+            "evidence": [{"kind": "url", "source_url": "https://ex"}],
+        }
+    )
+    for key in (
+        "raw_image",
+        "rawImage",
+        "RAW-IMAGE",
+        "image_base64",
+        "image_data",
+        "image_payload",
+        "image_path",
+        "image",
+        "images",
+        "photo",
+        "session_token",
+        "sessionToken",
+        "source_path",
+        "sourcePath",
+        "raw_reasoning",
+        "rawReasoning",
+        "api_key",
+        "api-key",
+        "API Key",
+    ):
+        with pytest.raises(storage.StorageError, match="forbidden provenance"):
+            storage.reject_forbidden_provenance({key: "x"})
+    with pytest.raises(storage.StorageError, match="forbidden binary"):
+        storage.reject_forbidden_provenance({"neutral": b"\x00"})
+    with pytest.raises(storage.StorageError, match="forbidden binary"):
+        storage.reject_forbidden_provenance({"n": bytearray(b"a")})
+    with pytest.raises(storage.StorageError, match="forbidden binary"):
+        storage.reject_forbidden_provenance({"n": memoryview(b"a")})
+    with pytest.raises(storage.StorageError, match="forbidden non-boolean"):
+        storage.reject_forbidden_provenance({"used_image": {"x": 1}})
+
+    # Trusted lineage helpers.
+    forced = storage.sanitize_recipe_provenance(
+        {"parent_revision_id": "fake", "creation_source": "spoof"},
+        parent_revision_id="rev_real",
+        creation_source="trusted",
+    )
+    assert forced["parent_revision_id"] == "rev_real"
+    assert forced["creation_source"] == "trusted"
+    first = storage.sanitize_recipe_provenance(
+        {"parent_revision_id": "fake", "model": "x"}
+    )
+    assert "parent_revision_id" not in first
+    assert first["model"] == "x"
+
+
+def test_concurrent_fresh_schema_init_two_independent_stores(tmp_path):
+    """Two distinct StateStores racing ensure_schema on a fresh real SQLite DB.
+
+    Repeated attempts catch intermittent database-is-locked races that a single
+    barrier trial can miss. Both callers must return SCHEMA_VERSION with exactly
+    one schema_migrations row per version.
+    """
+
+    attempts = 30
+    for attempt in range(attempts):
+        root = tmp_path / f"race_{attempt}"
+        root.mkdir()
+        barrier = threading.Barrier(2)
+        results: list[object] = []
+        lock = threading.Lock()
+
+        def worker() -> None:
+            store = storage.StateStore(root)
+            try:
+                barrier.wait(timeout=15)
+                version = store.ensure_schema()
+                with lock:
+                    results.append(version)
+            except Exception as exc:  # noqa: BLE001 - collect either outcome
+                with lock:
+                    results.append(exc)
+            finally:
+                store.close()
+
+        t1 = threading.Thread(target=worker, name=f"schema-a-{attempt}")
+        t2 = threading.Thread(target=worker, name=f"schema-b-{attempt}")
+        t1.start()
+        t2.start()
+        t1.join(timeout=60)
+        t2.join(timeout=60)
+        assert not t1.is_alive() and not t2.is_alive(), attempt
+        errors = [r for r in results if isinstance(r, BaseException)]
+        versions = [r for r in results if not isinstance(r, BaseException)]
+        assert not errors, (attempt, errors)
+        assert versions == [storage.SCHEMA_VERSION, storage.SCHEMA_VERSION], (
+            attempt,
+            versions,
+        )
+
+        verify = storage.StateStore(root)
+        assert verify.ensure_schema() == storage.SCHEMA_VERSION
+        rows = verify.list_migrations()
+        assert [row["version"] for row in rows] == list(
+            range(1, storage.SCHEMA_VERSION + 1)
+        )
+        assert len(rows) == storage.SCHEMA_VERSION
+        assert len({row["name"] for row in rows}) == storage.SCHEMA_VERSION
+        for row in rows:
+            assert row["checksum"]
+        assert verify.integrity_check()["ok"] is True
+        verify.close()
+
+
+def test_archive_restore_with_revision_guard(tmp_path):
+    store = storage.StateStore(tmp_path)
+    created = store.create_recipe_with_revision(_COFFEE_CONTENT)
+    rid = created["recipe"]["recipe_id"]
+    rev1 = created["revision"]["revision_id"]
+
+    archived = store.archive_recipe(rid, expected_latest_revision_id=rev1)
+    assert archived["archived_at"] is not None
+    assert store.list_recipes() == []
+    listed = store.list_recipes(include_archived=True)
+    assert len(listed) == 1
+    assert listed[0]["archived_at"] is not None
+    # Revisions and workflows still intact.
+    assert len(store.list_recipe_revisions(rid)) == 1
+    wf = store.create_workflow(
+        kind="coffee",
+        state="loaded",
+        recipe_revision_id=rev1,
+    )
+    assert wf["recipe_revision_id"] == rev1
+
+    restored = store.restore_recipe(rid, expected_latest_revision_id=rev1)
+    assert restored["archived_at"] is None
+    assert len(store.list_recipes()) == 1
+
+    # Stale expected latest revision guard.
+    edited = store.create_recipe_revision(
+        rid,
+        _coffee_edit(name="after restore"),
+        expected_parent_revision_id=rev1,
+    )
+    with pytest.raises(storage.StorageConflictError, match="expected latest"):
+        store.archive_recipe(rid, expected_latest_revision_id=rev1)
+    store.archive_recipe(
+        rid, expected_latest_revision_id=edited["revision"]["revision_id"]
+    )
+    assert store.get_recipe(rid)["archived_at"] is not None
+    store.close()
+
+
+def test_create_and_edit_rollback_on_injected_failure(tmp_path, monkeypatch):
+    store = storage.StateStore(tmp_path)
+
+    def fail_revision(stage):
+        if stage == "before_revision_insert":
+            raise storage.StorageError("injected revision insert failure")
+
+    monkeypatch.setattr(storage, "_recipe_write_fault_hook", fail_revision)
+    with pytest.raises(storage.StorageError, match="injected revision insert"):
+        store.create_recipe_with_revision(_COFFEE_CONTENT, recipe_id="rcp_roll")
+    monkeypatch.setattr(storage, "_recipe_write_fault_hook", None)
+    assert store.get_recipe("rcp_roll") is None
+    assert (
+        store._connect()
+        .execute("SELECT COUNT(*) AS n FROM recipe_revisions")
+        .fetchone()["n"]
+        == 0
+    )
+
+    created = store.create_recipe_with_revision(
+        _COFFEE_CONTENT, recipe_id="rcp_edit", name="Original Name"
+    )
+    rev1 = created["revision"]["revision_id"]
+    meta_before = created["recipe"]["provenance"]
+    name_before = created["recipe"]["name"]
+
+    def fail_update(stage):
+        if stage == "before_recipe_update":
+            raise storage.StorageError("injected recipe update failure")
+
+    monkeypatch.setattr(storage, "_recipe_write_fault_hook", fail_update)
+    with pytest.raises(storage.StorageError, match="injected recipe update"):
+        store.create_recipe_revision(
+            "rcp_edit",
+            _coffee_edit(name="Should Not Stick"),
+            expected_parent_revision_id=rev1,
+            provenance={"model": "new-model"},
+        )
+    monkeypatch.setattr(storage, "_recipe_write_fault_hook", None)
+
+    recipe = store.get_recipe("rcp_edit")
+    assert recipe["name"] == name_before
+    assert recipe["provenance"] == meta_before
+    latest = store.get_latest_recipe_revision("rcp_edit")
+    assert latest["revision_id"] == rev1
+    assert latest["revision_number"] == 1
+    assert len(store.list_recipe_revisions("rcp_edit")) == 1
+    store.close()
+
+
+def test_concurrent_expected_parent_conflict(tmp_path):
+    store = storage.StateStore(tmp_path)
+    created = store.create_recipe_with_revision(_COFFEE_CONTENT)
+    rid = created["recipe"]["recipe_id"]
+    parent = created["revision"]["revision_id"]
+    # Second recipe proceeds under SQLite serialization while first is contested.
+    other = store.create_recipe_with_revision(
+        _tea_content_named("Other Tea"), recipe_id="rcp_other"
+    )
+    store.close()
+
+    barrier = threading.Barrier(2)
+    results: list[object] = []
+    lock = threading.Lock()
+
+    def worker():
+        local = storage.StateStore(tmp_path)
+        try:
+            barrier.wait(timeout=10)
+            out = local.create_recipe_revision(
+                rid,
+                _coffee_edit(name=f"from-{threading.current_thread().name}"),
+                expected_parent_revision_id=parent,
+            )
+            with lock:
+                results.append(out)
+        except Exception as exc:  # noqa: BLE001 - collect either outcome
+            with lock:
+                results.append(exc)
+        finally:
+            local.close()
+
+    t1 = threading.Thread(target=worker, name="w1")
+    t2 = threading.Thread(target=worker, name="w2")
+    t1.start()
+    t2.start()
+    t1.join(timeout=30)
+    t2.join(timeout=30)
+
+    successes = [r for r in results if isinstance(r, dict)]
+    conflicts = [r for r in results if isinstance(r, storage.StorageConflictError)]
+    assert len(successes) == 1, results
+    assert len(conflicts) == 1, results
+    assert successes[0]["revision"]["revision_number"] == 2
+
+    verify = storage.StateStore(tmp_path)
+    revs = verify.list_recipe_revisions(rid)
+    assert len(revs) == 2
+    numbers = [r["revision_number"] for r in revs]
+    assert numbers == [1, 2]
+    # Different recipe still healthy.
+    assert verify.get_latest_recipe_revision("rcp_other")["revision_id"] == (
+        other["revision"]["revision_id"]
+    )
+    # Editing the other recipe still works after the conflict race.
+    tea2 = verify.create_recipe_revision(
+        "rcp_other",
+        _tea_content_named("Other Tea 2"),
+        expected_parent_revision_id=other["revision"]["revision_id"],
+    )
+    assert tea2["revision"]["revision_number"] == 2
+    verify.close()
+
+
+def _tea_content_named(name: str) -> dict:
+    data = json.loads(json.dumps(_TEA_CONTENT))
+    data["name"] = name
+    return data
