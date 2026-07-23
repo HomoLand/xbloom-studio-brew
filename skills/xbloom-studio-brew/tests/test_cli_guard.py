@@ -342,7 +342,9 @@ def test_doctor_reports_catalog_configuration_without_reading_secrets(
     monkeypatch.setattr(bridge_module, "bridge_is_running", lambda: False)
     assert xbloom.cmd_doctor(SimpleNamespace(scan=False, scan_timeout=0.1)) == 0
     report = json.loads(capsys.readouterr().out)
-    assert report["capabilities"]["catalog_path"] == str(catalog)
+    # Doctor honestly reports state.db as the catalog runtime path.
+    assert report["capabilities"]["catalog_path"] == str(tmp_path / "state.db")
+    assert report["capabilities"]["catalog_source"] == "state.db"
     assert report["capabilities"]["catalog_cloud_configured"] is True
     assert report["capabilities"]["catalog_login_configured"] is True
     assert report["capabilities"]["catalog_login_email_configured"] is True

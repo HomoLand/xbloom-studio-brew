@@ -281,6 +281,30 @@ def history_db_path() -> Path:
     return resolve_history_state_root(history_path()) / DB_FILE_NAME
 
 
+def catalog_selector_path() -> Path:
+    """Deprecated state-root selector path (legacy catalog.json location).
+
+    Catalog runtime writes go to state.db via xbloom_catalog / StateStore.
+    ``XBLOOM_CATALOG_PATH`` only selects the associated state root.
+    """
+
+    from xbloom_catalog import default_catalog_path, resolve_catalog_state_root
+
+    configured = environment_value(CATALOG_PATH_ENV)
+    if configured:
+        return default_catalog_path(resolve_catalog_state_root(configured))
+    return default_catalog_path(STATE_DIR)
+
+
+def catalog_db_path() -> Path:
+    """Authoritative private recipe catalog store (SQLite state.db)."""
+
+    from xbloom_catalog import resolve_catalog_state_root
+    from xbloom_storage import DB_FILE_NAME
+
+    return resolve_catalog_state_root(catalog_selector_path()) / DB_FILE_NAME
+
+
 def account_password_for_catalog(action: str) -> str:
     password = environment_value(ACCOUNT_PASSWORD_ENV)
     if password:
@@ -401,7 +425,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     selected_runtime = local_python()
     external_runtime = runtime_python_path(skill_runtime_dir())
     legacy_runtime = legacy_runtime_python(ROOT)
-    catalog_path = Path(environment_value(CATALOG_PATH_ENV, str(CATALOG_FILE))).expanduser()
+    catalog_path = catalog_db_path()
     cloud_config_value = environment_value(CLOUD_CONFIG_ENV)
     cloud_config_exists = bool(
         cloud_config_value and Path(cloud_config_value).expanduser().is_file()
@@ -476,6 +500,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "catalog_cloud_push": "preview_default_idempotent_add_only",
             "catalog_cloud_delete": "preview_default_created_tableid_only",
             "catalog_path": str(catalog_path),
+            "catalog_source": "state.db",
             "brew_history": True,
             "brew_history_path": str(history_db_path()),
             "brew_history_source": "state.db",
@@ -663,6 +688,9 @@ def cmd_catalog(args: argparse.Namespace) -> int:
         CLOUD_DELETE_CONFIRM_SENTINEL,
         CLOUD_WRITE_CONFIRM_SENTINEL,
         DEFAULT_ACCOUNT_TARGETS,
+        CatalogError,
+        archive_catalog_entry,
+        catalog_db_path as catalog_state_db_path,
         catalog_summary,
         cloud_recipe_delete_preview,
         cloud_recipe_preview,
@@ -684,24 +712,28 @@ def cmd_catalog(args: argparse.Namespace) -> int:
     from xbloom_history import import_app_records
 
     configured_path = getattr(args, "catalog_file", None)
-    catalog_path = (
+    selector_path = (
         Path(configured_path).expanduser()
         if configured_path
         else default_catalog_path(STATE_DIR)
-    ).resolve()
-    catalog = load_catalog(catalog_path)
+    )
+    db_path = catalog_state_db_path(selector_path)
+    catalog = load_catalog(selector_path)
     action = args.catalog_action
     if action == "status":
         summary = catalog_summary(catalog)
-        if not catalog_path.exists():
-            summary["updated_at"] = None
         emit(
             {
                 "command": "catalog",
                 "action": action,
-                "path": str(catalog_path),
-                "exists": catalog_path.exists(),
-                **summary,
+                "path": str(db_path),
+                "source": "state.db",
+                "exists": bool(summary.get("exists", db_path.exists())),
+                **{
+                    k: v
+                    for k, v in summary.items()
+                    if k not in {"path", "source", "exists"}
+                },
             }
         )
         return 0
@@ -713,13 +745,14 @@ def cmd_catalog(args: argparse.Namespace) -> int:
             region=args.region,
             kind_hint=args.kind,
         )
-        save_catalog(catalog, catalog_path)
+        save_catalog(catalog, selector_path)
         emit(
             {
                 "command": "catalog",
                 "action": action,
                 "status": "imported",
-                "path": str(catalog_path),
+                "path": str(db_path),
+                "source": "state.db",
                 **stats,
             }
         )
@@ -737,6 +770,8 @@ def cmd_catalog(args: argparse.Namespace) -> int:
             {
                 "command": "catalog",
                 "action": action,
+                "path": str(db_path),
+                "source": "state.db",
                 "count": len(entries),
                 "entries": entries,
             }
@@ -747,6 +782,8 @@ def cmd_catalog(args: argparse.Namespace) -> int:
             {
                 "command": "catalog",
                 "action": action,
+                "path": str(db_path),
+                "source": "state.db",
                 "entry": get_entry(catalog, args.identifier),
             }
         )
@@ -780,13 +817,14 @@ def cmd_catalog(args: argparse.Namespace) -> int:
             include=args.include or DEFAULT_ACCOUNT_TARGETS,
             timeout=args.timeout,
         )
-        save_catalog(catalog, catalog_path)
+        save_catalog(catalog, selector_path)
         emit(
             {
                 "command": "catalog",
                 "action": action,
                 "status": "synced",
-                "path": str(catalog_path),
+                "path": str(db_path),
+                "source": "state.db",
                 **result,
             }
         )
@@ -807,13 +845,14 @@ def cmd_catalog(args: argparse.Namespace) -> int:
             language_type={"en": 0, "zh-cn": 3}[args.language],
             timeout=args.timeout,
         )
-        save_catalog(catalog, catalog_path)
+        save_catalog(catalog, selector_path)
         emit(
             {
                 "command": "catalog",
                 "action": action,
                 "status": "synced",
-                "path": str(catalog_path),
+                "path": str(db_path),
+                "source": "state.db",
                 **result,
             }
         )
@@ -900,17 +939,18 @@ def cmd_catalog(args: argparse.Namespace) -> int:
         )
         if result.get("write_performed"):
             remote_id = result.get("remote_table_id")
-            before = len(catalog.get("entries") or [])
-            catalog["entries"] = [
-                entry
-                for entry in catalog.get("entries") or []
-                if entry.get("table_id") != remote_id
-            ]
-            if len(catalog.get("entries") or []) != before:
-                save_catalog(catalog, catalog_path)
-                result["local_catalog_removed"] = True
-            else:
-                result["local_catalog_removed"] = False
+            try:
+                archived = archive_catalog_entry(
+                    table_id=remote_id, path=selector_path
+                )
+                # Soft-archive retains revisions; do not claim local removal.
+                result["local_catalog_archived"] = True
+                result["local_recipe_id"] = archived.get("recipe_id")
+                result["local_entry_id"] = archived.get("entry_id")
+                result["local_archived_at"] = archived.get("archived_at")
+            except CatalogError:
+                # No local mapping is not a cloud-delete failure.
+                result["local_catalog_archived"] = False
         emit({"command": "catalog", "action": action, **result})
         return 0
     if action == "history-sync":
@@ -1984,11 +2024,11 @@ def cmd_state(args: argparse.Namespace) -> int:
                 "workflow": "sqlite",
                 "history": "sqlite",
                 "idempotency": "sqlite",
-                "catalog": "json_legacy",
+                "catalog": "sqlite",
             },
             "message": (
-                "online SQLite backup only; workflow/history/idempotency use state.db; "
-                "catalog remains JSON-backed"
+                "online SQLite backup only; workflow/history/idempotency/catalog "
+                "use state.db"
             ),
         }
         store.close()
@@ -2708,7 +2748,7 @@ def build_parser() -> argparse.ArgumentParser:
         "state",
         help=(
             "explicit state.db migration/status/backup; does not auto-migrate on "
-            "daemon start; SQLite active for workflow/history/idempotency, catalog pending"
+            "daemon start; SQLite active for workflow/history/idempotency/catalog"
         ),
     )
     state_sub = state.add_subparsers(dest="state_action", required=True)
@@ -2716,7 +2756,7 @@ def build_parser() -> argparse.ArgumentParser:
         "status",
         help=(
             "migration receipt + runtime source-of-truth "
-            "(SQLite workflow/history/idempotency; catalog still JSON)"
+            "(SQLite workflow/history/idempotency/catalog)"
         ),
     )
     state_migrate = state_sub.add_parser(

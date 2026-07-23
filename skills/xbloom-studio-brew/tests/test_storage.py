@@ -156,6 +156,7 @@ def test_legacy_migration_backup_hashes_and_idempotent(tmp_path):
     assert first["status"] == "completed"
     assert first["imported"] is True
     assert first["history_cutover_completed"] is True
+    assert first["catalog_cutover_completed"] is True
     backup_dir = Path(first["backup"]["backup_dir"])
     assert backup_dir.is_dir()
     manifest = json.loads((backup_dir / "MANIFEST.json").read_text(encoding="utf-8"))
@@ -171,6 +172,7 @@ def test_legacy_migration_backup_hashes_and_idempotent(tmp_path):
     store = storage.StateStore(tmp_path)
     assert store.migration_completed(storage.LEGACY_MIGRATION_NAME)
     assert store.migration_completed(storage.LEGACY_HISTORY_CUTOVER_NAME)
+    assert store.migration_completed(storage.LEGACY_CATALOG_CUTOVER_NAME)
     assert store.count_legacy_imports("catalog") >= 1
     assert store.count_legacy_imports("history") >= 1
     assert store.count_legacy_imports("recovery_armed") == 1
@@ -179,14 +181,26 @@ def test_legacy_migration_backup_hashes_and_idempotent(tmp_path):
     loaded = store.load_history_events()
     assert loaded[0]["event_id"] == "bh_test1"
     assert loaded[0]["outcome"] == "completed"
+    # Catalog cutover: normalized entry is a full recipe envelope in SQLite.
+    snap = store.build_catalog_snapshot(include_derived=False)
+    assert len(snap["entries"]) == 1
+    assert snap["entries"][0]["id"] == "entry-1"
+    assert snap["source"] == "state.db"
+    recipe = store.get_recipe(storage.recipe_id_for_catalog_entry_id("entry-1"))
+    assert recipe is not None
+    rev = store.get_latest_recipe_revision(recipe["recipe_id"])
+    assert rev is not None
+    assert rev["content"]["name"] == "Hot Demo"
 
     second = storage.migrate_legacy_state(tmp_path)
     assert second["status"] == "already_completed"
     assert second["imported"] is False
     assert second["history_cutover_completed"] is True
+    assert second["catalog_cutover_completed"] is True
     # No duplicate catalog entries on rerun.
     assert store.count_legacy_imports("history") == 1
     assert store.count_history_events() == 1
+    assert len(store.build_catalog_snapshot(include_derived=False)["entries"]) == 1
     store.close()
 
 
@@ -464,17 +478,19 @@ def test_foreign_key_and_parent_recipe_constraints(tmp_path):
     store.close()
 
 
-def test_migration_status_declares_partial_sqlite_runtime_truth(tmp_path):
+def test_migration_status_declares_full_sqlite_runtime_truth(tmp_path):
     status = storage.migration_status(tmp_path)
     assert status["runtime_source_of_truth"]["history"] == "sqlite"
     assert status["runtime_source_of_truth"]["workflow"] == "sqlite"
     assert status["runtime_source_of_truth"]["idempotency"] == "sqlite"
-    assert status["runtime_source_of_truth"]["catalog"] == "json_legacy"
+    assert status["runtime_source_of_truth"]["catalog"] == "sqlite"
     assert status["sqlite_active_runtime"] is True
-    assert status["catalog_runtime"] == "json_legacy"
+    assert status["catalog_runtime"] == "sqlite"
     assert status["migration_completed"] is False
     assert status["history_cutover_completed"] is False
+    assert status["catalog_cutover_completed"] is False
     assert status["history_cutover_name"] == storage.LEGACY_HISTORY_CUTOVER_NAME
+    assert status["catalog_cutover_name"] == storage.LEGACY_CATALOG_CUTOVER_NAME
 
     _write(
         tmp_path / "brew-history.jsonl",
@@ -485,15 +501,19 @@ def test_migration_status_declares_partial_sqlite_runtime_truth(tmp_path):
     )
     result = storage.migrate_legacy_state(tmp_path)
     assert result["runtime_source_of_truth"]["history"] == "sqlite"
-    assert result["runtime_source_of_truth"]["catalog"] == "json_legacy"
+    assert result["runtime_source_of_truth"]["catalog"] == "sqlite"
     assert result["imported"] is True
     assert result["history_cutover_completed"] is True
+    assert result["catalog_cutover_completed"] is True
     status2 = storage.migration_status(tmp_path)
     assert status2["migration_completed"] is True
     assert status2["history_cutover_completed"] is True
+    assert status2["catalog_cutover_completed"] is True
     assert status2["history_cutover_receipt"] is not None
+    assert status2["catalog_cutover_receipt"] is not None
     assert status2["runtime_source_of_truth"]["history"] == "sqlite"
-    assert status2["catalog_runtime"] == "json_legacy"
+    assert status2["catalog_runtime"] == "sqlite"
+    assert "catalog" in status2["sqlite_active_for"]
     assert "workflow" in status2["sqlite_active_for"]
     store = storage.StateStore(tmp_path)
     assert store.count_history_events() == 1
@@ -2021,3 +2041,686 @@ def _tea_content_named(name: str) -> dict:
     data = json.loads(json.dumps(_TEA_CONTENT))
     data["name"] = name
     return data
+
+
+def _catalog_entry(entry_id="entry-a", name="Alpha Hot", dose=15, grind=50):
+    return {
+        "id": entry_id,
+        "name": name,
+        "kind": "coffee",
+        "origin": "created",
+        "executable": True,
+        "slot_compatible": False,
+        "sources": [{"type": "fixture", "file": "t.json"}],
+        "recipe": {
+            "name": name,
+            "kind": "hot",
+            "dose_g": dose,
+            "grind": grind,
+            "pours": [
+                {
+                    "ml": 45,
+                    "temp_c": 92,
+                    "pattern": "spiral",
+                    "pause_s": 30,
+                    "flow_ml_s": 3.0,
+                    "vibration": "after",
+                    "rpm": 90,
+                },
+                {
+                    "ml": 180,
+                    "temp_c": 92,
+                    "pattern": "spiral",
+                    "pause_s": 0,
+                    "flow_ml_s": 3.2,
+                    "vibration": "none",
+                    "rpm": 90,
+                },
+            ],
+        },
+        "first_seen_at": "2026-01-01T00:00:00+00:00",
+        "last_seen_at": "2026-01-01T00:00:00+00:00",
+    }
+
+
+def test_old_receipt_backfills_catalog_on_normal_migrate(tmp_path):
+    """legacy_json_v1 only: catalog rows in legacy_imports, partial recipes.
+
+    A normal migrate without --force must repair full catalog envelopes from
+    legacy_imports and must not reread catalog.json.
+    """
+
+    store = storage.StateStore(tmp_path)
+    store.ensure_schema()
+    imported_at = "2026-01-01T00:00:00+00:00"
+    entry = _catalog_entry("xbloom:9001", name="Backfill Coffee")
+    body = storage.canonical_json(entry)
+    digest = storage.sha256_text(body)
+    record_key = f"entry:xbloom:9001:{digest}"
+    with store.transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO legacy_imports (
+                source_kind, source_path, source_sha256, record_key,
+                payload_json, imported_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "catalog",
+                str(tmp_path / "catalog" / "catalog.json"),
+                "fake_catalog_sha",
+                record_key,
+                body,
+                imported_at,
+            ),
+        )
+        # Partial v3-era recipe row (flags only, no full envelope).
+        conn.execute(
+            """
+            INSERT INTO recipes (
+                recipe_id, kind, name, created_at, updated_at,
+                source, provenance_json, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy_xbloom:9001",
+                "coffee",
+                "Backfill Coffee",
+                imported_at,
+                imported_at,
+                "legacy_catalog",
+                storage.canonical_json({"legacy_entry_id": "xbloom:9001"}),
+                storage.canonical_json({"executable": True, "slot_compatible": False}),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO migration_receipts (
+                name, completed_at, backup_dir, manifest_json, stats_json
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                storage.LEGACY_MIGRATION_NAME,
+                imported_at,
+                None,
+                storage.canonical_json({"kind": "pre_catalog_cutover_fixture"}),
+                storage.canonical_json({"catalog": {"entries": 1}}),
+            ),
+        )
+        # History cutover already done so only catalog is pending.
+        conn.execute(
+            """
+            INSERT INTO migration_receipts (
+                name, completed_at, backup_dir, manifest_json, stats_json
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                storage.LEGACY_HISTORY_CUTOVER_NAME,
+                imported_at,
+                None,
+                storage.canonical_json({"kind": "history_cutover"}),
+                storage.canonical_json({}),
+            ),
+        )
+    assert store.migration_completed(storage.LEGACY_MIGRATION_NAME)
+    assert store.migration_completed(storage.LEGACY_HISTORY_CUTOVER_NAME)
+    assert not store.migration_completed(storage.LEGACY_CATALOG_CUTOVER_NAME)
+    store.close()
+
+    # Live catalog.json that must NOT be reread for the cutover path.
+    _write(
+        tmp_path / "catalog" / "catalog.json",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "entries": [
+                    _catalog_entry("must-not-import", name="Must Not Import")
+                ],
+            }
+        ),
+    )
+    original_bytes = (tmp_path / "catalog" / "catalog.json").read_bytes()
+
+    first = storage.migrate_legacy_state(tmp_path)
+    assert first["status"] == "completed"
+    assert first["imported"] is False
+    assert first.get("catalog_backfilled") is True
+    assert first["catalog_cutover_completed"] is True
+    assert first["stats"]["catalog_cutover"]["source_rows"] == 1
+
+    # Original JSON untouched.
+    assert (tmp_path / "catalog" / "catalog.json").read_bytes() == original_bytes
+
+    store = storage.StateStore(tmp_path)
+    assert store.migration_completed(storage.LEGACY_CATALOG_CUTOVER_NAME)
+    snap = store.build_catalog_snapshot(include_derived=False)
+    assert len(snap["entries"]) == 1
+    assert snap["entries"][0]["id"] == "xbloom:9001"
+    assert snap["entries"][0]["name"] == "Backfill Coffee"
+    assert "catalog_envelope" in (store.get_recipe("legacy_xbloom:9001") or {}).get(
+        "metadata", {}
+    )
+    assert not any(e["id"] == "must-not-import" for e in snap["entries"])
+    revs = store.list_recipe_revisions("legacy_xbloom:9001")
+    assert len(revs) == 1
+
+    second = storage.migrate_legacy_state(tmp_path)
+    assert second["status"] == "already_completed"
+    assert len(store.build_catalog_snapshot(include_derived=False)["entries"]) == 1
+    assert len(store.list_recipe_revisions("legacy_xbloom:9001")) == 1
+    store.close()
+
+
+def test_catalog_merge_metadata_only_and_content_revision(tmp_path):
+    store = storage.StateStore(tmp_path)
+    store.ensure_schema()
+    entry = _catalog_entry()
+    first = store.merge_catalog_entries([entry], source="test")
+    assert first["created"] == 1
+    rid = storage.recipe_id_for_catalog_entry_id("entry-a")
+    rev1 = store.get_latest_recipe_revision(rid)
+    assert rev1 is not None
+    assert rev1["revision_number"] == 1
+
+    # Metadata-only change: same recipe body, new source tag.
+    meta_entry = dict(entry)
+    meta_entry["sources"] = [
+        {"type": "fixture", "file": "t.json"},
+        {"type": "cloud", "endpoint": "created"},
+    ]
+    meta_entry["executable"] = False
+    second = store.merge_catalog_entries([meta_entry], source="test")
+    assert second["metadata_only"] == 1
+    assert second["updated"] == 0
+    rev2 = store.get_latest_recipe_revision(rid)
+    assert rev2["revision_id"] == rev1["revision_id"]
+    recipe = store.get_recipe(rid)
+    assert recipe["metadata"]["executable"] is False
+    assert len(recipe["metadata"]["catalog_envelope"]["sources"]) == 2
+
+    # Content change creates one new child revision.
+    changed = dict(entry)
+    changed["recipe"] = dict(entry["recipe"])
+    changed["recipe"]["dose_g"] = 16
+    changed["name"] = "Alpha Hot 16"
+    third = store.merge_catalog_entries([changed], source="test")
+    assert third["updated"] == 1
+    rev3 = store.get_latest_recipe_revision(rid)
+    assert rev3["revision_number"] == 2
+    assert rev3["parent_revision_id"] == rev1["revision_id"]
+    assert rev3["content"]["dose_g"] == 16
+
+    # Unchanged replay is truly idempotent: no UPDATE at all.
+    before = store.get_recipe(rid)
+    before_revs = store.list_recipe_revisions(rid)
+    fourth = store.merge_catalog_entries([changed], source="test")
+    assert fourth["unchanged"] == 1
+    assert fourth["metadata_only"] == 0
+    assert fourth["updated"] == 0
+    after = store.get_recipe(rid)
+    assert after["updated_at"] == before["updated_at"]
+    assert after["source"] == before["source"]
+    assert after["metadata"] == before["metadata"]
+    assert after["provenance"] == before["provenance"]
+    assert after["archived_at"] is None
+    assert len(store.list_recipe_revisions(rid)) == len(before_revs) == 2
+    store.close()
+
+
+def test_catalog_merge_true_idempotency_byte_stable(tmp_path):
+    """Exact same entry + source must leave the recipe row byte-stable."""
+
+    store = storage.StateStore(tmp_path)
+    store.ensure_schema()
+    entry = _catalog_entry("stable-1", name="Stable Hot")
+    store.merge_catalog_entries([entry], source="test")
+    rid = storage.recipe_id_for_catalog_entry_id("stable-1")
+    before = store.get_recipe(rid)
+    conn = store._connect()
+    raw_before = conn.execute(
+        "SELECT updated_at, source, metadata_json, provenance_json, archived_at "
+        "FROM recipes WHERE recipe_id = ?",
+        (rid,),
+    ).fetchone()
+    rev_count_before = conn.execute(
+        "SELECT COUNT(*) AS n FROM recipe_revisions WHERE recipe_id = ?",
+        (rid,),
+    ).fetchone()["n"]
+
+    stats = store.merge_catalog_entries([entry], source="test")
+    assert stats == {
+        "candidates": 1,
+        "created": 0,
+        "updated": 0,
+        "metadata_only": 0,
+        "unchanged": 1,
+        "skipped": 0,
+    }
+    raw_after = conn.execute(
+        "SELECT updated_at, source, metadata_json, provenance_json, archived_at "
+        "FROM recipes WHERE recipe_id = ?",
+        (rid,),
+    ).fetchone()
+    rev_count_after = conn.execute(
+        "SELECT COUNT(*) AS n FROM recipe_revisions WHERE recipe_id = ?",
+        (rid,),
+    ).fetchone()["n"]
+    assert tuple(raw_after) == tuple(raw_before)
+    assert rev_count_after == rev_count_before == 1
+    after = store.get_recipe(rid)
+    assert after["updated_at"] == before["updated_at"]
+    assert after["metadata"] == before["metadata"]
+    assert after["provenance"] == before["provenance"]
+    store.close()
+
+
+def test_catalog_revision_id_collision_keeps_both_recipes_complete(tmp_path):
+    store = storage.StateStore(tmp_path)
+    store.ensure_schema()
+    entry = _catalog_entry("revision-collision", name="Catalog Recipe")
+    body = entry["recipe"]
+    deterministic_id = (
+        "legacy_rev_revision-collision_"
+        + storage.sha256_text(storage.canonical_json(body))[:16]
+    )
+    store.upsert_recipe(recipe_id="unrelated", kind="coffee", name="Unrelated")
+    unrelated = store.add_recipe_revision(
+        "unrelated",
+        body,
+        revision_id=deterministic_id,
+    )
+
+    stats = store.merge_catalog_entries([entry], source="test")
+    assert stats["created"] == 1
+    catalog_id = storage.recipe_id_for_catalog_entry_id("revision-collision")
+    catalog_revisions = store.list_recipe_revisions(catalog_id)
+    assert len(catalog_revisions) == 1
+    assert catalog_revisions[0]["revision_id"] != deterministic_id
+    assert catalog_revisions[0]["content"] == body
+    assert store.get_recipe_revision(deterministic_id)["recipe_id"] == "unrelated"
+    assert store.get_recipe_revision(deterministic_id)["revision_id"] == unrelated[
+        "revision_id"
+    ]
+    store.close()
+
+
+def test_catalog_restore_archived_is_metadata_only_when_content_unchanged(tmp_path):
+    store = storage.StateStore(tmp_path)
+    store.ensure_schema()
+    entry = _catalog_entry("restore-me")
+    store.merge_catalog_entries([entry], source="test")
+    rid = storage.recipe_id_for_catalog_entry_id("restore-me")
+    store.archive_catalog_entry(entry_id="restore-me")
+    archived = store.get_recipe(rid)
+    assert archived["archived_at"] is not None
+    revs_before = store.list_recipe_revisions(rid)
+
+    stats = store.merge_catalog_entries([entry], source="test")
+    assert stats["metadata_only"] == 1
+    assert stats["updated"] == 0
+    assert stats["unchanged"] == 0
+    restored = store.get_recipe(rid)
+    assert restored["archived_at"] is None
+    assert len(store.list_recipe_revisions(rid)) == len(revs_before) == 1
+    store.close()
+
+
+def test_catalog_ownership_collision_refuses_unrelated_web_recipe(tmp_path):
+    """deterministic legacy_<entry_id> must never take over an unrelated Web recipe."""
+
+    store = storage.StateStore(tmp_path)
+    store.ensure_schema()
+    collision_id = "collision"
+    recipe_id = storage.recipe_id_for_catalog_entry_id(collision_id)
+    assert recipe_id == "legacy_collision"
+    created = store.create_recipe_with_revision(
+        _coffee_edit(name="Web Collision Target"),
+        recipe_id=recipe_id,
+        source="web",
+        creation_source="web-ui",
+        name="Web Collision Target",
+        provenance={"sources": [{"type": "web-state", "recipe_id": recipe_id}]},
+        metadata={"user_note": "keep me"},
+    )
+    assert created["recipe"]["recipe_id"] == recipe_id
+    web_before = store.get_recipe(recipe_id)
+    revs_before = store.list_recipe_revisions(recipe_id)
+
+    with pytest.raises(storage.StorageConflictError, match="without catalog ownership"):
+        store.merge_catalog_entries(
+            [_catalog_entry(collision_id, name="Hostile Catalog")],
+            source="test",
+        )
+
+    web_after = store.get_recipe(recipe_id)
+    assert web_after["name"] == "Web Collision Target"
+    assert web_after["updated_at"] == web_before["updated_at"]
+    assert web_after["metadata"] == web_before["metadata"]
+    assert web_after["provenance"] == web_before["provenance"]
+    assert web_after["source"] == "web"
+    assert len(store.list_recipe_revisions(recipe_id)) == len(revs_before)
+    # Not catalog-owned despite legacy_ prefix + provenance.sources.
+    owned = store.build_catalog_snapshot(include_derived=False)
+    assert owned["entries"] == []
+    derived = store.build_catalog_snapshot(include_derived=True)
+    hit = next(e for e in derived["entries"] if e["recipe_id"] == recipe_id)
+    assert hit["catalog_owned"] is False
+    assert hit["derived"] is True
+    store.close()
+
+
+def test_catalog_ownership_mismatched_marker_is_conflict(tmp_path):
+    store = storage.StateStore(tmp_path)
+    store.ensure_schema()
+    rid = storage.recipe_id_for_catalog_entry_id("target")
+    store.create_recipe_with_revision(
+        _coffee_edit(name="Wrong Owner"),
+        recipe_id=rid,
+        source="legacy_catalog",
+        name="Wrong Owner",
+        provenance={"legacy_entry_id": "other-entry"},
+        metadata={"catalog_entry_id": "other-entry"},
+    )
+    with pytest.raises(storage.StorageConflictError, match="conflicts with existing ownership"):
+        store.merge_catalog_entries([_catalog_entry("target")], source="test")
+    store.close()
+
+
+def test_legacy_prefix_alone_is_not_catalog_owned(tmp_path):
+    store = storage.StateStore(tmp_path)
+    store.ensure_schema()
+    created = store.create_recipe_with_revision(
+        _coffee_edit(name="Prefix Only"),
+        recipe_id="legacy_prefix_only",
+        source="web",
+        name="Prefix Only",
+        provenance={"sources": [{"type": "annotation", "note": "not ownership"}]},
+    )
+    rid = created["recipe"]["recipe_id"]
+    owned = store.build_catalog_snapshot(include_derived=False)
+    assert all(e.get("recipe_id") != rid for e in owned["entries"])
+    derived = store.build_catalog_snapshot(include_derived=True)
+    hit = next(e for e in derived["entries"] if e["recipe_id"] == rid)
+    assert hit["catalog_owned"] is False
+    assert hit["derived"] is True
+    store.close()
+
+
+def test_catalog_envelope_strips_runtime_view_fields_and_preserves_annotations(tmp_path):
+    store = storage.StateStore(tmp_path)
+    store.ensure_schema()
+    entry = _catalog_entry("env-1", name="Envelope Clean")
+    # Pollute incoming with snapshot runtime fields.
+    polluted = {
+        **entry,
+        "recipe_id": "should-not-persist",
+        "catalog_owned": True,
+        "derived": False,
+        "archived_at": "2099-01-01T00:00:00+00:00",
+    }
+    store.merge_catalog_entries([polluted], source="test")
+    rid = storage.recipe_id_for_catalog_entry_id("env-1")
+    # Inject unrelated Web/user annotations that must survive re-merge.
+    conn = store._connect()
+    recipe = store.get_recipe(rid)
+    meta = dict(recipe["metadata"])
+    meta["user_annotation"] = {"label": "keep"}
+    prov = dict(recipe["provenance"])
+    prov["browser_tag"] = "chrome"
+    conn.execute(
+        "UPDATE recipes SET metadata_json = ?, provenance_json = ? WHERE recipe_id = ?",
+        (
+            storage.canonical_json(meta),
+            storage.canonical_json(prov),
+            rid,
+        ),
+    )
+
+    snap = store.build_catalog_snapshot(include_derived=False)
+    loaded = next(e for e in snap["entries"] if e["id"] == "env-1")
+    assert loaded["recipe_id"] == rid
+    assert loaded["catalog_owned"] is True
+    # Round-trip save of snapshot entry must not pollute envelope or churn.
+    before = store.get_recipe(rid)
+    stats = store.merge_catalog_entries([loaded], source="test")
+    assert stats["unchanged"] == 1
+    after = store.get_recipe(rid)
+    envelope = after["metadata"]["catalog_envelope"]
+    for key in ("recipe_id", "catalog_owned", "derived", "archived_at", "id"):
+        assert key not in envelope
+    assert after["metadata"]["user_annotation"] == {"label": "keep"}
+    assert after["provenance"]["browser_tag"] == "chrome"
+    assert after["updated_at"] == before["updated_at"]
+    assert after["metadata"]["catalog_envelope"] == before["metadata"]["catalog_envelope"]
+    store.close()
+
+
+def test_catalog_archive_retains_revisions(tmp_path):
+    store = storage.StateStore(tmp_path)
+    store.ensure_schema()
+    store.merge_catalog_entries([_catalog_entry("del-me")], source="test")
+    archived = store.archive_catalog_entry(entry_id="del-me")
+    assert archived["archived"] is True
+    active = store.build_catalog_snapshot(include_derived=False)
+    assert active["entries"] == []
+    all_entries = store.build_catalog_snapshot(
+        include_derived=False, include_archived=True
+    )
+    assert len(all_entries["entries"]) == 1
+    revs = store.list_recipe_revisions(storage.recipe_id_for_catalog_entry_id("del-me"))
+    assert len(revs) == 1
+    store.close()
+
+
+def test_catalog_archive_exact_id_only_no_name_fallback(tmp_path):
+    store = storage.StateStore(tmp_path)
+    store.ensure_schema()
+    store.merge_catalog_entries(
+        [_catalog_entry("exact-id", name="Unique Archive Name")],
+        source="test",
+    )
+    # Name substring must not archive via this API.
+    with pytest.raises(storage.StorageError, match="exact catalog-owned id"):
+        store.archive_catalog_entry(entry_id="Unique Archive")
+    with pytest.raises(storage.StorageError, match="exact catalog-owned id"):
+        store.archive_catalog_entry(entry_id="exact")
+    # Unrelated derived Web recipe must never archive through this API.
+    web = store.create_recipe_with_revision(
+        _coffee_edit(name="Web Only"),
+        source="web",
+        name="Web Only",
+    )
+    web_id = web["recipe"]["recipe_id"]
+    with pytest.raises(storage.StorageError, match="not found for archive"):
+        store.archive_catalog_entry(entry_id=web_id)
+    assert store.get_recipe(web_id)["archived_at"] is None
+    # Exact id still works.
+    ok = store.archive_catalog_entry(entry_id="exact-id")
+    assert ok["entry_id"] == "exact-id"
+    store.close()
+
+
+def test_catalog_archive_table_id_exact_and_ambiguous(tmp_path):
+    store = storage.StateStore(tmp_path)
+    store.ensure_schema()
+    a = _catalog_entry("tid-a", name="A")
+    a["table_id"] = 42
+    b = _catalog_entry("tid-b", name="B")
+    b["table_id"] = 42
+    store.merge_catalog_entries([a, b], source="test")
+    with pytest.raises(storage.StorageError, match="ambiguous"):
+        store.archive_catalog_entry(table_id=42)
+    # Single exact mapping succeeds.
+    store2 = storage.StateStore(tmp_path / "solo")
+    store2.ensure_schema()
+    solo = _catalog_entry("solo", name="Solo")
+    solo["table_id"] = 99
+    store2.merge_catalog_entries([solo], source="test")
+    archived = store2.archive_catalog_entry(table_id=99)
+    assert archived["entry_id"] == "solo"
+    assert archived["table_id"] == 99
+    with pytest.raises(storage.StorageError, match="not found for archive"):
+        store2.archive_catalog_entry(table_id=1000)
+    store.close()
+    store2.close()
+
+
+def test_concurrent_catalog_merge_disjoint_entries(tmp_path):
+    store = storage.StateStore(tmp_path)
+    store.ensure_schema()
+    store.close()
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(2)
+
+    def worker(prefix: str) -> None:
+        local = storage.StateStore(tmp_path)
+        try:
+            barrier.wait(timeout=5)
+            entries = [
+                _catalog_entry(f"{prefix}-{i}", name=f"{prefix} {i}", dose=15 + i)
+                for i in range(8)
+            ]
+            local.merge_catalog_entries(entries, source="concurrent")
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            local.close()
+
+    t1 = threading.Thread(target=worker, args=("left",))
+    t2 = threading.Thread(target=worker, args=("right",))
+    t1.start()
+    t2.start()
+    t1.join(timeout=30)
+    t2.join(timeout=30)
+    assert errors == []
+    store = storage.StateStore(tmp_path)
+    snap = store.build_catalog_snapshot(include_derived=False)
+    ids = {e["id"] for e in snap["entries"]}
+    assert len(ids) == 16
+    assert all(f"left-{i}" in ids for i in range(8))
+    assert all(f"right-{i}" in ids for i in range(8))
+    store.close()
+
+
+def test_same_entry_content_race_is_deterministic(tmp_path):
+    store = storage.StateStore(tmp_path)
+    store.ensure_schema()
+    store.merge_catalog_entries([_catalog_entry("race-1")], source="seed")
+    store.close()
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(2)
+    entry = _catalog_entry("race-1", dose=17)
+
+    def worker() -> None:
+        local = storage.StateStore(tmp_path)
+        try:
+            barrier.wait(timeout=5)
+            local.merge_catalog_entries([entry], source="race")
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            local.close()
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert errors == []
+    store = storage.StateStore(tmp_path)
+    rid = storage.recipe_id_for_catalog_entry_id("race-1")
+    revs = store.list_recipe_revisions(rid)
+    # Seed rev1 + at most one content change to dose 17.
+    assert len(revs) == 2
+    assert revs[-1]["content"]["dose_g"] == 17
+    store.close()
+
+
+def test_web_recipe_visible_in_skill_catalog_view(tmp_path):
+    store = storage.StateStore(tmp_path)
+    store.ensure_schema()
+    created = store.create_recipe_with_revision(
+        _coffee_edit(name="Web Hot"),
+        source="web",
+        creation_source="web-ui",
+        name="Web Hot",
+    )
+    recipe_id = created["recipe"]["recipe_id"]
+    snap = store.build_catalog_snapshot(include_derived=True)
+    ids = {e["id"] for e in snap["entries"]}
+    assert recipe_id in ids
+    derived = next(e for e in snap["entries"] if e["id"] == recipe_id)
+    assert derived["derived"] is True
+    assert derived["catalog_owned"] is False
+    assert derived["name"] == "Web Hot"
+    store.close()
+
+
+def test_skill_imported_recipe_readable_by_web_apis(tmp_path):
+    store = storage.StateStore(tmp_path)
+    store.ensure_schema()
+    entry = _catalog_entry("skill-1", name="Skill Export")
+    store.merge_catalog_entries([entry], source="skill")
+    rid = storage.recipe_id_for_catalog_entry_id("skill-1")
+    recipe = store.get_recipe(rid)
+    assert recipe is not None
+    assert recipe["name"] == "Skill Export"
+    latest = store.get_latest_recipe_revision(rid)
+    assert latest is not None
+    assert latest["content"]["name"] == "Skill Export"
+    assert latest["content"]["dose_g"] == 15
+    listed = store.list_recipes(query="Skill")
+    assert any(item["recipe_id"] == rid for item in listed)
+    store.close()
+
+
+def test_catalog_merge_fault_rolls_back(tmp_path, monkeypatch):
+    store = storage.StateStore(tmp_path)
+    store.ensure_schema()
+    store.merge_catalog_entries([_catalog_entry("keep")], source="seed")
+
+    def fault(stage: str) -> None:
+        if stage == "before_commit":
+            raise RuntimeError("catalog fault")
+
+    # Inject fault inside merge transaction via nested path: use migration hook
+    # only for migrate path. For merge, raise mid-transaction by monkeypatching
+    # _merge_one_catalog_entry_in_tx after first success.
+    original = store._merge_one_catalog_entry_in_tx
+    calls = {"n": 0}
+
+    def flaky(conn, entry, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise storage.StorageError("injected merge failure")
+        return original(conn, entry, **kwargs)
+
+    monkeypatch.setattr(store, "_merge_one_catalog_entry_in_tx", flaky)
+    with pytest.raises(storage.StorageError, match="injected merge failure"):
+        store.merge_catalog_entries(
+            [_catalog_entry("keep"), _catalog_entry("new-one")],
+            source="fault",
+        )
+    # Transaction rolled back: new-one absent, keep still present.
+    snap = store.build_catalog_snapshot(include_derived=False)
+    ids = {e["id"] for e in snap["entries"]}
+    assert "keep" in ids
+    assert "new-one" not in ids
+    store.close()
+
+
+def test_no_catalog_json_write_after_cutover(tmp_path):
+    import xbloom_catalog as catalog
+
+    selector = tmp_path / "catalog" / "catalog.json"
+    catalog.save_catalog(
+        {**catalog.empty_catalog(), "entries": [_catalog_entry()]},
+        selector,
+    )
+    assert not selector.exists()
+    db = tmp_path / "state.db"
+    assert db.is_file()
+    loaded = catalog.load_catalog(selector)
+    assert len(loaded["entries"]) == 1
+    assert loaded["source"] == "state.db"
+    assert "state.db" in str(loaded["path"])

@@ -106,9 +106,11 @@ python <skill-dir>/scripts/xbloom.py history list --limit 20
 python <skill-dir>/scripts/xbloom.py history note <event_id> "tasting notes"
 ```
 
-Treat “all” as all records in the supplied export or visible to the user's own account and region,
-not a global xBloom database. Keep the normalized catalog private: redistribution rights default
-to unknown. xPod and J20 entries are reference-only; tea exports use the dedicated tea path.
+The shared local catalog runtime is `state.db` (`recipes` / `recipe_revisions`), the same store
+used by Web recipe APIs. Legacy `catalog/catalog.json` is import-only after migration. Treat
+“all” as all records in the supplied export or visible to the user's own account and region, not a
+global xBloom database. Keep the normalized catalog private: redistribution rights default to
+unknown. xPod and J20 entries are reference-only; tea exports use the dedicated tea path.
 
 `login-sync` reads all five account categories by default. Those reads and two explicitly
 owner-approved add-only writes were live-service verified against the China tenant on 2026-07-14,

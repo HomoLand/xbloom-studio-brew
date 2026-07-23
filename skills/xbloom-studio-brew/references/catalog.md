@@ -31,16 +31,18 @@ permission from the recipe owner.
 
 ## Storage and self-check
 
-The default path is:
+The authoritative catalog runtime is SQLite:
 
 ```text
-~/.xbloom-studio-brew/catalog/catalog.json
+~/.xbloom-studio-brew/state.db   # recipes + recipe_revisions (shared with Web)
 ```
 
-Override it with `XBLOOM_CATALOG_PATH` or the command-level `--catalog-file`. The writer uses an
-atomic replacement and attempts owner-only permissions. It stores normalized recipe fields and
-safe provenance only; it does not retain raw responses, account tokens, member IDs, serial
-numbers, or request forms.
+`XBLOOM_CATALOG_PATH` and `--catalog-file` remain deprecated selectors for the associated
+state root (historical default was `catalog/catalog.json` under the state directory). Runtime
+load/save never creates, appends, or rewrites `catalog.json`. Legacy JSON is import-only via
+`state migrate`. Normalized entry envelopes and recipe content live in `recipes` /
+`recipe_revisions` with safe provenance only; raw responses, account tokens, member IDs, serial
+numbers, and request forms are not retained.
 
 Check availability without network or BLE:
 

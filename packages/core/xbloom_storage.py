@@ -1,12 +1,11 @@
 """Transactional SQLite storage for workflows, history, and catalog schema.
 
 Phase 0 baseline: schema, primitives, integrity, online backup, and a one-time
-lossless import of legacy JSON/JSONL state. Phase 0.3/0.4 history cutover makes
-``history_events`` the authoritative append-only brew journal (JSONL is
-import-only). Phase B B8 adds typed recipe/revision APIs with optimistic
-concurrency, domain validation, and safe provenance. Catalog *runtime* writers
-remain JSON-backed until catalog cutover. Physical BLE workflow semantics remain
-in the bridge.
+lossless import of legacy JSON/JSONL state. Phase 0.3/0.4 history and catalog
+cutovers make ``history_events`` and ``recipes``/``recipe_revisions`` the
+authoritative runtime stores (legacy JSON/JSONL are import-only). Phase B B8
+adds typed recipe/revision APIs with optimistic concurrency, domain validation,
+and safe provenance. Physical BLE workflow semantics remain in the bridge.
 """
 
 from __future__ import annotations
@@ -44,6 +43,11 @@ LEGACY_MIGRATION_NAME = "legacy_json_v1"
 # installs that already hold a legacy_json_v1 receipt still populate the v4
 # journal on a normal migrate without --force.
 LEGACY_HISTORY_CUTOVER_NAME = "legacy_history_sqlite_v1"
+# Independent catalog cutover: recipes + recipe_revisions are the single
+# authoritative local catalog. Existing installs with only legacy_json_v1
+# (and possibly history cutover) still get a full catalog backfill from
+# legacy_imports on a normal migrate without --force.
+LEGACY_CATALOG_CUTOVER_NAME = "legacy_catalog_sqlite_v1"
 DEFAULT_RECIPE_LIST_LIMIT = 50
 MAX_RECIPE_LIST_LIMIT = 500
 DEFAULT_HISTORY_LIST_LIMIT = 20
@@ -51,6 +55,22 @@ MAX_HISTORY_LIST_LIMIT = 200
 MAX_HISTORY_NOTE_CHARS = 500
 HISTORY_SOURCE_LOCAL = "local-skill"
 HISTORY_SOURCE_APP = "app-cloud"
+CATALOG_SOURCE_LEGACY = "legacy_catalog"
+CATALOG_SOURCE_SKILL = "skill-catalog"
+CATALOG_SOURCE_WEB = "web"
+CATALOG_SOURCE_MERGE = "catalog-merge"
+# Runtime view fields injected by build_catalog_snapshot; never persist into
+# metadata.catalog_envelope (load -> save must not pollute or churn).
+CATALOG_ENVELOPE_RUNTIME_KEYS = frozenset(
+    {
+        "recipe",
+        "recipe_id",
+        "catalog_owned",
+        "derived",
+        "archived_at",
+        "id",
+    }
+)
 HISTORY_VALID_OUTCOMES = frozenset(
     {
         "loaded",
@@ -312,6 +332,126 @@ def legacy_history_record_dedupe_key(record_key: str) -> str:
     """Dedupe key for a legacy_imports history row (source identity / record_key)."""
 
     return f"legacy:{record_key}"
+
+
+def recipe_id_for_catalog_entry_id(entry_id: str) -> str:
+    """Deterministic stable recipe_id for a public catalog entry id.
+
+    Matches the Phase 0 legacy import mapping so existing migrated IDs remain
+    resolvable after catalog cutover.
+    """
+
+    text = str(entry_id).strip()
+    if not text:
+        raise StorageError("catalog entry id must be a non-empty string")
+    return f"legacy_{text}"
+
+
+def catalog_entry_id_from_recipe_id(recipe_id: str) -> str | None:
+    """Inverse of :func:`recipe_id_for_catalog_entry_id` when applicable.
+
+    A ``legacy_`` prefix alone does **not** imply catalog ownership. Use
+    :func:`catalog_ownership_entry_ids` for ownership checks.
+    """
+
+    text = str(recipe_id or "")
+    if text.startswith("legacy_"):
+        return text[len("legacy_") :]
+    return None
+
+
+def catalog_ownership_entry_ids(
+    metadata: Mapping[str, Any] | None,
+    provenance: Mapping[str, Any] | None,
+) -> set[str]:
+    """Explicit catalog-ownership markers only (never recipe_id prefix alone).
+
+    Legitimate catalog / partial-legacy rows are identified by matching
+    ``metadata.catalog_entry_id`` or ``provenance.catalog_entry_id`` /
+    ``provenance.legacy_entry_id``.
+    """
+
+    owned: set[str] = set()
+    meta = metadata if isinstance(metadata, Mapping) else {}
+    prov = provenance if isinstance(provenance, Mapping) else {}
+    for value in (
+        meta.get("catalog_entry_id"),
+        prov.get("catalog_entry_id"),
+        prov.get("legacy_entry_id"),
+    ):
+        text = str(value).strip() if value is not None else ""
+        if text:
+            owned.add(text)
+    return owned
+
+
+def normalize_catalog_envelope(envelope: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return a catalog envelope with runtime view fields stripped."""
+
+    if not isinstance(envelope, Mapping):
+        return {}
+    return {
+        key: value
+        for key, value in envelope.items()
+        if key not in CATALOG_ENVELOPE_RUNTIME_KEYS
+    }
+
+
+def split_catalog_entry(entry: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Split a normalized catalog entry into envelope (no recipe) + recipe body.
+
+    Runtime snapshot fields (``recipe_id``, ``catalog_owned``, ``derived``,
+    ``archived_at``) are stripped so they are never persisted into
+    ``metadata.catalog_envelope``.
+    """
+
+    if not isinstance(entry, Mapping):
+        raise StorageError("catalog entry must be a mapping")
+    data = dict(entry)
+    recipe = data.pop("recipe", None)
+    if recipe is None:
+        recipe = {}
+    if not isinstance(recipe, Mapping):
+        raise StorageError("catalog entry recipe must be an object mapping")
+    return normalize_catalog_envelope(data), dict(recipe)
+
+
+def merge_catalog_envelopes(
+    existing: Mapping[str, Any] | None,
+    incoming: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Merge catalog entry envelopes (sources/slots union; incoming wins fields)."""
+
+    base = normalize_catalog_envelope(existing)
+    merged = normalize_catalog_envelope(incoming)
+    merged["first_seen_at"] = base.get("first_seen_at", merged.get("first_seen_at"))
+    old_sources = list(base.get("sources") or [])
+    new_sources = list(merged.get("sources") or [])
+    source_map: dict[tuple[Any, Any, Any, Any], dict[str, Any]] = {}
+    for source in [*old_sources, *new_sources]:
+        if not isinstance(source, dict):
+            continue
+        key = (
+            source.get("type"),
+            source.get("endpoint"),
+            source.get("file"),
+            source.get("region"),
+        )
+        source_map[key] = source
+    merged["sources"] = sorted(
+        source_map.values(),
+        key=lambda item: (
+            str(item.get("type")),
+            str(item.get("endpoint")),
+            str(item.get("file")),
+        ),
+    )
+    slots: dict[str, dict[str, Any]] = {}
+    for slot in [*(base.get("slots") or []), *(merged.get("slots") or [])]:
+        if isinstance(slot, dict) and slot.get("position"):
+            slots[str(slot["position"]).upper()] = slot
+    merged["slots"] = [slots[key] for key in sorted(slots)]
+    return merged
 
 
 def public_history_event(event: Mapping[str, Any]) -> dict[str, Any]:
@@ -1751,6 +1891,685 @@ class StateStore:
                 "SELECT * FROM recipes WHERE recipe_id = ?", (recipe_id,)
             ).fetchone()
         return _parse_recipe_row(out)
+
+    # ------------------------------------------------------------------
+    # Catalog view / merge (Phase 0.3/0.4 catalog cutover)
+    # ------------------------------------------------------------------
+
+    def build_catalog_snapshot(
+        self,
+        *,
+        include_derived: bool = True,
+        include_archived: bool = False,
+        schema_version: int = 1,
+    ) -> dict[str, Any]:
+        """Build a public catalog dict from recipes + latest revisions.
+
+        Catalog-owned rows (metadata.catalog_entry_id / legacy mapping) keep the
+        full normalized entry envelope. Web-created recipes without catalog
+        metadata appear as derived public entries when *include_derived* is set.
+
+        When ``state.db`` does not exist yet, returns an empty snapshot without
+        creating the database (read path must not invent runtime files).
+        """
+
+        if not self.db_path.is_file():
+            return {
+                "schema_version": schema_version,
+                "created_at": None,
+                "updated_at": None,
+                "entries": [],
+                "path": str(self.db_path),
+                "source": "state.db",
+                "authoritative": "sqlite",
+                "exists": False,
+            }
+        self.ensure_schema()
+        rows = self.list_recipes(
+            limit=MAX_RECIPE_LIST_LIMIT,
+            offset=0,
+            include_archived=include_archived,
+        )
+        # Paginate if needed (personal catalogs are small; hard-cap safety).
+        if len(rows) >= MAX_RECIPE_LIST_LIMIT:
+            offset = MAX_RECIPE_LIST_LIMIT
+            while True:
+                batch = self.list_recipes(
+                    limit=MAX_RECIPE_LIST_LIMIT,
+                    offset=offset,
+                    include_archived=include_archived,
+                )
+                if not batch:
+                    break
+                rows.extend(batch)
+                if len(batch) < MAX_RECIPE_LIST_LIMIT:
+                    break
+                offset += MAX_RECIPE_LIST_LIMIT
+
+        entries: list[dict[str, Any]] = []
+        updated_at: str | None = None
+        created_at: str | None = None
+        for row in rows:
+            entry = self._catalog_entry_from_recipe_row(row, include_derived=include_derived)
+            if entry is None:
+                continue
+            entries.append(entry)
+            ru = row.get("updated_at")
+            rc = row.get("created_at")
+            if isinstance(ru, str) and (updated_at is None or ru > updated_at):
+                updated_at = ru
+            if isinstance(rc, str) and (created_at is None or rc < created_at):
+                created_at = rc
+        entries.sort(
+            key=lambda item: (
+                str(item.get("kind") or ""),
+                str(item.get("name") or "").casefold(),
+                str(item.get("id") or ""),
+            )
+        )
+        return {
+            "schema_version": schema_version,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "entries": entries,
+            "path": str(self.db_path),
+            "source": "state.db",
+            "authoritative": "sqlite",
+            "exists": True,
+        }
+
+    def get_catalog_entry(
+        self,
+        identifier: str,
+        *,
+        include_derived: bool = True,
+        include_archived: bool = False,
+    ) -> dict[str, Any] | None:
+        """Resolve one catalog entry by public id, table_id, or unambiguous name."""
+
+        catalog = self.build_catalog_snapshot(
+            include_derived=include_derived,
+            include_archived=include_archived,
+        )
+        entries = list(catalog.get("entries") or [])
+        exact = [e for e in entries if str(e.get("id")) == identifier]
+        if exact:
+            return dict(exact[0])
+        by_table = [
+            e
+            for e in entries
+            if e.get("table_id") is not None and str(e.get("table_id")) == identifier
+        ]
+        if len(by_table) == 1:
+            return dict(by_table[0])
+        matches = [
+            e
+            for e in entries
+            if identifier.casefold() in str(e.get("name", "")).casefold()
+        ]
+        if len(matches) == 1:
+            return dict(matches[0])
+        if matches:
+            raise StorageError(
+                f"catalog identifier {identifier!r} is ambiguous ({len(matches)} matches)"
+            )
+        return None
+
+    def list_catalog_entries(
+        self,
+        *,
+        kind: str = "all",
+        origin: str | None = None,
+        query: str | None = None,
+        executable_only: bool = False,
+        slot_compatible_only: bool = False,
+        include_derived: bool = True,
+        include_archived: bool = False,
+    ) -> list[dict[str, Any]]:
+        """List summary catalog entries with the same filters as the Skill CLI."""
+
+        catalog = self.build_catalog_snapshot(
+            include_derived=include_derived,
+            include_archived=include_archived,
+        )
+        needle = (query or "").strip().casefold()
+        result: list[dict[str, Any]] = []
+        for entry in catalog.get("entries") or []:
+            if kind != "all" and entry.get("kind") != kind:
+                continue
+            if origin and entry.get("origin") != origin:
+                continue
+            if executable_only and not entry.get("executable"):
+                continue
+            if slot_compatible_only and not entry.get("slot_compatible"):
+                continue
+            haystack = " ".join(
+                str(entry.get(key, ""))
+                for key in ("id", "name", "origin", "author", "cup_type")
+            ).casefold()
+            if needle and needle not in haystack:
+                continue
+            result.append(
+                {
+                    key: entry.get(key)
+                    for key in (
+                        "id",
+                        "table_id",
+                        "name",
+                        "kind",
+                        "machine_program",
+                        "origin",
+                        "author",
+                        "cup_type",
+                        "executable",
+                        "slot_compatible",
+                        "slots",
+                        "warnings",
+                        "validation_errors",
+                        "manual_preparation",
+                        "catalog_owned",
+                        "derived",
+                        "recipe_id",
+                    )
+                    if entry.get(key) not in (None, [], "")
+                }
+            )
+        return result
+
+    def catalog_summary(self, *, include_derived: bool = True) -> dict[str, Any]:
+        """Counts for catalog status CLI / doctor."""
+
+        catalog = self.build_catalog_snapshot(include_derived=include_derived)
+        entries = list(catalog.get("entries") or [])
+        return {
+            "total": len(entries),
+            "coffee": sum(entry.get("kind") == "coffee" for entry in entries),
+            "tea": sum(entry.get("kind") == "tea" for entry in entries),
+            "executable": sum(bool(entry.get("executable")) for entry in entries),
+            "slot_compatible": sum(
+                bool(entry.get("slot_compatible")) for entry in entries
+            ),
+            "updated_at": catalog.get("updated_at"),
+            "path": str(self.db_path),
+            "source": "state.db",
+            "authoritative": "sqlite",
+            "exists": bool(catalog.get("exists", self.db_path.is_file())),
+        }
+
+    def merge_catalog_entries(
+        self,
+        entries: Sequence[Mapping[str, Any]],
+        *,
+        source: str = CATALOG_SOURCE_MERGE,
+        creation_source: str | None = None,
+    ) -> dict[str, Any]:
+        """Transactionally merge normalized catalog entries into recipes/revisions.
+
+        Rules (BEGIN IMMEDIATE):
+        - create recipe + first revision atomically for new entry ids
+        - changed recipe content creates one new immutable child revision
+        - metadata-only changes update recipe metadata without a fake revision
+        - unchanged replay is idempotent (no duplicate revisions)
+        - never deletes another writer's revisions; concurrent writers serialize
+          on IMMEDIATE and parent/revision_number uniqueness
+        """
+
+        stats: dict[str, Any] = {
+            "candidates": 0,
+            "created": 0,
+            "updated": 0,
+            "metadata_only": 0,
+            "unchanged": 0,
+            "skipped": 0,
+        }
+        now = utc_now()
+        # One BEGIN IMMEDIATE transaction: any failure rolls back the whole batch.
+        with self.transaction() as conn:
+            for raw in entries:
+                stats["candidates"] += 1
+                if not isinstance(raw, Mapping):
+                    raise StorageError("catalog entry must be a mapping")
+                if raw.get("derived") or raw.get("catalog_owned") is False:
+                    stats["skipped"] += 1
+                    continue
+                action = self._merge_one_catalog_entry_in_tx(
+                    conn,
+                    dict(raw),
+                    now=now,
+                    source=source,
+                    creation_source=creation_source,
+                )
+                if action == "created":
+                    stats["created"] += 1
+                elif action == "updated":
+                    stats["updated"] += 1
+                elif action == "metadata_only":
+                    stats["metadata_only"] += 1
+                else:
+                    stats["unchanged"] += 1
+        return stats
+
+    def archive_catalog_entry(
+        self,
+        *,
+        entry_id: str | None = None,
+        table_id: int | str | None = None,
+        expected_latest_revision_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Soft-archive one local catalog-owned entry after confirmed cloud delete.
+
+        Targets exact catalog-owned mappings only:
+        - ``entry_id`` is exact id match (never substring / name fallback)
+        - ``table_id`` is exact; ambiguity fails
+        - derived Web recipes are never archived through this API
+
+        Does not delete recipe_revisions or history_events.
+        """
+
+        catalog = self.build_catalog_snapshot(
+            include_derived=False, include_archived=True
+        )
+        entries = list(catalog.get("entries") or [])
+        entry: dict[str, Any] | None = None
+        if entry_id is not None:
+            eid = str(entry_id).strip()
+            if not eid:
+                raise StorageError("entry_id must be a non-empty string")
+            exact = [e for e in entries if str(e.get("id")) == eid]
+            if not exact:
+                raise StorageError(
+                    f"catalog entry {eid!r} not found for archive "
+                    "(exact catalog-owned id required; no name fallback)"
+                )
+            entry = exact[0]
+        elif table_id is not None:
+            matches = [
+                e
+                for e in entries
+                if e.get("table_id") is not None
+                and str(e.get("table_id")) == str(table_id)
+            ]
+            if len(matches) > 1:
+                raise StorageError(
+                    f"catalog table_id {table_id!r} is ambiguous ({len(matches)} matches)"
+                )
+            if not matches:
+                raise StorageError(
+                    f"catalog table_id {table_id!r} not found for archive"
+                )
+            entry = matches[0]
+        else:
+            raise StorageError(
+                "entry_id or table_id is required to archive catalog entry"
+            )
+        if entry.get("catalog_owned") is False or entry.get("derived"):
+            raise StorageError(
+                "archive_catalog_entry refuses derived / non-owned recipes"
+            )
+        recipe_id = entry.get("recipe_id") or recipe_id_for_catalog_entry_id(
+            str(entry["id"])
+        )
+        archived = self.archive_recipe(
+            str(recipe_id),
+            expected_latest_revision_id=expected_latest_revision_id,
+        )
+        return {
+            "archived": True,
+            "entry_id": entry.get("id"),
+            "recipe_id": archived.get("recipe_id"),
+            "table_id": entry.get("table_id"),
+            "archived_at": archived.get("archived_at"),
+        }
+
+    def _catalog_entry_from_recipe_row(
+        self,
+        row: Mapping[str, Any],
+        *,
+        include_derived: bool,
+    ) -> dict[str, Any] | None:
+        metadata = dict(row.get("metadata") or {})
+        provenance = dict(row.get("provenance") or {})
+        latest = row.get("latest_revision")
+        recipe_body: dict[str, Any] = {}
+        if isinstance(latest, Mapping) and isinstance(latest.get("content"), Mapping):
+            recipe_body = dict(latest["content"])
+
+        owned_ids = catalog_ownership_entry_ids(metadata, provenance)
+        entry_id: str | None = None
+        if len(owned_ids) == 1:
+            entry_id = next(iter(owned_ids))
+        elif metadata.get("catalog_entry_id"):
+            entry_id = str(metadata.get("catalog_entry_id")).strip() or None
+        elif provenance.get("catalog_entry_id"):
+            entry_id = str(provenance.get("catalog_entry_id")).strip() or None
+        elif provenance.get("legacy_entry_id"):
+            entry_id = str(provenance.get("legacy_entry_id")).strip() or None
+        # Never treat a bare legacy_ recipe_id prefix as catalog ownership.
+
+        envelope = metadata.get("catalog_envelope")
+        if entry_id and isinstance(envelope, Mapping):
+            entry = normalize_catalog_envelope(envelope)
+            entry["id"] = str(entry_id)
+            entry["recipe"] = recipe_body
+            entry["recipe_id"] = row.get("recipe_id")
+            entry["catalog_owned"] = True
+            entry["derived"] = False
+            if row.get("archived_at"):
+                entry["archived_at"] = row.get("archived_at")
+            # Prefer live name/kind from recipe row when present.
+            if row.get("name"):
+                entry["name"] = row.get("name")
+            if row.get("kind") in {"coffee", "tea"}:
+                entry["kind"] = row.get("kind")
+            return entry
+
+        # Partial legacy import: ownership markers present, body in revision.
+        # provenance.sources alone (without ownership markers) is not enough.
+        if entry_id and (
+            "executable" in metadata
+            or "slot_compatible" in metadata
+            or provenance.get("legacy_entry_id")
+            or provenance.get("catalog_entry_id")
+            or metadata.get("catalog_entry_id")
+        ):
+            entry = {
+                "id": str(entry_id),
+                "name": row.get("name") or recipe_body.get("name") or str(entry_id),
+                "kind": row.get("kind") or recipe_body.get("kind") or "coffee",
+                "executable": metadata.get("executable"),
+                "slot_compatible": metadata.get("slot_compatible"),
+                "origin": provenance.get("origin"),
+                "sources": list(provenance.get("sources") or []),
+                "recipe": recipe_body,
+                "recipe_id": row.get("recipe_id"),
+                "catalog_owned": True,
+                "derived": False,
+            }
+            return entry
+
+        if not include_derived:
+            return None
+        # Web / high-level API recipes without catalog ownership markers.
+        recipe_id = str(row.get("recipe_id") or "")
+        if not recipe_id:
+            return None
+        kind = row.get("kind") or recipe_body.get("kind") or "coffee"
+        name = row.get("name") or recipe_body.get("name") or recipe_id
+        executable = False
+        validation_errors: list[str] = []
+        if recipe_body:
+            try:
+                canonicalize_recipe_content(recipe_body)
+                executable = True
+            except StorageError as exc:
+                validation_errors.append(str(exc))
+        return {
+            "id": recipe_id,
+            "name": name,
+            "kind": kind if kind in {"coffee", "tea"} else "coffee",
+            "machine_program": (
+                "omni-tea-brewer" if kind == "tea" else "coffee-pour-over"
+            ),
+            "origin": provenance.get("origin") or row.get("source") or CATALOG_SOURCE_WEB,
+            "executable": executable,
+            "slot_compatible": False,
+            "validation_errors": validation_errors,
+            "warnings": [],
+            "sources": [
+                {
+                    "type": "web-state",
+                    "recipe_id": recipe_id,
+                }
+            ],
+            "recipe": recipe_body,
+            "recipe_id": recipe_id,
+            "catalog_owned": False,
+            "derived": True,
+            "slots": [],
+        }
+
+    @staticmethod
+    def _require_catalog_merge_ownership(
+        entry_id: str,
+        recipe_id: str,
+        metadata: Mapping[str, Any],
+        provenance: Mapping[str, Any],
+    ) -> None:
+        """Refuse to take over a row not explicitly owned by this catalog entry."""
+
+        owned = catalog_ownership_entry_ids(metadata, provenance)
+        if not owned:
+            raise StorageConflictError(
+                f"recipe_id {recipe_id!r} exists without catalog ownership "
+                f"markers; refusing merge of catalog entry {entry_id!r}"
+            )
+        if owned != {entry_id}:
+            raise StorageConflictError(
+                f"catalog entry {entry_id!r} conflicts with existing ownership "
+                f"markers {sorted(owned)!r} on recipe_id {recipe_id!r}"
+            )
+
+    def _merge_one_catalog_entry_in_tx(
+        self,
+        conn: sqlite3.Connection,
+        entry: dict[str, Any],
+        *,
+        now: str,
+        source: str,
+        creation_source: str | None,
+    ) -> str:
+        entry_id = str(entry.get("id") or "").strip()
+        if not entry_id:
+            raise StorageError("catalog entry missing id")
+        envelope, recipe_body = split_catalog_entry(entry)
+        recipe_id = recipe_id_for_catalog_entry_id(entry_id)
+        content_json = canonical_json(recipe_body)
+        digest = sha256_text(content_json)
+
+        existing_row = conn.execute(
+            "SELECT * FROM recipes WHERE recipe_id = ?",
+            (recipe_id,),
+        ).fetchone()
+        existing_meta: dict[str, Any] = {}
+        existing_prov: dict[str, Any] = {}
+        if existing_row is not None:
+            existing_meta = json.loads(existing_row["metadata_json"] or "{}")
+            if not isinstance(existing_meta, dict):
+                existing_meta = {}
+            existing_prov = json.loads(existing_row["provenance_json"] or "{}")
+            if not isinstance(existing_prov, dict):
+                existing_prov = {}
+            self._require_catalog_merge_ownership(
+                entry_id, recipe_id, existing_meta, existing_prov
+            )
+
+        existing_envelope = existing_meta.get("catalog_envelope")
+        if not isinstance(existing_envelope, Mapping):
+            existing_envelope = {
+                k: existing_meta[k]
+                for k in ("executable", "slot_compatible")
+                if k in existing_meta
+            } or None
+        merged_envelope = merge_catalog_envelopes(existing_envelope, envelope)
+        kind = merged_envelope.get("kind") or recipe_body.get("kind")
+        if kind not in {"coffee", "tea"}:
+            kind = "tea" if str(recipe_body.get("kind", "")).lower() == "tea" else "coffee"
+        name = str(merged_envelope.get("name") or recipe_body.get("name") or entry_id)
+
+        # Preserve unrelated Web/user metadata and provenance annotations.
+        metadata = dict(existing_meta)
+        metadata["catalog_entry_id"] = entry_id
+        metadata["catalog_envelope"] = normalize_catalog_envelope(merged_envelope)
+        metadata["executable"] = merged_envelope.get("executable")
+        metadata["slot_compatible"] = merged_envelope.get("slot_compatible")
+
+        provenance = dict(existing_prov)
+        provenance["catalog_entry_id"] = entry_id
+        provenance["legacy_entry_id"] = entry_id
+        if "sources" in merged_envelope:
+            provenance["sources"] = merged_envelope.get("sources")
+        if "origin" in merged_envelope:
+            provenance["origin"] = merged_envelope.get("origin")
+        provenance["source"] = source
+        if creation_source:
+            provenance["creation_source"] = creation_source
+        meta_json = canonical_json(metadata)
+        prov_json = canonical_json(provenance)
+
+        if existing_row is None:
+            conn.execute(
+                """
+                INSERT INTO recipes (
+                    recipe_id, kind, name, created_at, updated_at,
+                    source, provenance_json, metadata_json, archived_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    recipe_id,
+                    kind,
+                    name,
+                    now,
+                    now,
+                    source,
+                    prov_json,
+                    meta_json,
+                ),
+            )
+            rev_id = f"legacy_rev_{entry_id}_{digest[:16]}"
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO recipe_revisions (
+                        revision_id, recipe_id, revision_number, content_json,
+                        content_sha256, parent_revision_id, created_at,
+                        provenance_json
+                    ) VALUES (?, ?, 1, ?, ?, NULL, ?, ?)
+                    """,
+                    (rev_id, recipe_id, content_json, digest, now, prov_json),
+                )
+            except sqlite3.IntegrityError:
+                # A global deterministic revision-id collision must not leave
+                # the newly inserted catalog recipe without revision 1.
+                rev_id = f"rev_{uuid4().hex}"
+                conn.execute(
+                    """
+                    INSERT INTO recipe_revisions (
+                        revision_id, recipe_id, revision_number, content_json,
+                        content_sha256, parent_revision_id, created_at,
+                        provenance_json
+                    ) VALUES (?, ?, 1, ?, ?, NULL, ?, ?)
+                    """,
+                    (rev_id, recipe_id, content_json, digest, now, prov_json),
+                )
+            return "created"
+
+        latest = conn.execute(
+            """
+            SELECT revision_id, revision_number, content_sha256
+            FROM recipe_revisions
+            WHERE recipe_id = ?
+            ORDER BY revision_number DESC
+            LIMIT 1
+            """,
+            (recipe_id,),
+        ).fetchone()
+
+        content_same = latest is not None and latest["content_sha256"] == digest
+        # Compare canonical forms so byte-stable stored JSON matches rebuilds.
+        existing_meta_canon = canonical_json(existing_meta)
+        existing_prov_canon = canonical_json(existing_prov)
+        existing_source = existing_row["source"]
+        existing_name = existing_row["name"]
+        existing_kind = existing_row["kind"]
+        existing_archived = existing_row["archived_at"]
+        # COALESCE(?, source) with non-null source always takes the merge source.
+        row_unchanged = (
+            content_same
+            and existing_kind == kind
+            and existing_name == name
+            and existing_source == source
+            and existing_meta_canon == meta_json
+            and existing_prov_canon == prov_json
+            and existing_archived is None
+        )
+        if row_unchanged:
+            # True idempotency: no UPDATE at all (updated_at, revision count, ...).
+            return "unchanged"
+
+        # Un-archive on re-merge so cloud re-import restores visibility.
+        # Content-identical restore / envelope-only edits are metadata_only.
+        conn.execute(
+            """
+            UPDATE recipes SET
+                kind = ?,
+                name = ?,
+                updated_at = ?,
+                source = COALESCE(?, source),
+                provenance_json = ?,
+                metadata_json = ?,
+                archived_at = NULL
+            WHERE recipe_id = ?
+            """,
+            (kind, name, now, source, prov_json, meta_json, recipe_id),
+        )
+
+        if latest is None:
+            rev_id = f"legacy_rev_{entry_id}_{digest[:16]}"
+            conn.execute(
+                """
+                INSERT INTO recipe_revisions (
+                    revision_id, recipe_id, revision_number, content_json,
+                    content_sha256, parent_revision_id, created_at,
+                    provenance_json
+                ) VALUES (?, ?, 1, ?, ?, NULL, ?, ?)
+                """,
+                (rev_id, recipe_id, content_json, digest, now, prov_json),
+            )
+            return "updated"
+
+        if content_same:
+            return "metadata_only"
+
+        number = int(latest["revision_number"]) + 1
+        rev_id = f"rev_{uuid4().hex}"
+        try:
+            conn.execute(
+                """
+                INSERT INTO recipe_revisions (
+                    revision_id, recipe_id, revision_number, content_json,
+                    content_sha256, parent_revision_id, created_at,
+                    provenance_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    rev_id,
+                    recipe_id,
+                    number,
+                    content_json,
+                    digest,
+                    latest["revision_id"],
+                    now,
+                    prov_json,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            # Concurrent writer took this revision_number; re-check content.
+            latest2 = conn.execute(
+                """
+                SELECT revision_id, revision_number, content_sha256
+                FROM recipe_revisions
+                WHERE recipe_id = ?
+                ORDER BY revision_number DESC
+                LIMIT 1
+                """,
+                (recipe_id,),
+            ).fetchone()
+            if latest2 is not None and latest2["content_sha256"] == digest:
+                return "unchanged"
+            raise StorageConflictError(
+                f"catalog merge conflict for {entry_id!r}: {exc}"
+            ) from exc
+        return "updated"
 
     @staticmethod
     def _encode_recovery_json(
@@ -3480,7 +4299,14 @@ def _import_catalog(
     if not isinstance(entries, list):
         raise StorageError(f"catalog entries at {path} must be a list")
 
-    stats = {"entries": 0, "recipes": 0, "revisions": 0, "skipped": 0}
+    stats = {
+        "entries": 0,
+        "recipes": 0,
+        "revisions": 0,
+        "skipped": 0,
+        "metadata_only": 0,
+        "unchanged": 0,
+    }
     # Whole-file provenance record (lossless envelope).
     store._insert_legacy_import(
         conn,
@@ -3502,6 +4328,8 @@ def _import_catalog(
         if not isinstance(entry, dict):
             raise StorageError(f"catalog entry {index} is not an object")
         entry_id = str(entry.get("id") or f"index:{index}")
+        if "id" not in entry or not str(entry.get("id") or "").strip():
+            entry = {**entry, "id": entry_id}
         record_key = f"entry:{entry_id}:{content_sha256(entry)}"
         inserted = store._insert_legacy_import(
             conn,
@@ -3514,72 +4342,99 @@ def _import_catalog(
         )
         if not inserted:
             stats["skipped"] += 1
-            continue
-        stats["entries"] += 1
-        recipe_id = f"legacy_{entry_id}"
-        kind = entry.get("kind")
-        name = entry.get("name")
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO recipes (
-                recipe_id, kind, name, created_at, updated_at,
-                source, provenance_json, metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                recipe_id,
-                str(kind) if kind is not None else None,
-                str(name) if name is not None else None,
-                imported_at,
-                imported_at,
-                "legacy_catalog",
-                canonical_json(
-                    {
-                        "legacy_entry_id": entry_id,
-                        "sources": entry.get("sources"),
-                        "origin": entry.get("origin"),
-                    }
-                ),
-                canonical_json(
-                    {
-                        "executable": entry.get("executable"),
-                        "slot_compatible": entry.get("slot_compatible"),
-                    }
-                ),
-            ),
+            # Still repair recipe/revision state on force re-run / partial import.
+        else:
+            stats["entries"] += 1
+        action = store._merge_one_catalog_entry_in_tx(
+            conn,
+            dict(entry),
+            now=imported_at,
+            source=CATALOG_SOURCE_LEGACY,
+            creation_source="legacy_import",
         )
-        if conn.execute("SELECT changes()").fetchone()[0]:
+        if action == "created":
             stats["recipes"] += 1
-        recipe_body = entry.get("recipe")
-        if isinstance(recipe_body, dict):
-            rev_id = f"legacy_rev_{entry_id}_{content_sha256(recipe_body)[:16]}"
-            content_json = canonical_json(recipe_body)
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO recipe_revisions (
-                        revision_id, recipe_id, revision_number, content_json,
-                        content_sha256, parent_revision_id, created_at,
-                        provenance_json
-                    ) VALUES (?, ?, 1, ?, ?, NULL, ?, ?)
-                    """,
-                    (
-                        rev_id,
-                        recipe_id,
-                        content_json,
-                        sha256_text(content_json),
-                        imported_at,
-                        canonical_json(
-                            {
-                                "source": "legacy_catalog",
-                                "legacy_entry_id": entry_id,
-                            }
-                        ),
-                    ),
-                )
-                stats["revisions"] += 1
-            except sqlite3.IntegrityError:
-                stats["skipped"] += 1
+            stats["revisions"] += 1
+        elif action == "updated":
+            stats["revisions"] += 1
+        elif action == "metadata_only":
+            stats["metadata_only"] += 1
+        else:
+            stats["unchanged"] += 1
+    return stats
+
+
+def _backfill_catalog_from_legacy_imports(
+    store: StateStore,
+    conn: sqlite3.Connection,
+    *,
+    imported_at: str,
+) -> dict[str, Any]:
+    """Populate/repair recipes from already-imported catalog rows.
+
+    Does not read or modify original catalog.json. Replays each
+    ``legacy_imports`` catalog entry through the same merge rules used at
+    runtime so partial v3-era recipe rows gain full catalog envelopes.
+    """
+
+    stats: dict[str, Any] = {
+        "source_rows": 0,
+        "created": 0,
+        "updated": 0,
+        "metadata_only": 0,
+        "unchanged": 0,
+        "errors": 0,
+        "source": "legacy_imports",
+    }
+    rows = conn.execute(
+        """
+        SELECT record_key, payload_json
+        FROM legacy_imports
+        WHERE source_kind = 'catalog'
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    for row in rows:
+        stats["source_rows"] += 1
+        record_key = str(row["record_key"])
+        try:
+            entry = json.loads(row["payload_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise StorageError(
+                f"corrupt legacy_imports catalog payload for {record_key!r}: {exc}"
+            ) from exc
+        if not isinstance(entry, dict):
+            raise StorageError(
+                f"legacy_imports catalog payload for {record_key!r} is not an object"
+            )
+        if "id" not in entry or not str(entry.get("id") or "").strip():
+            # record_key form entry:{id}:{hash}
+            parts = record_key.split(":", 2)
+            if len(parts) >= 2 and parts[0] == "entry":
+                entry = {**entry, "id": parts[1]}
+            else:
+                entry = {**entry, "id": f"legacy:{record_key}"}
+        try:
+            action = store._merge_one_catalog_entry_in_tx(
+                conn,
+                dict(entry),
+                now=imported_at,
+                source=CATALOG_SOURCE_LEGACY,
+                creation_source="catalog_cutover_backfill",
+            )
+        except StorageError as exc:
+            stats["errors"] += 1
+            raise StorageError(
+                f"catalog cutover failed for {record_key!r}: {exc}"
+            ) from exc
+        if action == "created":
+            stats["created"] += 1
+        elif action == "updated":
+            stats["updated"] += 1
+        elif action == "metadata_only":
+            stats["metadata_only"] += 1
+        else:
+            stats["unchanged"] += 1
     return stats
 
 
@@ -3814,6 +4669,19 @@ def _import_recovery(
     return stats
 
 
+def _runtime_truth_full() -> dict[str, str]:
+    return {
+        "workflow": "sqlite",
+        "history": "sqlite",
+        "idempotency": "sqlite",
+        "catalog": "sqlite",
+    }
+
+
+def _sqlite_active_for_full() -> list[str]:
+    return ["workflow", "history", "idempotency", "catalog"]
+
+
 def migrate_legacy_state(
     state_root: Path | str,
     *,
@@ -3831,18 +4699,20 @@ def migrate_legacy_state(
       do not mark the migration complete.
     - Reruns after success are idempotent (no duplicate data).
 
-    Two independent receipts:
+    Three independent receipts:
     - ``legacy_json_v1``: raw legacy import into ``legacy_imports`` (+ catalog/
       recovery side effects).
     - ``legacy_history_sqlite_v1``: history journal cutover into
-      ``history_events``. On a fresh migrate both commit atomically. On an
-      already-completed v3-era import, a normal migrate (no ``--force``)
-      backfills ``history_events`` from ``legacy_imports`` without rereading
-      JSONL.
+      ``history_events``.
+    - ``legacy_catalog_sqlite_v1``: catalog runtime cutover into
+      ``recipes`` / ``recipe_revisions`` with full entry envelopes.
 
-    History runtime is SQLite (``history_events``). Catalog runtime remains
-    JSON-backed until a later cutover. A completed legacy import receipt is
-    not full catalog cutover.
+    On a fresh migrate all receipts commit atomically. On an already-completed
+    older import, a normal migrate (no ``--force``) backfills missing cutovers
+    from ``legacy_imports`` without rereading catalog.json or brew-history.jsonl.
+
+    After cutover, runtime truth for workflow/history/idempotency/catalog is
+    SQLite. Legacy JSON files remain import-only and are never rewritten.
     """
 
     root = normalize_state_root(state_root)
@@ -3856,61 +4726,85 @@ def migrate_legacy_state(
 
         legacy_done = db.migration_completed(LEGACY_MIGRATION_NAME)
         history_done = db.migration_completed(LEGACY_HISTORY_CUTOVER_NAME)
-        runtime_truth = {
-            "workflow": "sqlite",
-            "history": "sqlite",
-            "idempotency": "sqlite",
-            "catalog": "json_legacy",
-        }
+        catalog_done = db.migration_completed(LEGACY_CATALOG_CUTOVER_NAME)
+        runtime_truth = _runtime_truth_full()
+        active_for = _sqlite_active_for_full()
 
-        if legacy_done and history_done and not force:
+        if legacy_done and history_done and catalog_done and not force:
             receipt = db.get_migration_receipt(LEGACY_MIGRATION_NAME) or {}
             history_receipt = (
                 db.get_migration_receipt(LEGACY_HISTORY_CUTOVER_NAME) or {}
+            )
+            catalog_receipt = (
+                db.get_migration_receipt(LEGACY_CATALOG_CUTOVER_NAME) or {}
             )
             return {
                 "status": "already_completed",
                 "state_root": str(root),
                 "receipt": receipt,
                 "history_cutover_receipt": history_receipt,
+                "catalog_cutover_receipt": catalog_receipt,
                 "migration_name": LEGACY_MIGRATION_NAME,
                 "history_cutover_name": LEGACY_HISTORY_CUTOVER_NAME,
+                "catalog_cutover_name": LEGACY_CATALOG_CUTOVER_NAME,
                 "migration_completed": True,
                 "history_cutover_completed": True,
+                "catalog_cutover_completed": True,
                 "imported": False,
                 "runtime_source_of_truth": runtime_truth,
-                "sqlite_active_for": ["workflow", "history", "idempotency"],
-                "catalog_runtime": "json_legacy",
+                "sqlite_active_for": active_for,
+                "sqlite_active_runtime": True,
+                "catalog_runtime": "sqlite",
+                "history_runtime": "sqlite",
                 "message": (
-                    "legacy import and history cutover already completed; SQLite "
-                    "is active for workflow/history/idempotency; catalog runtime "
-                    "remains JSON-backed"
+                    "legacy import, history cutover, and catalog cutover already "
+                    "completed; SQLite is active for workflow/history/idempotency/"
+                    "catalog"
                 ),
             }
 
-        # Pre-v4 / old-receipt path: legacy_json_v1 done but history journal
-        # cutover missing. Backfill from legacy_imports only; never reread JSONL.
-        if legacy_done and not history_done and not force:
+        # Old-receipt path: legacy_json_v1 done but one or more cutovers missing.
+        # Backfill from legacy_imports only; never reread originals.
+        if legacy_done and (not history_done or not catalog_done) and not force:
             imported_at = utc_now()
             cutover_stats: dict[str, Any] = {}
+            catalog_stats: dict[str, Any] = {}
             try:
                 with db.transaction() as conn:
-                    _maybe_fault("in_history_cutover_start")
-                    cutover_stats = _backfill_history_from_legacy_imports(
-                        db, conn, imported_at=imported_at
-                    )
-                    _write_migration_receipt(
-                        conn,
-                        name=LEGACY_HISTORY_CUTOVER_NAME,
-                        completed_at=imported_at,
-                        backup_dir=None,
-                        manifest={
-                            "kind": "history_cutover",
-                            "source": "legacy_imports",
-                            "from_migration": LEGACY_MIGRATION_NAME,
-                        },
-                        stats=cutover_stats,
-                    )
+                    if not history_done:
+                        _maybe_fault("in_history_cutover_start")
+                        cutover_stats = _backfill_history_from_legacy_imports(
+                            db, conn, imported_at=imported_at
+                        )
+                        _write_migration_receipt(
+                            conn,
+                            name=LEGACY_HISTORY_CUTOVER_NAME,
+                            completed_at=imported_at,
+                            backup_dir=None,
+                            manifest={
+                                "kind": "history_cutover",
+                                "source": "legacy_imports",
+                                "from_migration": LEGACY_MIGRATION_NAME,
+                            },
+                            stats=cutover_stats,
+                        )
+                    if not catalog_done:
+                        _maybe_fault("in_catalog_cutover_start")
+                        catalog_stats = _backfill_catalog_from_legacy_imports(
+                            db, conn, imported_at=imported_at
+                        )
+                        _write_migration_receipt(
+                            conn,
+                            name=LEGACY_CATALOG_CUTOVER_NAME,
+                            completed_at=imported_at,
+                            backup_dir=None,
+                            manifest={
+                                "kind": "catalog_cutover",
+                                "source": "legacy_imports",
+                                "from_migration": LEGACY_MIGRATION_NAME,
+                            },
+                            stats=catalog_stats,
+                        )
                     _maybe_fault("before_commit")
             except Exception:
                 raise
@@ -3918,25 +4812,39 @@ def migrate_legacy_state(
             history_receipt = (
                 db.get_migration_receipt(LEGACY_HISTORY_CUTOVER_NAME) or {}
             )
+            catalog_receipt = (
+                db.get_migration_receipt(LEGACY_CATALOG_CUTOVER_NAME) or {}
+            )
+            stats_out: dict[str, Any] = {}
+            if cutover_stats:
+                stats_out["history_cutover"] = cutover_stats
+            if catalog_stats:
+                stats_out["catalog_cutover"] = catalog_stats
             return {
                 "status": "completed",
                 "state_root": str(root),
                 "receipt": receipt,
                 "history_cutover_receipt": history_receipt,
+                "catalog_cutover_receipt": catalog_receipt,
                 "migration_name": LEGACY_MIGRATION_NAME,
                 "history_cutover_name": LEGACY_HISTORY_CUTOVER_NAME,
+                "catalog_cutover_name": LEGACY_CATALOG_CUTOVER_NAME,
                 "migration_completed": True,
                 "history_cutover_completed": True,
+                "catalog_cutover_completed": True,
                 "imported": False,
-                "history_backfilled": True,
-                "stats": {"history_cutover": cutover_stats},
+                "history_backfilled": bool(cutover_stats),
+                "catalog_backfilled": bool(catalog_stats),
+                "stats": stats_out,
                 "completed_at": imported_at,
                 "runtime_source_of_truth": runtime_truth,
-                "sqlite_active_for": ["workflow", "history", "idempotency"],
-                "catalog_runtime": "json_legacy",
+                "sqlite_active_for": active_for,
+                "sqlite_active_runtime": True,
+                "catalog_runtime": "sqlite",
+                "history_runtime": "sqlite",
                 "message": (
-                    "history_events backfilled from legacy_imports; history "
-                    "cutover receipt recorded; catalog runtime remains JSON-backed"
+                    "missing cutovers backfilled from legacy_imports; SQLite is "
+                    "active for workflow/history/idempotency/catalog"
                 ),
             }
 
@@ -4029,7 +4937,7 @@ def migrate_legacy_state(
                         )
                     _maybe_fault(f"after_{kind}")
 
-                # Both receipts + imported rows commit atomically.
+                # All receipts + imported rows commit atomically.
                 _write_migration_receipt(
                     conn,
                     name=LEGACY_MIGRATION_NAME,
@@ -4062,6 +4970,28 @@ def migrate_legacy_state(
                     stats=history_cutover_stats,
                 )
                 stats["history_cutover"] = history_cutover_stats
+                catalog_cutover_stats = {
+                    "entries": int((stats.get("catalog") or {}).get("entries") or 0),
+                    "recipes": int((stats.get("catalog") or {}).get("recipes") or 0),
+                    "revisions": int(
+                        (stats.get("catalog") or {}).get("revisions") or 0
+                    ),
+                    "source": "legacy_import_transaction",
+                    "files_seen": list(seen_kinds),
+                }
+                _write_migration_receipt(
+                    conn,
+                    name=LEGACY_CATALOG_CUTOVER_NAME,
+                    completed_at=imported_at,
+                    backup_dir=backup_manifest.get("backup_dir"),
+                    manifest={
+                        "kind": "catalog_cutover",
+                        "source": "legacy_import_transaction",
+                        "paired_with": LEGACY_MIGRATION_NAME,
+                    },
+                    stats=catalog_cutover_stats,
+                )
+                stats["catalog_cutover"] = catalog_cutover_stats
                 _maybe_fault("before_commit")
         except Exception:
             # Transaction rolled back by context manager; originals untouched.
@@ -4076,15 +5006,19 @@ def migrate_legacy_state(
             "completed_at": imported_at,
             "migration_name": LEGACY_MIGRATION_NAME,
             "history_cutover_name": LEGACY_HISTORY_CUTOVER_NAME,
+            "catalog_cutover_name": LEGACY_CATALOG_CUTOVER_NAME,
             "migration_completed": True,
             "history_cutover_completed": True,
+            "catalog_cutover_completed": True,
             "runtime_source_of_truth": runtime_truth,
-            "sqlite_active_for": ["workflow", "history", "idempotency"],
-            "catalog_runtime": "json_legacy",
+            "sqlite_active_for": active_for,
+            "sqlite_active_runtime": True,
+            "catalog_runtime": "sqlite",
+            "history_runtime": "sqlite",
             "message": (
-                "legacy JSON/JSONL imported into state.db with history cutover; "
-                "SQLite is active for workflow/history/idempotency; catalog "
-                "runtime remains JSON-backed"
+                "legacy JSON/JSONL imported into state.db with history and "
+                "catalog cutover; SQLite is active for workflow/history/"
+                "idempotency/catalog"
             ),
         }
     finally:
@@ -4105,6 +5039,7 @@ def migration_status(state_root: Path | str | None = None) -> dict[str, Any]:
         store.ensure_schema()
         completed = store.migration_completed(LEGACY_MIGRATION_NAME)
         history_cutover = store.migration_completed(LEGACY_HISTORY_CUTOVER_NAME)
+        catalog_cutover = store.migration_completed(LEGACY_CATALOG_CUTOVER_NAME)
         receipt = (
             store.get_migration_receipt(LEGACY_MIGRATION_NAME) if completed else None
         )
@@ -4113,10 +5048,16 @@ def migration_status(state_root: Path | str | None = None) -> dict[str, Any]:
             if history_cutover
             else None
         )
+        catalog_receipt = (
+            store.get_migration_receipt(LEGACY_CATALOG_CUTOVER_NAME)
+            if catalog_cutover
+            else None
+        )
         present = [
             {"kind": kind, "path": str(root / rel), "exists": (root / rel).is_file()}
             for kind, rel in LEGACY_SOURCES
         ]
+        cutovers_complete = history_cutover and catalog_cutover
         return {
             "state_root": str(root),
             "db_path": str(store.db_path),
@@ -4126,23 +5067,28 @@ def migration_status(state_root: Path | str | None = None) -> dict[str, Any]:
             "history_cutover_name": LEGACY_HISTORY_CUTOVER_NAME,
             "history_cutover_completed": history_cutover,
             "history_cutover_receipt": history_receipt,
+            "catalog_cutover_name": LEGACY_CATALOG_CUTOVER_NAME,
+            "catalog_cutover_completed": catalog_cutover,
+            "catalog_cutover_receipt": catalog_receipt,
             "legacy_sources": present,
-            "runtime_source_of_truth": {
-                "workflow": "sqlite",
-                "history": "sqlite",
-                "idempotency": "sqlite",
-                "catalog": "json_legacy",
-            },
+            "runtime_source_of_truth": _runtime_truth_full(),
             "sqlite_active_runtime": True,
-            "sqlite_active_for": ["workflow", "history", "idempotency"],
-            "catalog_runtime": "json_legacy",
+            "sqlite_active_for": _sqlite_active_for_full(),
+            "catalog_runtime": "sqlite",
             "history_runtime": "sqlite",
             "message": (
                 "state.db is the authoritative runtime store for workflow, history, "
-                "and idempotency. Catalog remains JSON-backed until catalog cutover. "
-                "Do not treat a completed migration receipt as full catalog cutover. "
+                "idempotency, and catalog (recipes/recipe_revisions). Legacy "
+                "catalog.json and brew-history.jsonl are import-only. "
                 f"History cutover ({LEGACY_HISTORY_CUTOVER_NAME}) "
-                f"{'is complete' if history_cutover else 'is pending'}."
+                f"{'is complete' if history_cutover else 'is pending'}; "
+                f"catalog cutover ({LEGACY_CATALOG_CUTOVER_NAME}) "
+                f"{'is complete' if catalog_cutover else 'is pending'}."
+                + (
+                    ""
+                    if cutovers_complete
+                    else " Run xbloom-state migrate to finish pending cutovers."
+                )
             ),
         }
     finally:
@@ -4158,7 +5104,7 @@ def open_store(
 
     ``migrate=True`` runs the explicit one-shot import helper. Daemon startup
     should not pass ``migrate=True`` (migration remains an explicit operator
-    action). History/workflow/idempotency runtime already uses SQLite.
+    action). Workflow/history/idempotency/catalog runtime uses SQLite.
 
     On success the open store is returned for the caller to manage. On any
     exception before return the store is closed (Windows holds SQLite locks
@@ -4185,7 +5131,7 @@ def main(argv: list[str] | None = None) -> None:
         prog="xbloom-state",
         description=(
             "Explicit state.db maintenance. Migration is idempotent. SQLite is "
-            "active for workflow/history/idempotency; catalog remains JSON-backed."
+            "active for workflow/history/idempotency/catalog."
         ),
     )
     parser.add_argument(
@@ -4244,12 +5190,8 @@ def main(argv: list[str] | None = None) -> None:
                 "status": "backed_up",
                 "destination": str(dest),
                 "state_root": str(store.state_root),
-                "runtime_source_of_truth": {
-                    "workflow": "sqlite",
-                    "history": "sqlite",
-                    "idempotency": "sqlite",
-                    "catalog": "json_legacy",
-                },
+                "runtime_source_of_truth": _runtime_truth_full(),
+                "sqlite_active_for": _sqlite_active_for_full(),
             }
         finally:
             store.close()
@@ -4261,6 +5203,11 @@ def main(argv: list[str] | None = None) -> None:
 __all__ = [
     "ACTIVE_WORKFLOW_STATES",
     "BUSY_TIMEOUT_MS",
+    "CATALOG_ENVELOPE_RUNTIME_KEYS",
+    "CATALOG_SOURCE_LEGACY",
+    "CATALOG_SOURCE_MERGE",
+    "CATALOG_SOURCE_SKILL",
+    "CATALOG_SOURCE_WEB",
     "CLEAR_RECOVERY",
     "DB_FILE_NAME",
     "DEFAULT_HISTORY_LIST_LIMIT",
@@ -4271,6 +5218,7 @@ __all__ = [
     "IDEM_COMPLETED",
     "IDEM_FAILED",
     "IDEM_PENDING",
+    "LEGACY_CATALOG_CUTOVER_NAME",
     "LEGACY_HISTORY_CUTOVER_NAME",
     "LEGACY_MIGRATION_NAME",
     "MAX_HISTORY_LIST_LIMIT",
@@ -4282,6 +5230,8 @@ __all__ = [
     "StorageError",
     "canonicalize_recipe_content",
     "canonical_json",
+    "catalog_entry_id_from_recipe_id",
+    "catalog_ownership_entry_ids",
     "content_sha256",
     "default_db_path",
     "history_event_dedupe_key",
@@ -4289,14 +5239,18 @@ __all__ = [
     "legacy_history_line_dedupe_key",
     "legacy_history_record_dedupe_key",
     "map_terminal_history_outcome",
+    "merge_catalog_envelopes",
     "migrate_legacy_state",
     "migration_status",
     "new_history_event_id",
+    "normalize_catalog_envelope",
     "open_store",
     "public_history_event",
+    "recipe_id_for_catalog_entry_id",
     "reject_forbidden_provenance",
     "sanitize_recipe_provenance",
     "sha256_bytes",
+    "split_catalog_entry",
     "sha256_file",
     "sha256_text",
     "utc_now",

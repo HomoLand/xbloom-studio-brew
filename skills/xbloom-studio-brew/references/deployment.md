@@ -204,7 +204,7 @@ All variables are optional; do not declare owner-gate overrides as automatically
 | `XBLOOM_STATE_DIR` | Canonical state root for `state.db`, bridge discovery/lock, history, catalog, and the default external runtime root. |
 | `XBLOOM_SKILL_STATE_DIR` | Legacy alias for the state root; used only when `XBLOOM_STATE_DIR` is unset (supported for v1). |
 | `XBLOOM_SKILL_RUNTIME_DIR` | Override only the external Python virtual-environment directory. |
-| `XBLOOM_CATALOG_PATH` | Override the private normalized catalog path; default is below the Skill state directory. |
+| `XBLOOM_CATALOG_PATH` | Deprecated state-root selector for the catalog (historical `catalog.json` path); runtime catalog is `state.db`. |
 | `XBLOOM_ACCOUNT_EMAIL` | Own-account email for ephemeral `catalog login-sync` or an approved `catalog push --apply`; never commit it. |
 | `XBLOOM_ACCOUNT_PASSWORD` | Own-account password for non-interactive login; never pass it as a CLI argument, print it, or commit it. Interactive use has a hidden prompt. |
 | `XBLOOM_CLOUD_CONFIG` | Point to an external own-account request form for advanced read-only recipe sync; never commit it. |
@@ -239,11 +239,11 @@ State layout under `~/.xbloom-studio-brew/` (or `XBLOOM_STATE_DIR` / legacy
 
 | Path | Role |
 | --- | --- |
-| `state.db` | SQLite/WAL authoritative runtime for workflows, history, and idempotency; recipe schema present; **catalog runtime still JSON** until catalog cutover |
+| `state.db` | SQLite/WAL authoritative runtime for workflows, history, idempotency, and catalog (`recipes` / `recipe_revisions`) |
 | `bridge.json` | Discovery only: instance id, pid, loopback host/port, token, core/protocol/record-format versions, config fingerprint |
 | `bridge.lock` | Lifecycle OS lock (one daemon per state root); not discovery |
 | `bridge.log` | Daemon stdout/stderr |
-| legacy `catalog/` | Still the catalog runtime writer until catalog cutover |
+| legacy `catalog/` | Import-only after catalog cutover; runtime never rewrites `catalog.json` |
 | legacy `brew-history.jsonl` | Import-only after history cutover; runtime never appends/rewrites it |
 | legacy `*-state.json` | Compatibility armed/tea/grinder files; optional explicit import via `state migrate` |
 
@@ -257,10 +257,12 @@ python scripts/xbloom.py state backup
 ```
 
 Migration is idempotent and observable. Status reports SQLite active for
-`workflow` / `history` / `idempotency` and `catalog_runtime: json_legacy`. Do not
-treat a completed migration receipt as full catalog cutover. Bridge wire protocol is
-**v3** (required hello + envelope; mutating RPCs require `request_id`); config
-fingerprint includes the effective BLE address.
+`workflow` / `history` / `idempotency` / `catalog` with independent receipts
+(`legacy_json_v1`, `legacy_history_sqlite_v1`, `legacy_catalog_sqlite_v1`). A
+normal migrate without `--force` backfills missing cutovers from `legacy_imports`
+without rereading originals. Bridge wire protocol is **v3** (required hello +
+envelope; mutating RPCs require `request_id`); config fingerprint includes the
+effective BLE address.
 
 Never publish tokens or private state. The server binds to loopback, requires the token on every
 JSON-line request, rejects incompatible clients before BLE writes (`hello` + protocol range),

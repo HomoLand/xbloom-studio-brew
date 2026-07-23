@@ -107,8 +107,9 @@ python scripts/xbloom.py history status
 python scripts/xbloom.py history list --limit 20
 ```
 
-The default catalog lives outside the installed Skill under
-`~/.xbloom-studio-brew/catalog/catalog.json`. Raw responses and credentials are not retained.
+The private catalog lives in `~/.xbloom-studio-brew/state.db` (`recipes` /
+`recipe_revisions`). Legacy `catalog/catalog.json` is import-only after migration;
+runtime never rewrites it. Raw responses and credentials are not retained.
 xPod and J20 records stay reference-only; validated Studio coffee and tea records export through
 their respective guarded YAML schemas. Ephemeral login, all five default read categories, and two
 explicitly owner-approved add-only writes were live-service verified against the China tenant on

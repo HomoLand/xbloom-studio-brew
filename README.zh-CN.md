@@ -95,7 +95,8 @@ python scripts/xbloom.py history status
 python scripts/xbloom.py history list --limit 20
 ```
 
-目录默认保存在安装目录外的 `~/.xbloom-studio-brew/catalog/catalog.json`，不会保留原始
+私有配方目录保存在 `~/.xbloom-studio-brew/state.db`（`recipes` /
+`recipe_revisions`）。迁移后遗留的 `catalog/catalog.json` 仅供导入，运行时不会改写。不会保留原始
 响应或凭据。xPod 与 J20 记录保持只读参考；通过校验的 Studio 咖啡和茶分别导出为受控 YAML。
 临时登录、默认五类读取以及两次经所有者明确批准的只新增写入，已于 2026-07-14 在中国区
 现网验证，包括云端回读与零写入幂等复验；凭据和会话只存在于进程内。宿主通过
