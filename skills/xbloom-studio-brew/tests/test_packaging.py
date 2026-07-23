@@ -248,12 +248,14 @@ def test_package_version_source_checkout_wins_over_stale_dist(monkeypatch):
 
     Reproduces checkout development via PYTHONPATH while an older wheel's
     metadata (e.g. 1.0.1) remains on the path: bridge identity must report
-    the source tree version (1.2.0), not the installed distribution.
+    the source tree version from packages/core, not the installed distribution.
     """
     import xbloom_ble
 
     source_version = _core_version()
-    assert source_version == "1.2.0", "fixture assumes packages/core is 1.2.0"
+    assert source_version and source_version != "unknown"
+    # Must match the live packages/core pin (do not hardcode a release number).
+    assert re.fullmatch(r"\d+\.\d+\.\d+", source_version), source_version
 
     # Adjacent source metadata must be discoverable in this worktree.
     pyproject = xbloom_ble._adjacent_pyproject()
