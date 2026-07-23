@@ -280,46 +280,75 @@ def test_persistent_setting_writes_require_owner_and_per_call_gates(monkeypatch)
     )
 
 
-def test_grinder_rest_interval_is_persisted(monkeypatch, tmp_path):
-    path = tmp_path / "grinder.json"
-    monkeypatch.setattr(xbloom, "GRINDER_STATE_FILE", path)
-    xbloom.reserve_grinder_rest(10)
-    with pytest.raises(RuntimeError, match="rest interval active"):
-        xbloom.require_grinder_rest()
+def test_cli_never_writes_or_reads_local_state_json(monkeypatch, tmp_path):
+    """CLI owns no *-state.json; grind validates then calls typed bridge only."""
+
+    # Isolate state root so we can assert no legacy JSON is created.
+    monkeypatch.setenv("XBLOOM_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(xbloom, "STATE_DIR", tmp_path)
+    monkeypatch.setenv(xbloom.REMOTE_GRINDER_ENV, xbloom.REMOTE_GRINDER_SENTINEL)
+    # Legacy path constants and local rest helpers are gone.
+    assert not hasattr(xbloom, "STATE_FILE")
+    assert not hasattr(xbloom, "TEA_STATE_FILE")
+    assert not hasattr(xbloom, "GRINDER_STATE_FILE")
+    assert not hasattr(xbloom, "state_write")
+    assert not hasattr(xbloom, "state_read")
+    assert not hasattr(xbloom, "state_clear")
+    assert not hasattr(xbloom, "require_grinder_rest")
+    assert not hasattr(xbloom, "reserve_grinder_rest")
+    assert not hasattr(xbloom, "ensure_no_loaded_workflow")
+
+    calls: list[dict] = []
+
+    class FakeTyped:
+        def grinder_start(self, **kwargs):
+            calls.append(dict(kwargs))
+            return {
+                "status": "running",
+                "workflow_id": "wf_cli_grind",
+                "rest_seconds": 60,
+                "size": kwargs["size"],
+                "rpm": kwargs["rpm"],
+                "runtime_s": kwargs["seconds"],
+            }
+
+    monkeypatch.setattr(xbloom, "make_bridge_client", lambda _a: FakeTyped())
+    args = xbloom.build_parser().parse_args(
+        [
+            "grind",
+            "--size",
+            "62",
+            "--rpm",
+            "100",
+            "--seconds",
+            "5",
+            "--confirm-ready",
+            xbloom.GRINDER_READY_SENTINEL,
+        ]
+    )
+    assert asyncio.run(xbloom.async_grind(args)) == 0
+    assert len(calls) == 1
+    assert calls[0]["size"] == 62
+    assert calls[0]["seconds"] == 5.0
+    # No legacy state JSON under the isolated state root.
+    for name in (
+        "armed-state.json",
+        "tea-loaded-state.json",
+        "grinder-rest-state.json",
+    ):
+        assert not (tmp_path / name).exists()
+        assert not (xbloom.STATE_DIR / name).exists()
 
 
-def test_corrupt_grinder_rest_record_blocks_motor(monkeypatch, tmp_path):
-    path = tmp_path / "grinder.json"
-    path.write_text("{not-json", encoding="utf-8")
-    monkeypatch.setattr(xbloom, "GRINDER_STATE_FILE", path)
-    with pytest.raises(RuntimeError, match="rest record is unreadable"):
-        xbloom.require_grinder_rest()
+def test_hardware_commands_no_longer_refuse_running_bridge(monkeypatch):
+    """A9: hardware commands use the daemon; they must not refuse a running bridge."""
 
-
-def test_unverified_bridge_grinder_stop_record_blocks_motor(monkeypatch, tmp_path):
-    path = tmp_path / "grinder.json"
-    path.write_text('{"in_progress": true}', encoding="utf-8")
-    monkeypatch.setattr(xbloom, "GRINDER_STATE_FILE", path)
-    with pytest.raises(RuntimeError, match="no verified stop"):
-        xbloom.require_grinder_rest()
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        "water",
-        "tea-brew",
-        "settings",
-        "set-settings",
-        "advanced",
-        "set-advanced",
-    ],
-)
-def test_one_shot_ble_commands_refuse_a_running_bridge(monkeypatch, command):
     monkeypatch.setattr(bridge_module, "bridge_is_running", lambda: True)
-    with pytest.raises(RuntimeError, match="owns Studio access"):
-        xbloom.ensure_bridge_not_running(command)
-    xbloom.ensure_bridge_not_running("validate")
+    # ensure_bridge_not_running is removed; validate remains non-hardware.
+    assert not hasattr(xbloom, "ensure_bridge_not_running") or not callable(
+        getattr(xbloom, "DIRECT_BLE_COMMANDS", None)
+    )
+    assert not hasattr(xbloom, "DIRECT_BLE_COMMANDS")
 
 
 def test_doctor_reports_unverified_live_adjust_gate(monkeypatch, capsys):
@@ -349,7 +378,9 @@ def test_doctor_reports_catalog_configuration_without_reading_secrets(
     monkeypatch.setattr(bridge_module, "bridge_is_running", lambda: False)
     assert xbloom.cmd_doctor(SimpleNamespace(scan=False, scan_timeout=0.1)) == 0
     report = json.loads(capsys.readouterr().out)
-    assert report["capabilities"]["catalog_path"] == str(catalog)
+    # Doctor honestly reports state.db as the catalog runtime path.
+    assert report["capabilities"]["catalog_path"] == str(tmp_path / "state.db")
+    assert report["capabilities"]["catalog_source"] == "state.db"
     assert report["capabilities"]["catalog_cloud_configured"] is True
     assert report["capabilities"]["catalog_login_configured"] is True
     assert report["capabilities"]["catalog_login_email_configured"] is True

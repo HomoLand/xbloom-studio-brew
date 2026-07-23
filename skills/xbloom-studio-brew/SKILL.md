@@ -106,9 +106,11 @@ python <skill-dir>/scripts/xbloom.py history list --limit 20
 python <skill-dir>/scripts/xbloom.py history note <event_id> "tasting notes"
 ```
 
-Treat “all” as all records in the supplied export or visible to the user's own account and region,
-not a global xBloom database. Keep the normalized catalog private: redistribution rights default
-to unknown. xPod and J20 entries are reference-only; tea exports use the dedicated tea path.
+The shared local catalog runtime is `state.db` (`recipes` / `recipe_revisions`), the same store
+used by Web recipe APIs. Legacy `catalog/catalog.json` is import-only after migration. Treat
+“all” as all records in the supplied export or visible to the user's own account and region, not a
+global xBloom database. Keep the normalized catalog private: redistribution rights default to
+unknown. xPod and J20 entries are reference-only; tea exports use the dedicated tea path.
 
 `login-sync` reads all five account categories by default. Those reads and two explicitly
 owner-approved add-only writes were live-service verified against the China tenant on 2026-07-14,
@@ -127,9 +129,10 @@ interaction. Never use a live account merely to test the write path; tests must 
 `--apply --confirm-delete own-account-cloud-recipe-delete`.
 
 `catalog history-sync` imports App brew-history records into the local journal so phone-only
-brews can still be reviewed. Local BLE runs are written automatically by `load`/`start`/
-`tea-start`/`tea-brew`/`monitor`/`cancel` into `~/.xbloom-studio-brew/brew-history.jsonl`.
-Use `history status|list|note` for dial-in review. App history is coarser than local telemetry.
+brews can still be reviewed. Confirmed terminal/cancel/stop history is written once by the
+bridge into `state.db` (`history_events`); Skill load/cancel/monitor paths do not duplicate
+that journal. Use `history status|list|note` for dial-in review. App history is coarser than
+local telemetry.
 
 ## Prepare local BLE
 
@@ -138,7 +141,10 @@ For a scale, grinder, or water request, also read `references/standalone-tools.m
 `references/tea-brewing.md`.
 
 Bootstrap once per user/Agent environment. The virtual environment is stored in the writable
-state directory, not inside the installed Skill, so upgrades and read-only package caches are safe:
+state directory, not inside the installed Skill, so upgrades and read-only package caches are safe.
+Release bundles install the exact vendored core wheel offline, then non-core deps from the
+universal hashed `requirements-runtime.lock` (`pip --require-hashes`); see
+`references/deployment.md`.
 
 ```text
 python <skill-dir>/scripts/bootstrap.py
@@ -170,12 +176,11 @@ python <skill-dir>/scripts/xbloom.py bridge connect
 python <skill-dir>/scripts/xbloom.py bridge events --since 0
 ```
 
-The bridge is the sole BLE owner while it runs. Direct one-shot BLE commands deliberately refuse
-to race it; use the matching `bridge` workflow or stop the idle daemon first. `bridge stop` refuses
-during an activity; `bridge stop --force` first sends that activity's guarded stop/cancel path.
-Bridge operations cover coffee, tea, scale, grinder, water, presets, persistent settings, advanced
-tuning, and continuous events. Read `references/deployment.md` for daemon state, external runtime,
-and deployment details.
+The bridge is the sole BLE owner. All active connection/machine commands (probe, load, start, tea,
+scale, grind, water, settings, cancel, save-slots, …) use typed bridge RPC through the daemon.
+Only passive `scan` / `doctor --scan` may call BLE discovery directly. `bridge stop` refuses during
+an activity; `bridge stop --force` first sends that activity's guarded stop/cancel path. Read
+`references/deployment.md` for daemon state, external runtime, and deployment details.
 
 ## Load without starting
 
@@ -188,11 +193,14 @@ python <skill-dir>/scripts/xbloom.py load <recipe.yaml>
 ```
 
 `load` performs its own read-only firmware/state preflight, transmits only guarded load frames,
-waits for the machine's `armed` state, and records the recipe hash. Confirm that JSON reports
-`"status": "armed"` and `"remote_start_sent": false`.
+waits for the machine's `armed` state, and returns a durable `workflow_id` with an immutable
+snapshot stored in `state.db`. Source YAML paths are provenance only after load; the SQLite
+snapshot is authoritative. Confirm that JSON reports `"status": "armed"`, a non-empty
+`"workflow_id"`, and `"remote_start_sent": false`. Legacy `armed-state.json` is import-only
+(via `xbloom-state migrate`) and is never written by runtime.
 
 Tell the user the machine is armed and can be approved physically. Do not run `probe` again while
-armed. To exit instead, run:
+a durable coffee workflow is active. To exit instead, run:
 
 ```text
 python <skill-dir>/scripts/xbloom.py cancel
@@ -208,23 +216,24 @@ in the current interaction—and measured vessel ice for `flash-brew`—and only
 owner has enabled remote start, run:
 
 ```text
-python <skill-dir>/scripts/xbloom.py start <same-recipe.yaml> --confirm-ready cup-filter-water-beans
+python <skill-dir>/scripts/xbloom.py start --workflow-id <id-from-load> --confirm-ready cup-filter-water-beans
 ```
 
-The recipe must be unchanged, armed on the same machine, and loaded less than five minutes ago.
-The command aggregates weight progress to at most one update per second and emits a final summary.
-Claim successful completion only when that summary reports `"completion_confirmed": true`.
-`"terminal_confirmed": true` means the workflow ended and allows the wrapper to clear its record;
-an `idle` terminal without `ready`/`complete` does not prove a successful cup. For listen-only
-telemetry, use:
+`start` uses `--workflow-id` or the bridge active durable coffee workflow. The optional positional
+recipe argument is ignored/deprecated CLI compatibility only and is never opened, validated, or
+hashed. After load, deleting or editing the source YAML does not change the immutable snapshot.
+Loaded recipes wait indefinitely for explicit start or cancel — there is **no** five-minute
+loaded expiry. Hardware commands go through the local bridge daemon (sole BLE owner); `monitor`
+only observes status/events and never connects, ensures, or mutates. Client exit does not release
+the brew. For listen-only observation of a running daemon workflow, use:
 
 ```text
-python <skill-dir>/scripts/xbloom.py monitor --duration 300
+python <skill-dir>/scripts/xbloom.py monitor --workflow-id <id> --duration 300
 ```
 
 If monitoring reaches its duration without a terminal machine state, `start` exits with code 3,
-reports `completion_unconfirmed`, and preserves the machine binding for `monitor` or `cancel`.
-Never interpret that timeout as a failed brew or a completed brew.
+reports `completion_unconfirmed`, and preserves durable workflow ownership for `monitor` or
+`cancel`. Never interpret that timeout as a failed brew or a completed brew.
 
 Interpret liquid telemetry as three separate measurements:
 
@@ -272,15 +281,21 @@ python <skill-dir>/scripts/xbloom.py tea-validate <tea.yaml>
 python <skill-dir>/scripts/xbloom.py tea-load <tea.yaml>
 ```
 
-`tea-load` only uploads the recipe. It must report `"status": "tea_loaded"` and
-`"remote_start_sent": false`. Execute only after the owner hot-water gate is enabled and the user
-currently confirms the Omni Tea Brewer, leaves, selected water supply, receiving vessel, and clear
-surroundings:
+`tea-load` only uploads the recipe and returns a durable `workflow_id` with an immutable
+snapshot in `state.db`. Source YAML paths are provenance only after load. It must report
+`"status": "tea_loaded"`, a non-empty `"workflow_id"`, and `"remote_start_sent": false`.
+Legacy `tea-loaded-state.json` is import-only and is never written by runtime. Execute only after
+the owner hot-water gate is enabled and the user currently confirms the Omni Tea Brewer, leaves,
+selected water supply, receiving vessel, and clear surroundings:
 
 ```text
-python <skill-dir>/scripts/xbloom.py tea-start <same-tea.yaml> \
+python <skill-dir>/scripts/xbloom.py tea-start --workflow-id <id-from-tea-load> \
   --confirm-ready tea-brewer-water-cup-clear
 ```
+
+`tea-start` uses `--workflow-id` or the bridge active durable tea workflow. The optional positional
+recipe argument is ignored/deprecated and is never opened or hashed. Deleting or editing source
+YAML after `tea-load` does not alter the stored snapshot.
 
 When load and execution should remain on one BLE connection, the same gates and checklist apply to:
 
@@ -345,10 +360,10 @@ python <skill-dir>/scripts/xbloom.py grind --size 62 --rpm 100 --seconds 10 \
   --confirm-ready beans-cup-clear
 ```
 
-Respect the persisted 60-second rest lock; do not delete it to retry. Standalone water is a
-hot-water action and uses the hot-water owner gate. Require a suitable centered vessel, available
-water at the selected source, the correct water path, and clear surroundings in the current
-interaction:
+Respect the durable 60-second grinder rest (`grinder_guard` in `state.db`); never invent or delete
+a JSON rest file to retry. Standalone water is a hot-water action and uses the hot-water owner
+gate. Require a suitable centered vessel, available water at the selected source, the correct
+water path, and clear surroundings in the current interaction:
 
 ```text
 python <skill-dir>/scripts/xbloom.py water --volume 250 --temp 85 --flow 3.5 \
@@ -374,9 +389,10 @@ python <skill-dir>/scripts/xbloom.py bridge resume
 ```
 
 For bridge grinder control, a missing start/pause/resume ACK triggers fail-closed STOP/QUIT and
-must not be retried past the persisted rest lock. For bridge water, claim completion only when
-`last_operation.result` is `complete`. A result of `completion_unconfirmed` or
-`safety_timeout_stopped`, or a phase of `control_unconfirmed`/`stop_unconfirmed`, requires
+must not be retried past the durable SQLite rest guard. Unconfirmed STOP retains recovery and the
+BLE link; prompt release runs only after a confirmed durable terminal. For bridge water, claim
+completion only when `last_operation.result` is `complete`. A result of `completion_unconfirmed`
+or `safety_timeout_stopped`, or a phase of `control_unconfirmed`/`stop_unconfirmed`, requires
 recovery and physical verification.
 
 The decoded FreeSolo live-temperature and live-pattern commands are intentionally separate from
@@ -461,16 +477,22 @@ instead of silently omitting it. Read `references/catalog.md` for the full repre
 - Multiple machines: select one with `--address` or `XBLOOM_ADDRESS`.
 - Unknown firmware: stop. Only the deployment owner may use the explicit override documented in
   `references/device-safety.md` after controlled validation.
-- Armed-state record exists: monitor or cancel; do not probe or load over it.
-- Completion is unconfirmed: leave the state record intact and run `monitor` or `cancel`; monitor
-  and cancel automatically reuse the recorded machine instead of scanning.
-- Tea-loaded-state record exists: execute the unchanged recipe while currently ready, or cancel.
-- Grinder cooldown active: wait for the reported remainder; never bypass the rest record.
-- Bridge running: do not start a direct BLE command. Use `bridge status`/`bridge events`, use the
-  matching bridge operation, or stop the idle daemon. If an activity is uncertain, keep the vessel
-  in place and use `bridge cancel` or the machine's physical control before `bridge stop --force`.
-- Bridge environment changed: restart the idle bridge; owner gates are captured by the daemon when
-  it starts. Never force-stop an activity merely to reload configuration.
+- Active durable coffee workflow (loaded/armed/unconfirmed): `bridge status` / `monitor` or
+  `cancel`; do not probe or load over it. Authoritative state is `state.db`, not
+  `armed-state.json` (import-only).
+- Completion is unconfirmed: leave the durable workflow intact and run `monitor --workflow-id …`
+  or `cancel`; do not retry start (retry protection is bridge-owned).
+- Active durable tea workflow (tea_loaded/unconfirmed): start with `--workflow-id` while currently
+  ready, or cancel. Authoritative state is `state.db`, not `tea-loaded-state.json` (import-only).
+- Grinder cooldown/recovery active: wait for `status.grinder_guard` remainder (or recover first).
+  Authoritative state is `state.db` via bridge `grinder_guard` (`ready` / `cooldown` /
+  `recovery_required` / `unavailable`); never invent or delete a JSON rest file.
+- Bridge activity uncertain: keep the vessel in place and use `cancel` / `bridge cancel` or the
+  machine's physical control before `bridge stop --force`. Top-level hardware commands already use
+  the daemon; they do not open a second direct BLE connection.
+- Bridge environment changed: restart the idle bridge only when no durable ownership/recovery;
+  owner gates are captured by the daemon when it starts. Never force-stop an activity merely to
+  reload configuration.
 - `WAIT` or slow drawdown: follow the physical checks in `references/recipe-design.md`, then change
   one recipe variable.
 - Interrupted or unsafe operation: run `cancel` and use the machine's physical control if BLE fails.

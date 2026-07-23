@@ -21,7 +21,7 @@ skill also completed its initial hardware validation on that firmware.
 | `load` | Writes guarded recipe frames and leaves the machine armed. Does not brew. | None |
 | `tea-validate` | Parses a local Omni Tea Brewer recipe. | None |
 | `tea-load` | Uploads tea cup geometry and recipe data; does not execute it. | None |
-| `monitor` | Subscribes to state and scale notifications. | None |
+| `monitor` | Observation-only: polls bridge status/events for a workflow; never connects, starts, cancels, or releases BLE. | None |
 | `scale` | Enters the electronic-scale screen, auto-zeros the entry load, optionally re-tares, streams grams, then exits. | No motor/water command |
 | `save-slots` | Persistently overwrites all three on-machine A/B/C presets. Does not brew. | None |
 | `cancel` | Cancels/exits an armed or active operation. | `0x47` cancel |
@@ -47,7 +47,7 @@ skill also completed its initial hardware validation on that firmware.
 
 1. Do not touch BLE when the user only asked for a recipe. Generate and validate the file.
 2. Use `scripts/xbloom.py`; never invoke the vendored client or raw protocol builders directly.
-3. Run `probe` only before loading, never while an armed-state record exists.
+3. Run `probe` only before loading, never while a durable coffee/tea workflow is active.
 4. Validate before load. Treat validation errors as blockers; do not weaken limits ad hoc.
 5. Load is the default device action. It arms the recipe and lets the user approve physically.
 6. Use `start`, `water`, or `tea-start` only when the deployment owner enabled hot-water actions
@@ -133,14 +133,17 @@ disabled until the deployment owner sets:
 XBLOOM_ENABLE_REMOTE_START=I_UNDERSTAND_REMOTE_HOT_WATER
 ```
 
-The command additionally requires an exact readiness argument and a recipe loaded less than five
-minutes earlier on the same machine with an unchanged file hash:
+The command additionally requires an exact readiness argument and a durable `workflow_id` from
+`load` / `tea-load` (or the bridge active durable workflow). After load, the immutable
+`state.db` snapshot is authoritative; source YAML paths are provenance only and are not re-read
+or re-hashed on start. Loaded recipes wait indefinitely for explicit start or cancel — there is
+**no** five-minute loaded expiry:
 
 ```text
-python scripts/xbloom.py start recipe.yaml --confirm-ready cup-filter-water-beans
+python scripts/xbloom.py start --workflow-id <id-from-load> --confirm-ready cup-filter-water-beans
 ```
 
-These gates prevent accidental or stale starts. They do not prove physical safety, so current-turn
+These gates prevent accidental starts. They do not prove physical safety, so current-turn
 user confirmation remains mandatory.
 
 For a local `flash-brew` serving, that current-turn confirmation must also cover the measured ice
@@ -224,32 +227,57 @@ python scripts/xbloom.py grind --size 62 --rpm 100 --seconds 10 \
   --confirm-ready beans-cup-clear
 ```
 
-Each run is limited to 30 seconds. The wrapper records a conservative runtime-plus-60-second block
-under the state directory before sending START. Do not delete or relocate that record to bypass a
-cooldown. STOP and QUIT are attempted from a `finally` block on normal errors or interruption;
-physical controls remain the final fallback if the process or BLE adapter fails completely.
+Each run is limited to 30 seconds. Authority for ownership and the post-stop rest lives only in
+SQLite `state.db` (bridge `status.grinder_guard`). There is no runtime CLI/wrapper
+`grinder-rest-state.json` reserve/`in_progress` file:
+
+1. **Before any motor write:** create a durable nonterminal grinder workflow (snapshot +
+   `workflow_id`). That row is the sole recovery marker if the daemon dies mid-grind.
+2. **Confirmed STOP:** terminal event/last_operation include `grinder_stopped_at`,
+   `grinder_cooldown_until` (or `blocked_until` on migrated payloads), and
+   `grinder_rest_seconds` (60). `grinder_guard.state` becomes `cooldown` until the deadline.
+3. **60-second guard:** a fresh `grinder.start` is blocked pre-BLE while `grinder_guard` is
+   `cooldown` or `recovery_required`. Exact completed `request_id` duplicates still return the
+   SQLite-cached result **before** cooldown/activity/BLE gates (no second motor write).
+4. **Unconfirmed STOP:** retain `recovery_required`, keep the active workflow and BLE link; do
+   not prompt-release. Physical stop is the final fallback if the process or adapter fails.
+5. **Prompt BLE release:** only after a confirmed durable terminal commit (cooldown fields
+   recorded). Restart cancel of a reconstructed nonterminal grinder reconnects once for STOP
+   only (no auto-start).
+
+`grinder_guard` states: `ready`, `cooldown`, `recovery_required`, `unavailable` (fail closed).
+Legacy `grinder-rest-state.json` is import-only via explicit `state migrate`; runtime never
+reads or writes it.
 
 ## Recovery
 
 Use the least invasive recovery path:
 
-1. Stop monitoring with Ctrl+C if only the terminal is stuck.
-2. If `start`/`tea-start` reports `completion_unconfirmed` (exit 3), run `monitor` to reattach or
-   `cancel` to stop. Both commands reuse the machine address stored by load and do not scan first.
-3. Run `python scripts/xbloom.py cancel` for an armed, waiting, or active workflow.
+1. Stop monitoring with Ctrl+C if only the terminal is stuck (observation-only; does not release BLE).
+2. If `start`/`tea-start` reports `completion_unconfirmed` (exit 3), run
+   `monitor --workflow-id …` to reattach or `cancel` to stop. Durable workflow ownership is in
+   `state.db`; do not retry start (bridge owns retry protection).
+3. Run `python scripts/xbloom.py cancel` for an armed, waiting, or active durable workflow.
 4. Use the machine's physical cancel control if BLE is unavailable.
 5. Move the cup only after the machine has stopped dispensing.
-6. If the local armed-state file is stale, run `cancel` once to clear it safely.
+6. If a durable coffee/tea workflow is stale or unconfirmed after a daemon restart, inspect
+   `bridge status`, run `recovery.reconcile` when appropriate, or `cancel` once. Do not treat
+   legacy `armed-state.json` / `tea-loaded-state.json` as runtime gates (import-only migration
+   inputs).
 
 For a bridge-owned activity, inspect `bridge status` and `bridge events` first, then use
 `bridge cancel`. An idle `bridge stop` is clean; `bridge stop --force` may send a physical stop and
 must be treated as an action, not process cleanup. If the bridge process crashes during grinding,
-its persisted `in_progress` rest record intentionally blocks another run until the operator has
-confirmed the machine stopped and the conservative cooldown has elapsed.
+the durable nonterminal grinder workflow surfaces as `grinder_guard.state=recovery_required` and
+blocks another start until the operator cancel/recovers (one-shot reconnect for STOP only) and any
+confirmed 60-second cooldown has elapsed.
 
-Coffee, tea, grinder-rest, bridge endpoint/token, bridge log, and the external Python runtime live under
-`~/.xbloom-studio-brew/` by default. Override the directory with `XBLOOM_SKILL_STATE_DIR` for tests
-or managed deployments; `XBLOOM_SKILL_RUNTIME_DIR` can override only the virtual environment. The
-bridge binds only to loopback and authenticates each JSON-line request
-with its random local token; this is local process isolation, not a remotely exposed security
-boundary.
+Durable coffee/tea/grinder workflows and immutable snapshots live in SQLite `state.db`. Legacy
+`*-state.json` (`armed-state.json`, `tea-loaded-state.json`, `grinder-rest-state.json`) is
+import-only via explicit migration and is never read or written by runtime. Bridge endpoint/token,
+bridge log, and the external Python runtime also live under `~/.xbloom-studio-brew/` by default.
+Override the directory with `XBLOOM_STATE_DIR` (canonical) or legacy `XBLOOM_SKILL_STATE_DIR` for
+tests or managed deployments; `XBLOOM_SKILL_RUNTIME_DIR` can override only the virtual environment.
+The bridge binds only to loopback, holds a lifecycle `bridge.lock`, and authenticates each
+JSON-line request with its random local token (never exposed via `status`/`hello`); this is local
+process isolation, not a remotely exposed security boundary.

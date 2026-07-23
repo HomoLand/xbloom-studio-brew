@@ -180,7 +180,24 @@ class XBloomClient:
         self._event_listeners: set[
             Callable[[StatusEvent], Awaitable[None] | None]
         ] = set()
+        # Disconnect observers (bridge recovery). Listeners receive expected=True
+        # only for bridge-initiated close/disconnect; unexpected BLE drops use
+        # expected=False so recovery is never invented for prompt/explicit release.
+        self._disconnect_listeners: set[
+            Callable[[bool], Awaitable[None] | None]
+        ] = set()
         self._command_waiters: dict[int, set[asyncio.Future[StatusEvent]]] = {}
+        # When True, the next Bleak disconnected_callback is bridge-initiated.
+        self._expecting_disconnect: bool = False
+        # Disconnect-aware wait state: transport loss must wake ACK and queue
+        # waiters with XBloomError (not Future.cancel → CancelledError). Genuine
+        # caller task cancellation still propagates as CancelledError.
+        self._connect_generation: int = 0
+        self._link_lost_event: asyncio.Event = asyncio.Event()
+        self._link_lost_error: XBloomError | None = None
+        # Event starts set so pre-connect waits fail closed immediately.
+        self._link_lost_event.set()
+        self._link_lost_error = XBloomError("not connected")
 
     # ------------------------------------------------------------------
     # Connection
@@ -189,6 +206,105 @@ class XBloomClient:
     def is_connected(self) -> bool:
         """True while the underlying BLE link is up (for held-connection callers)."""
         return self._client is not None and self._client.is_connected
+
+    def _begin_link_session(self) -> None:
+        """Mark the GATT link live for disconnect-aware waiters."""
+
+        self._link_lost_error = None
+        self._link_lost_event = asyncio.Event()  # clear: waiters race this vs queue
+
+    def _fail_waiters_link_lost(self, message: str) -> XBloomError:
+        """Wake all ACK/queue waiters with a domain error (never Future.cancel)."""
+
+        err = self._link_lost_error
+        if err is None:
+            err = XBloomError(message)
+            self._link_lost_error = err
+        # Idempotent: already-failed waiters stay failed.
+        for waiters in list(self._command_waiters.values()):
+            for future in list(waiters):
+                if not future.done():
+                    future.set_exception(err)
+        self._command_waiters.clear()
+        self._link_lost_event.set()
+        return err
+
+    def _on_bleak_disconnected(self, _client: object) -> None:
+        """Bleak link-down callback: classify expected vs unexpected for listeners."""
+
+        expected = bool(self._expecting_disconnect)
+        self._expecting_disconnect = False
+        # Drop local session flags; address is retained so the bridge can
+        # reconnect for explicit recovery without re-scanning.
+        self._subscribed = False
+        self._session_active = False
+        self._consuming = False
+        # Transport loss must surface as XBloomError so bridge RPC handlers
+        # convert to BridgeError / recovery_required — not CancelledError.
+        self._fail_waiters_link_lost(
+            "BLE disconnected"
+            if expected
+            else "BLE link lost (unexpected disconnect)"
+        )
+        self._notification_stream.reset()
+        # Keep _client reference until explicit disconnect/cleanup so is_connected
+        # correctly reports False via Bleak's is_connected while listeners run.
+        self._dispatch_disconnect(expected=expected)
+
+    def _dispatch_disconnect(self, *, expected: bool) -> None:
+        for listener in tuple(self._disconnect_listeners):
+            try:
+                result = listener(expected)
+                if asyncio.iscoroutine(result):
+                    asyncio.create_task(result)
+            except Exception:  # pragma: no cover - observers must never break BLE I/O
+                log.exception("xBloom disconnect listener failed")
+
+    def mark_disconnect_expected(self) -> None:
+        """Mark the next disconnect as bridge-initiated (no recovery signal)."""
+
+        self._expecting_disconnect = True
+
+    def add_disconnect_listener(
+        self, listener: Callable[[bool], Awaitable[None] | None]
+    ) -> None:
+        """Observe link loss. Listener receives ``expected`` (bool)."""
+
+        self._disconnect_listeners.add(listener)
+
+    def remove_disconnect_listener(
+        self, listener: Callable[[bool], Awaitable[None] | None]
+    ) -> None:
+        self._disconnect_listeners.discard(listener)
+
+    async def _abandon_partial_client(self, client: object, *, message: str) -> None:
+        """Best-effort release of a half-open Bleak handle before dropping ownership.
+
+        If ``BleakClient.connect()`` partially establishes the OS/GATT session and
+        then raises, we must disconnect *that exact* client while we still hold the
+        reference. Clearing ``self._client`` first would strand the radio so a later
+        :meth:`disconnect` (e.g. bridge outer cleanup) finds nothing to tear down.
+        """
+
+        try:
+            # Expected cleanup: do not invent unexpected-drop recovery.
+            self._expecting_disconnect = True
+            if client is not None and bool(getattr(client, "is_connected", False)):
+                try:
+                    await client.disconnect()  # type: ignore[union-attr]
+                except Exception:  # pragma: no cover - best-effort radio release
+                    log.debug(
+                        "best-effort disconnect after connect failure failed",
+                        exc_info=True,
+                    )
+        finally:
+            if self._client is client:
+                self._client = None
+            self._subscribed = False
+            self._session_active = False
+            self._consuming = False
+            self._fail_waiters_link_lost(message)
+            self._expecting_disconnect = False
 
     async def connect(self) -> None:
         from bleak import BleakClient
@@ -200,26 +316,83 @@ class XBloomClient:
             return
         log.info("connecting to %s…", self.address)
         self._notification_stream.reset()
-        self._client = BleakClient(self.address)
-        await self._client.connect()
-        if not self._client.is_connected:
+        self._expecting_disconnect = False
+        # Invalidate any pre-connect waiters; link is not live until connect
+        # succeeds and _begin_link_session runs.
+        self._connect_generation += 1
+        connect_gen = self._connect_generation
+        self._fail_waiters_link_lost("not connected")
+        client = BleakClient(
+            self.address, disconnected_callback=self._on_bleak_disconnected
+        )
+        self._client = client
+        try:
+            await client.connect()
+        except BaseException as original:
+            # Partial OS/GATT handle may already be up: disconnect it first, then
+            # clear ownership. Always re-raise the original exception (including
+            # genuine CancelledError); never let cleanup replace it.
+            try:
+                await self._abandon_partial_client(
+                    client, message="BLE connect failed"
+                )
+            except BaseException:
+                pass
+            raise original
+        if connect_gen != self._connect_generation:
+            # Superseded by a newer connect/disconnect race.
+            try:
+                await self._abandon_partial_client(
+                    client, message=f"connect to {self.address} was superseded"
+                )
+            except BaseException:
+                pass
+            raise XBloomError(f"connect to {self.address} was superseded")
+        if not client.is_connected:
+            try:
+                await self._abandon_partial_client(
+                    client, message=f"failed to connect to {self.address}"
+                )
+            except BaseException:
+                pass
             raise XBloomError(f"failed to connect to {self.address}")
+        # Connect succeeded: open a fresh link session so waiters are live.
+        # A drop that raced through the callback after connect will re-fail waiters
+        # and clear is_connected; callers observe that on the next I/O.
+        self._begin_link_session()
+        if not client.is_connected:
+            # Lost between connect-return and session begin.
+            lost = self._link_lost_error or XBloomError(
+                "BLE link lost during connect"
+            )
+            try:
+                await self._abandon_partial_client(
+                    client, message="BLE link lost during connect"
+                )
+            except BaseException:
+                pass
+            raise lost
         log.info("connected")
 
     async def disconnect(self) -> None:
-        if self._client is not None and self._client.is_connected:
-            await self._client.disconnect()
-            log.info("disconnected")
-        for waiters in self._command_waiters.values():
-            for future in waiters:
-                if not future.done():
-                    future.cancel()
-        self._command_waiters.clear()
-        self._client = None
-        self._subscribed = False
-        self._session_active = False
-        self._consuming = False
-        self._notification_stream.reset()
+        # Bridge-initiated close: mark expected *before* Bleak disconnect so the
+        # disconnected_callback never surfaces recovery for prompt/explicit release.
+        self._expecting_disconnect = True
+        self._connect_generation += 1  # supersede any in-flight connect
+        try:
+            if self._client is not None and self._client.is_connected:
+                await self._client.disconnect()
+                log.info("disconnected")
+        finally:
+            # If Bleak already fired the callback, waiters were woken with a
+            # domain error. If not (already down / no callback), wake them now.
+            self._fail_waiters_link_lost("BLE disconnected")
+            self._client = None
+            self._subscribed = False
+            self._session_active = False
+            self._consuming = False
+            self._notification_stream.reset()
+            self._expecting_disconnect = False
 
     async def open_session(self, *, settle: float = 0.3) -> None:
         """Register as an app-style session so the machine shows it's **connected**.
@@ -325,6 +498,22 @@ class XBloomClient:
     ) -> None:
         self._event_listeners.discard(listener)
 
+    def simulate_unexpected_disconnect(self) -> None:
+        """Test helper: fire unexpected disconnect without a real Bleak drop.
+
+        Production code uses Bleak's ``disconnected_callback``. Fake / unit
+        tests that inject a bare client can call this to exercise recovery.
+        """
+
+        if self.is_connected and self._client is not None:
+            # Mirror a hard link drop: mark underlying fake as disconnected when
+            # possible, then dispatch unexpected.
+            try:
+                self._client.is_connected = False  # type: ignore[union-attr]
+            except Exception:
+                pass
+        self._on_bleak_disconnected(self._client)
+
     async def send_command(
         self,
         frame: bytes,
@@ -340,16 +529,29 @@ class XBloomClient:
         the same event; observing an ACK here never steals it from another workflow.
         When ``response_optional`` is true, a completed BLE write with no matching
         report returns ``None`` instead of pretending that the physical write failed.
+        Link loss fails the ACK waiter with :class:`XBloomError` (not CancelledError).
         """
         if self._client is None or not self._client.is_connected:
-            raise XBloomError("not connected")
+            raise self._link_lost_error or XBloomError("not connected")
         await self._ensure_subscribed()
         future: asyncio.Future[StatusEvent] | None = None
         if expect_command is not None:
             future = asyncio.get_running_loop().create_future()
             self._command_waiters.setdefault(int(expect_command), set()).add(future)
+            # Link may have dropped between the is_connected check and register.
+            if self._link_lost_error is not None and self._link_lost_event.is_set():
+                if not future.done():
+                    future.set_exception(self._link_lost_error)
         try:
             async with self._write_lock:
+                if self._client is None or not self._client.is_connected:
+                    # Link may have set_exception on the ACK future while we
+                    # waited for the write lock. Prefer awaiting that future so
+                    # the exception is retrieved (avoids "Future exception was
+                    # never retrieved") and surfaces the transport-loss error.
+                    if future is not None and future.done() and not future.cancelled():
+                        return await future
+                    raise self._link_lost_error or XBloomError("not connected")
                 await self._client.write_gatt_char(CHAR_COMMAND, bytes(frame), response=False)
             if future is None:
                 return None
@@ -363,6 +565,11 @@ class XBloomClient:
                 raise XBloomError(
                     f"timed out waiting for command 0x{int(expect_command):04x}"
                 ) from None
+            except XBloomError:
+                raise
+            except asyncio.CancelledError:
+                # Genuine caller/task cancellation only — transport loss uses set_exception.
+                raise
         finally:
             if future is not None:
                 waiters_for_command = self._command_waiters.get(int(expect_command))
@@ -370,11 +577,19 @@ class XBloomClient:
                     waiters_for_command.discard(future)
                     if not waiters_for_command:
                         self._command_waiters.pop(int(expect_command), None)
+                # If we raised without awaiting the future (any early-exit path),
+                # retrieve a completed non-cancelled exception so the event loop
+                # does not log "Future exception was never retrieved".
+                if future.done() and not future.cancelled():
+                    try:
+                        future.exception()
+                    except Exception:  # pragma: no cover - retrieval is best-effort
+                        pass
 
     async def _ensure_subscribed(self) -> None:
         """Subscribe to ffe2 status notifications (idempotent)."""
         if self._client is None or not self._client.is_connected:
-            raise XBloomError("not connected")
+            raise self._link_lost_error or XBloomError("not connected")
         if self._subscribed:
             return
         await self._client.start_notify(CHAR_STATUS, self._on_notify)
@@ -402,6 +617,54 @@ class XBloomClient:
         self._subscribed = False
         self._notification_stream.reset()
 
+    async def _await_notification(self, timeout: float) -> StatusEvent:
+        """Next queued notification, or fail promptly when the BLE link drops.
+
+        Transport loss raises :class:`XBloomError`. Caller task cancellation
+        still propagates as :class:`asyncio.CancelledError`. Timeout raises
+        :class:`asyncio.TimeoutError` (callers map it to domain errors as needed).
+        """
+
+        if self._link_lost_error is not None and self._link_lost_event.is_set():
+            raise self._link_lost_error
+        if self._client is None or not self._client.is_connected:
+            raise self._link_lost_error or XBloomError("not connected")
+
+        timeout = max(0.0, float(timeout))
+        get_task = asyncio.create_task(self._notif_queue.get())
+        lost_task = asyncio.create_task(self._link_lost_event.wait())
+        try:
+            done, pending = await asyncio.wait(
+                {get_task, lost_task},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            get_task.cancel()
+            lost_task.cancel()
+            raise
+        for task in pending:
+            task.cancel()
+        # Drain cancellations without suppressing a completed get result.
+        for task in pending:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        if get_task in done and not get_task.cancelled():
+            # Prefer a real notification if both completed in the same tick.
+            return get_task.result()
+        if lost_task in done or (
+            self._link_lost_error is not None and self._link_lost_event.is_set()
+        ):
+            # Cancelled get_task may still hold a queued item — best-effort drain
+            # is unnecessary; next consumer starts with a clean queue.
+            raise self._link_lost_error or XBloomError(
+                "BLE disconnected while waiting for notification"
+            )
+        raise asyncio.TimeoutError()
+
     async def _drain_until_state(self, state: int, timeout: float) -> StatusEvent:
         """Wait for a status event whose state byte equals ``state``."""
         loop = asyncio.get_event_loop()
@@ -413,7 +676,7 @@ class XBloomClient:
                     f"timed out waiting for state 0x{state:02x} after {timeout:.0f}s"
                 )
             try:
-                event = await asyncio.wait_for(self._notif_queue.get(), timeout=remaining)
+                event = await self._await_notification(remaining)
             except asyncio.TimeoutError:
                 raise XBloomError(
                     f"timed out waiting for state 0x{state:02x} after {timeout:.0f}s"
@@ -435,7 +698,7 @@ class XBloomClient:
                     f"timed out waiting for command 0x{command:04x} after {timeout:.0f}s"
                 )
             try:
-                event = await asyncio.wait_for(self._notif_queue.get(), timeout=remaining)
+                event = await self._await_notification(remaining)
             except asyncio.TimeoutError:
                 raise XBloomError(
                     f"timed out waiting for command 0x{command:04x} after {timeout:.0f}s"
@@ -457,7 +720,7 @@ class XBloomClient:
             if remaining <= 0:
                 return None
             try:
-                event = await asyncio.wait_for(self._notif_queue.get(), timeout=remaining)
+                event = await self._await_notification(remaining)
             except asyncio.TimeoutError:
                 return None
             dispensed = event.dispensed_water_ml
@@ -558,7 +821,10 @@ class XBloomClient:
     # ------------------------------------------------------------------
     async def _drain_for_any(self, states: set[int], timeout: float) -> StatusEvent | None:
         """Return the first status event whose state is in ``states``, or ``None`` on
-        timeout. Skips heartbeats; consumes intervening frames."""
+        timeout. Skips heartbeats; consumes intervening frames.
+
+        Link loss raises :class:`XBloomError` immediately (not a silent ``None``).
+        """
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
         while True:
@@ -566,7 +832,7 @@ class XBloomClient:
             if remaining <= 0:
                 return None
             try:
-                event = await asyncio.wait_for(self._notif_queue.get(), timeout=remaining)
+                event = await self._await_notification(remaining)
             except asyncio.TimeoutError:
                 return None
             if event.is_heartbeat:
@@ -585,6 +851,8 @@ class XBloomClient:
         returning on the first 0x1e creates a start/pause race. Consume the complete
         observation window, returning early only for an acted/refusal state, while
         remembering whether awaiting-confirm was actually observed.
+
+        Link loss raises :class:`XBloomError` immediately.
         """
 
         loop = asyncio.get_event_loop()
@@ -595,7 +863,7 @@ class XBloomClient:
             if remaining <= 0:
                 return None, saw_awaiting_confirm
             try:
-                event = await asyncio.wait_for(self._notif_queue.get(), timeout=remaining)
+                event = await self._await_notification(remaining)
             except asyncio.TimeoutError:
                 return None, saw_awaiting_confirm
             if event.is_heartbeat:
@@ -852,9 +1120,7 @@ class XBloomClient:
                 if remaining <= 0:
                     return
                 try:
-                    event = await asyncio.wait_for(
-                        self._notif_queue.get(), timeout=remaining
-                    )
+                    event = await self._await_notification(remaining)
                 except asyncio.TimeoutError:
                     return
                 if event.scale_g is None:
@@ -1391,7 +1657,7 @@ class XBloomClient:
                     log.info("telemetry duration elapsed")
                     return
                 try:
-                    event = await asyncio.wait_for(self._notif_queue.get(), timeout=remaining)
+                    event = await self._await_notification(remaining)
                 except asyncio.TimeoutError:
                     log.info("telemetry duration elapsed")
                     return

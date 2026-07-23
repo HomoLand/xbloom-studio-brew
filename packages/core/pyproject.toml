@@ -1,0 +1,36 @@
+[build-system]
+# Exact pin for byte-for-byte reproducible wheels (see tools/build_release.py).
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xbloom-studio-core"
+version = "1.2.0"
+description = "Core BLE protocol, recipe validation, catalog, and history for xBloom Studio. Shared by the Agent Skill and the Web UI; contains no Agent-coupled logic."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "HomoLand" }]
+dependencies = [
+    "bleak==3.0.2",
+    "PyYAML==6.0.3",
+]
+
+[project.urls]
+Repository = "https://github.com/HomoLand/xbloom-studio-brew"
+Issues = "https://github.com/HomoLand/xbloom-studio-brew/issues"
+
+[project.scripts]
+xbloom-bridge = "xbloom_ble.bridge:main"
+xbloom-state = "xbloom_storage:main"
+
+[tool.setuptools]
+py-modules = [
+    "xbloom_paths",
+    "xbloom_safety",
+    "xbloom_catalog",
+    "xbloom_history",
+    "xbloom_knowledge",
+    "xbloom_storage",
+]
+packages = ["xbloom_ble"]

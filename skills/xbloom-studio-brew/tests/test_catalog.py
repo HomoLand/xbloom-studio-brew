@@ -7,6 +7,7 @@ import pytest
 
 import xbloom
 import xbloom_catalog
+import xbloom_storage as storage
 from xbloom_ble.recipe import Recipe
 from xbloom_ble.tea import TeaRecipe
 from xbloom_catalog import (
@@ -211,7 +212,10 @@ def test_easy_mode_snapshot_merges_slot_without_duplicate_recipe():
 
     assert stats["updated"] == 1
     assert stats["total"] == 1
-    assert get_entry(catalog, "101")["slots"] == [{"position": "A", "scale": True}]
+    merged = get_entry(catalog, "101")
+    # Public id must survive pure in-memory merge (envelope normalize strips it).
+    assert merged["id"] == "xbloom:101"
+    assert merged["slots"] == [{"position": "A", "scale": True}]
 
 
 def test_bad_easy_metadata_does_not_abort_recipe_import():
@@ -240,9 +244,13 @@ def test_decoded_mmkv_json_and_catalog_round_trip(tmp_path):
     stats = import_json_file(catalog, source, source_type="mmkv-json")
     assert stats["added"] == 1
 
+    # Runtime selector path: state root is parent of catalog.json; never writes JSON.
     catalog_path = tmp_path / "private" / "catalog.json"
-    save_catalog(catalog, catalog_path)
+    db_path = save_catalog(catalog, catalog_path)
+    assert db_path.name == "state.db"
+    assert not catalog_path.exists()
     loaded = load_catalog(catalog_path)
+    assert loaded["source"] == "state.db"
     assert get_entry(loaded, "101")["sources"][0]["file"] == source.name
 
 
@@ -620,9 +628,13 @@ def test_login_sync_cli_reads_password_only_from_environment(
     assert observed["language_type"] == 3
     assert email not in output
     assert password not in output
-    saved = path.read_text(encoding="utf-8")
-    assert email not in saved
-    assert password not in saved
+    # Catalog runtime is state.db; legacy selector path is never written.
+    assert not path.exists()
+    db = tmp_path / "state.db"
+    assert db.is_file()
+    raw = db.read_bytes()
+    assert email.encode("utf-8") not in raw
+    assert password.encode("utf-8") not in raw
 
 
 def test_cloud_config_rejects_wrong_field_types_and_non_studio_sync(tmp_path):
@@ -879,6 +891,7 @@ def test_loading_legacy_catalog_adds_manual_ice_semantics(tmp_path):
 
     path = tmp_path / "catalog.json"
     save_catalog({**empty_catalog(), "entries": [entry]}, path)
+    assert not path.exists()
     loaded = load_catalog(path)
     migrated = get_entry(loaded, "779")
 
@@ -1203,6 +1216,135 @@ def test_catalog_delete_defaults_to_offline_preview_without_credentials(
     assert output["endpoint"] == "tuRecipeDelete.tuhtml"
 
 
+def test_catalog_delete_apply_soft_archives_mapped_sqlite_recipe(
+    monkeypatch, tmp_path, capsys
+):
+    """Applied cloud delete soft-archives the exact mapped SQLite recipe.
+
+    Network helpers are mocked. Revisions are retained, catalog.json is never
+    written, and CLI output uses honest archive semantics.
+    """
+
+    email = "account@example.test"
+    password = "private-password"
+    token = "private-session-token"
+    remote = {
+        **_coffee(table_id=777),
+        "appPlace": [4],
+        "theName": "Mapped Cloud Coffee",
+    }
+    selector = tmp_path / "catalog" / "catalog.json"
+    store = storage.StateStore(tmp_path)
+    store.ensure_schema()
+    entry = {
+        "id": "mapped-cloud",
+        "name": "Mapped Cloud Coffee",
+        "kind": "coffee",
+        "origin": "created",
+        "table_id": 777,
+        "executable": True,
+        "slot_compatible": False,
+        "sources": [{"type": "fixture", "file": "t.json"}],
+        "recipe": {
+            "name": "Mapped Cloud Coffee",
+            "kind": "hot",
+            "dose_g": 15,
+            "grind": 50,
+            "pours": [
+                {
+                    "ml": 45,
+                    "temp_c": 92,
+                    "pattern": "spiral",
+                    "pause_s": 30,
+                    "flow_ml_s": 3.0,
+                    "vibration": "after",
+                    "rpm": 90,
+                },
+                {
+                    "ml": 180,
+                    "temp_c": 92,
+                    "pattern": "spiral",
+                    "pause_s": 0,
+                    "flow_ml_s": 3.2,
+                    "vibration": "none",
+                    "rpm": 90,
+                },
+            ],
+        },
+    }
+    store.merge_catalog_entries([entry], source="test")
+    rid = storage.recipe_id_for_catalog_entry_id("mapped-cloud")
+    revs_before = store.list_recipe_revisions(rid)
+    assert len(revs_before) == 1
+    store.close()
+
+    def request(**kwargs):
+        if kwargs["endpoint"] == xbloom_catalog.LOGIN_ENDPOINT:
+            return {
+                "result": "success",
+                "token": token,
+                "member": {"tableId": 42},
+            }
+        if kwargs["endpoint"] == xbloom_catalog.ENDPOINTS["created"]:
+            return {"result": "success", "list": [remote]}
+        assert kwargs["endpoint"] == xbloom_catalog.RECIPE_DELETE_ENDPOINT
+        assert kwargs["form"]["tableId"] == 777
+        return {"result": "success"}
+
+    monkeypatch.setattr(xbloom, "reexec_in_local_runtime", lambda: None)
+    monkeypatch.setattr(xbloom_catalog, "_cloud_request", request)
+    monkeypatch.setenv(xbloom.ACCOUNT_EMAIL_ENV, email)
+    monkeypatch.setenv(xbloom.ACCOUNT_PASSWORD_ENV, password)
+
+    assert (
+        xbloom.main(
+            [
+                "catalog",
+                "--catalog-file",
+                str(selector),
+                "delete",
+                "--region",
+                "china",
+                "--table-id",
+                "777",
+                "--apply",
+                "--confirm-delete",
+                CLOUD_DELETE_CONFIRM_SENTINEL,
+            ]
+        )
+        == 0
+    )
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "deleted"
+    assert output["write_performed"] is True
+    assert output["remote_table_id"] == 777
+    assert output["local_catalog_archived"] is True
+    assert "local_catalog_removed" not in output
+    assert output["local_recipe_id"] == rid
+    assert output["local_entry_id"] == "mapped-cloud"
+    assert output.get("local_archived_at")
+
+    # catalog.json never written; SQLite soft-archive only.
+    assert not selector.exists()
+    verify = storage.StateStore(tmp_path)
+    recipe = verify.get_recipe(rid)
+    assert recipe is not None
+    assert recipe["archived_at"] is not None
+    revs_after = verify.list_recipe_revisions(rid)
+    assert len(revs_after) == 1
+    assert revs_after[0]["revision_id"] == revs_before[0]["revision_id"]
+    active = verify.build_catalog_snapshot(include_derived=False)
+    assert active["entries"] == []
+    archived_snap = verify.build_catalog_snapshot(
+        include_derived=False, include_archived=True
+    )
+    assert any(e["id"] == "mapped-cloud" for e in archived_snap["entries"])
+    verify.close()
+    serialised = json.dumps(output)
+    for secret in (email, password, token):
+        assert secret not in serialised
+
+
 def test_fetch_cloud_brew_records_normalises_group_payload(monkeypatch):
     calls = []
 
@@ -1253,6 +1395,7 @@ def test_fetch_cloud_brew_records_normalises_group_payload(monkeypatch):
 def test_catalog_history_sync_imports_into_local_journal(monkeypatch, tmp_path, capsys):
     history_file = tmp_path / "brew-history.jsonl"
     monkeypatch.setenv(xbloom.HISTORY_PATH_ENV, str(history_file))
+    monkeypatch.setenv("XBLOOM_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(xbloom, "reexec_in_local_runtime", lambda: None)
     monkeypatch.setenv(xbloom.ACCOUNT_EMAIL_ENV, "account@example.test")
     monkeypatch.setenv(xbloom.ACCOUNT_PASSWORD_ENV, "private-password")
@@ -1286,7 +1429,11 @@ def test_catalog_history_sync_imports_into_local_journal(monkeypatch, tmp_path, 
     output = json.loads(capsys.readouterr().out)
     assert output["status"] == "synced"
     assert output["imported"] == 1
-    assert history_file.exists()
-    rows = [json.loads(line) for line in history_file.read_text(encoding="utf-8").splitlines() if line.strip()]
-    assert rows[-1]["source"] == "app-cloud"
-    assert rows[-1]["recipe_name"] == "Phone Brew"
+    assert output["history_source"] == "state.db"
+    # Cutover: App import goes to state.db, never JSONL.
+    assert not history_file.exists()
+    store = storage.StateStore(tmp_path)
+    events = store.load_history_events()
+    store.close()
+    assert events[-1]["source"] == "app-cloud"
+    assert events[-1]["recipe_name"] == "Phone Brew"

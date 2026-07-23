@@ -95,12 +95,13 @@ python scripts/xbloom.py history status
 python scripts/xbloom.py history list --limit 20
 ```
 
-目录默认保存在安装目录外的 `~/.xbloom-studio-brew/catalog/catalog.json`，不会保留原始
+私有配方目录保存在 `~/.xbloom-studio-brew/state.db`（`recipes` /
+`recipe_revisions`）。迁移后遗留的 `catalog/catalog.json` 仅供导入，运行时不会改写。不会保留原始
 响应或凭据。xPod 与 J20 记录保持只读参考；通过校验的 Studio 咖啡和茶分别导出为受控 YAML。
 临时登录、默认五类读取以及两次经所有者明确批准的只新增写入，已于 2026-07-14 在中国区
 现网验证，包括云端回读与零写入幂等复验；凭据和会话只存在于进程内。宿主通过
 `XBLOOM_ACCOUNT_EMAIL` 与 `XBLOOM_ACCOUNT_PASSWORD` 提供账号，密码不接受命令行参数。
-`catalog push` 默认只预览；只有同时给出 `--apply` 与 `--confirm-write own-account-cloud-recipe` 才会写远端。`catalog delete` 同样默认只预览；只有同时给出 `--apply` 与 `--confirm-delete own-account-cloud-recipe-delete` 才会删除，且只接受当前账号自建列表中的 `tableId`。本地冲泡日志默认写在 `~/.xbloom-studio-brew/brew-history.jsonl`。发布测试不会调用线上写/删接口。详见[目录与 A/B/C 说明](skills/xbloom-studio-brew/references/catalog.md)。
+`catalog push` 默认只预览；只有同时给出 `--apply` 与 `--confirm-write own-account-cloud-recipe` 才会写远端。`catalog delete` 同样默认只预览；只有同时给出 `--apply` 与 `--confirm-delete own-account-cloud-recipe-delete` 才会删除，且只接受当前账号自建列表中的 `tableId`。本地冲泡日志权威存储为 `~/.xbloom-studio-brew/state.db` 的 `history_events`；遗留 `brew-history.jsonl` 仅用于迁移导入。发布测试不会调用线上写/删接口。详见[目录与 A/B/C 说明](skills/xbloom-studio-brew/references/catalog.md)。
 
 ## 安装
 
@@ -178,8 +179,9 @@ python scripts/xbloom.py bridge stop
 禁用。详见[独立工具说明](skills/xbloom-studio-brew/references/standalone-tools.md)与
 [茶冲煮说明](skills/xbloom-studio-brew/references/tea-brewing.md)。
 
-设备操作优先使用常驻 bridge；它覆盖咖啡、茶、称重、研磨、FreeSolo 出水、预设、设置与
-调校。bridge 运行期间，一次性 BLE 命令会拒绝抢占连接。FreeSolo 运行中温度目标和水型切换
+设备操作优先使用常驻 bridge；它是唯一 BLE 所有者。顶层主动命令（probe、load、start、tea、
+scale、grind、water、settings、cancel、save-slots 等）经 typed bridge RPC 走守护进程；仅被动的
+`scan` / `doctor --scan` 直接做 BLE 发现。FreeSolo 运行中温度目标和水型切换
 也已按协议实现，并受独立部署者门禁
 保护；固件 `V12.0D.500` 上运行中从 `center` 切到 `spiral` 已完成真机验证，运行中调温仍待
 温度计测量；调温指令编码与 BLE 写入路径本身已经验证。它们不能运行中修改总水量/流速，
@@ -196,9 +198,11 @@ AUTO，全程不会启动冲煮；可用 `--scale on off on` 按 A/B/C 顺序设
 - `load` 只发送受控装载帧并停在 `armed`，不会启动冲煮。
 - `tea-load` 只上传专用茶配方，不会执行；`scale` 会报告自动归零基线，并在结束或中断时退出称重模式。
 - 配方及预设写入前自动检查固件和机器状态。
-- 远程启动要求部署者开关、当次物理就绪确认、相同配方哈希与机器，以及五分钟内的 armed 状态。
-- 冲煮遥测默认聚合为每秒一条；只有收到机器终态才清除工作流记录。监控超时会保留恢复状态，
-  后续 `monitor` 或 `cancel` 直接复用已记录的机器，不会重新扫描。
+- 远程启动要求部署者开关、当次物理就绪确认，以及同一机器上相同配方哈希 / 持久 `workflow_id`。
+  已 loaded 的配方会无限等待显式 start 或 cancel（**无**五分钟 loaded 过期）；daemon 在确认终态
+  或 cancel 之前持有 BLE 连接。
+- 冲煮遥测默认聚合为每秒一条；只有收到机器终态才清除工作流记录。`monitor` 仅为观察（不建联、
+  不 cancel）；observation 超时或客户端退出不会改变 daemon/BLE 所有权。
 - 当前已验证固件为 `V12.0D.500`；其他固件必须由部署者显式接受兼容性风险。
 - 所有网络来源或模型生成的配方都经过同一个校验器。
 - 独立研磨单次最多 30 秒，并持久化 60 秒休息锁；普通中断时仍会尝试发送停止和退出。

@@ -5,6 +5,12 @@ account/region-visible records and caches them in MMKV. This module normalises
 authorised JSON exports or bounded own-account cloud responses into a user-local
 catalog, and can preview or explicitly add one guarded recipe. It never stores
 request credentials, login sessions, or raw account blobs.
+
+Phase 0.3/0.4 catalog cutover: runtime persistence is StateStore / state.db
+(recipes + recipe_revisions). Normalization and cloud helpers remain pure;
+``load_catalog`` / ``save_catalog`` are a SQLite facade and never create,
+append, or rewrite catalog.json. ``XBLOOM_CATALOG_PATH`` and
+``default_catalog_path`` remain deprecated state-root selectors only.
 """
 
 from __future__ import annotations
@@ -16,7 +22,6 @@ from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import math
-import os
 from pathlib import Path
 import re
 import secrets
@@ -29,8 +34,16 @@ import yaml
 
 from xbloom_ble.recipe import Recipe
 from xbloom_ble.tea import TeaRecipe
-from xbloom_paths import environment_value
+from xbloom_paths import environment_value, skill_state_dir
 from xbloom_safety import strict_validate, validate_slot_compatible
+from xbloom_storage import (
+    CATALOG_SOURCE_MERGE,
+    CATALOG_SOURCE_SKILL,
+    DB_FILE_NAME,
+    StateStore,
+    StorageError,
+    recipe_id_for_catalog_entry_id,
+)
 
 
 SCHEMA_VERSION = 1
@@ -125,11 +138,70 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def default_catalog_path(state_dir: Path) -> Path:
+def default_catalog_path(state_dir: Path | None = None) -> Path:
+    """Deprecated selector helper for the historical catalog.json location.
+
+    After catalog cutover this path is **not** a write target. Use
+    :func:`resolve_catalog_state_root` / StateStore for the authoritative
+    ``state.db`` path.
+    """
+
     configured = environment_value(CATALOG_PATH_ENV)
     if configured:
         return Path(configured).expanduser()
-    return Path(state_dir) / "catalog" / "catalog.json"
+    root = Path(state_dir) if state_dir is not None else skill_state_dir()
+    return root / "catalog" / "catalog.json"
+
+
+def _state_root_from_path(path: Path) -> Path:
+    """Map an explicit path to the associated state root.
+
+    - Directory path -> that directory
+    - ``state.db`` -> parent
+    - ``catalog/catalog.json`` -> parent of ``catalog/``
+    - other ``catalog.json`` / file -> parent directory
+    """
+
+    resolved = path.expanduser()
+    if resolved.name == DB_FILE_NAME or resolved.suffix.lower() == ".db":
+        return resolved.parent
+    if resolved.name == "catalog.json":
+        if resolved.parent.name == "catalog":
+            return resolved.parent.parent
+        return resolved.parent
+    if resolved.is_dir() or not resolved.suffix:
+        return resolved
+    return resolved.parent
+
+
+def resolve_catalog_state_root(path: str | Path | None = None) -> Path:
+    """Resolve the state root used for catalog reads/writes.
+
+    Precedence for default (path is None):
+    1. Deprecated ``XBLOOM_CATALOG_PATH`` as state-root selector
+    2. ``XBLOOM_STATE_DIR`` / skill state dir
+    """
+
+    if path is not None:
+        return _state_root_from_path(Path(path))
+    configured = environment_value(CATALOG_PATH_ENV)
+    if configured:
+        return _state_root_from_path(Path(configured))
+    return skill_state_dir()
+
+
+def catalog_db_path(path: str | Path | None = None) -> Path:
+    """Authoritative catalog store (SQLite state.db under the state root)."""
+
+    return resolve_catalog_state_root(path) / DB_FILE_NAME
+
+
+def _store_for(path: str | Path | None = None) -> StateStore:
+    return StateStore(resolve_catalog_state_root(path))
+
+
+def _map_storage_error(exc: StorageError) -> CatalogError:
+    return CatalogError(str(exc))
 
 
 def _jsonish(value: Any) -> Any:
@@ -803,68 +875,128 @@ def _annotate_loaded_entry(entry: dict[str, Any]) -> None:
     }
 
 
-def load_catalog(path: str | Path) -> dict[str, Any]:
-    resolved = Path(path).expanduser()
-    if not resolved.exists():
-        return empty_catalog()
+def load_catalog(
+    path: str | Path | None = None,
+    *,
+    include_derived: bool = True,
+) -> dict[str, Any]:
+    """Load the catalog snapshot from state.db (never reads catalog.json at runtime).
+
+    *path* selects the associated state root (legacy catalog.json path, state.db,
+    or directory). Returns an empty catalog when no recipes exist yet.
+    """
+
+    store = _store_for(path)
     try:
-        data = json.loads(resolved.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise CatalogError(f"catalog at {resolved} is unreadable") from exc
-    if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
-        raise CatalogError(f"unsupported catalog schema at {resolved}")
-    entries = data.get("entries")
-    if not isinstance(entries, list) or not all(isinstance(item, dict) for item in entries):
-        raise CatalogError(f"catalog entries at {resolved} are invalid")
-    for entry in entries:
-        _annotate_loaded_entry(entry)
-    return data
+        data = store.build_catalog_snapshot(
+            include_derived=include_derived,
+            schema_version=SCHEMA_VERSION,
+        )
+        entries = data.get("entries")
+        if not isinstance(entries, list):
+            raise CatalogError("catalog entries from state.db are invalid")
+        for entry in entries:
+            if isinstance(entry, dict):
+                _annotate_loaded_entry(entry)
+        return data
+    except StorageError as exc:
+        raise _map_storage_error(exc) from exc
+    finally:
+        store.close()
 
 
-def save_catalog(catalog: Mapping[str, Any], path: str | Path) -> Path:
-    resolved = Path(path).expanduser()
-    resolved.parent.mkdir(parents=True, exist_ok=True)
-    data = deepcopy(dict(catalog))
-    data["schema_version"] = SCHEMA_VERSION
-    data["updated_at"] = utc_now()
-    temp = resolved.with_suffix(resolved.suffix + ".tmp")
-    temp.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+def save_catalog(
+    catalog: Mapping[str, Any],
+    path: str | Path | None = None,
+) -> Path:
+    """Persist catalog entries into state.db via transactional merge.
+
+    Never creates, appends, or rewrites catalog.json. Derived / non-owned
+    entries are skipped. Returns the authoritative ``state.db`` path.
+    """
+
+    store = _store_for(path)
     try:
-        os.chmod(temp, 0o600)
-    except OSError:
-        pass
-    temp.replace(resolved)
-    return resolved
+        entries = [
+            entry
+            for entry in (catalog.get("entries") or [])
+            if isinstance(entry, Mapping)
+            and not entry.get("derived")
+            and entry.get("catalog_owned", True) is not False
+        ]
+        store.merge_catalog_entries(
+            entries,
+            source=CATALOG_SOURCE_SKILL,
+            creation_source="catalog_save",
+        )
+        return store.db_path
+    except StorageError as exc:
+        raise _map_storage_error(exc) from exc
+    finally:
+        store.close()
+
+
+def merge_catalog_into_store(
+    entries: Iterable[Mapping[str, Any]],
+    path: str | Path | None = None,
+    *,
+    source: str = CATALOG_SOURCE_MERGE,
+) -> dict[str, Any]:
+    """Transactionally merge normalized entries; returns merge stats."""
+
+    store = _store_for(path)
+    try:
+        return store.merge_catalog_entries(list(entries), source=source)
+    except StorageError as exc:
+        raise _map_storage_error(exc) from exc
+    finally:
+        store.close()
+
+
+def archive_catalog_entry(
+    *,
+    entry_id: str | None = None,
+    table_id: int | str | None = None,
+    path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Soft-archive one local catalog entry (revisions/history retained)."""
+
+    store = _store_for(path)
+    try:
+        return store.archive_catalog_entry(entry_id=entry_id, table_id=table_id)
+    except StorageError as exc:
+        raise _map_storage_error(exc) from exc
+    finally:
+        store.close()
 
 
 def _merge_entry(existing: Mapping[str, Any], incoming: Mapping[str, Any]) -> dict[str, Any]:
-    merged = deepcopy(dict(incoming))
-    merged["first_seen_at"] = existing.get("first_seen_at", incoming.get("first_seen_at"))
-    old_sources = list(existing.get("sources") or [])
-    new_sources = list(incoming.get("sources") or [])
-    source_map: dict[tuple[Any, Any, Any, Any], dict[str, Any]] = {}
-    for source in [*old_sources, *new_sources]:
-        if not isinstance(source, dict):
-            continue
-        key = (
-            source.get("type"),
-            source.get("endpoint"),
-            source.get("file"),
-            source.get("region"),
-        )
-        source_map[key] = source
-    merged["sources"] = sorted(
-        source_map.values(),
-        key=lambda item: (str(item.get("type")), str(item.get("endpoint")), str(item.get("file"))),
+    """In-memory merge for import_payload (pure; does not touch disk).
+
+    ``merge_catalog_envelopes`` / ``normalize_catalog_envelope`` strip runtime
+    view fields (including public ``id``) so they are not persisted into
+    ``metadata.catalog_envelope``. For the pure in-memory catalog, restore
+    public ``id`` deterministically: incoming preferred, else existing.
+    """
+
+    from xbloom_storage import merge_catalog_envelopes
+
+    recipe = incoming.get("recipe")
+    envelope = merge_catalog_envelopes(
+        {k: v for k, v in existing.items() if k != "recipe"},
+        {k: v for k, v in incoming.items() if k != "recipe"},
     )
-    slots: dict[str, dict[str, Any]] = {}
-    for slot in [*(existing.get("slots") or []), *(incoming.get("slots") or [])]:
-        if isinstance(slot, dict) and slot.get("position"):
-            slots[str(slot["position"]).upper()] = slot
-    merged["slots"] = [slots[key] for key in sorted(slots)]
+    merged = dict(envelope)
+    # Public entry id is a catalog-view field, not a persisted envelope field.
+    entry_id = incoming.get("id")
+    if entry_id is None or entry_id == "":
+        entry_id = existing.get("id")
+    if entry_id is not None and entry_id != "":
+        merged["id"] = entry_id
+    if isinstance(recipe, Mapping):
+        merged["recipe"] = deepcopy(dict(recipe))
+    elif isinstance(existing.get("recipe"), Mapping):
+        merged["recipe"] = deepcopy(dict(existing["recipe"]))
     return merged
 
 
@@ -1053,9 +1185,23 @@ def export_entry(
     return resolved.resolve()
 
 
-def catalog_summary(catalog: Mapping[str, Any]) -> dict[str, Any]:
+def catalog_summary(
+    catalog: Mapping[str, Any] | None = None,
+    *,
+    path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Summarize a catalog dict or the live state.db catalog when *catalog* is None."""
+
+    if catalog is None:
+        store = _store_for(path)
+        try:
+            return store.catalog_summary(include_derived=True)
+        except StorageError as exc:
+            raise _map_storage_error(exc) from exc
+        finally:
+            store.close()
     entries = list(catalog.get("entries") or [])
-    return {
+    summary = {
         "total": len(entries),
         "coffee": sum(entry.get("kind") == "coffee" for entry in entries),
         "tea": sum(entry.get("kind") == "tea" for entry in entries),
@@ -1063,6 +1209,13 @@ def catalog_summary(catalog: Mapping[str, Any]) -> dict[str, Any]:
         "slot_compatible": sum(bool(entry.get("slot_compatible")) for entry in entries),
         "updated_at": catalog.get("updated_at"),
     }
+    if catalog.get("path"):
+        summary["path"] = catalog.get("path")
+    if catalog.get("source"):
+        summary["source"] = catalog.get("source")
+    if catalog.get("authoritative"):
+        summary["authoritative"] = catalog.get("authoritative")
+    return summary
 
 
 def _der_tlv(data: bytes, offset: int) -> tuple[int, bytes, int]:
@@ -2160,7 +2313,9 @@ __all__ = [
     "RECIPE_DELETE_ENDPOINT",
     "CatalogError",
     "app_encrypt_form",
+    "archive_catalog_entry",
     "build_cloud_recipe_form",
+    "catalog_db_path",
     "catalog_summary",
     "cloud_recipe_delete_preview",
     "cloud_recipe_preview",
@@ -2176,8 +2331,11 @@ __all__ = [
     "load_catalog",
     "load_cloud_recipe",
     "load_cloud_config",
+    "merge_catalog_into_store",
     "normalise_entry",
     "push_cloud_recipe_with_login",
+    "recipe_id_for_catalog_entry_id",
+    "resolve_catalog_state_root",
     "save_catalog",
     "sync_cloud",
     "sync_cloud_with_login",

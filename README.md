@@ -107,8 +107,9 @@ python scripts/xbloom.py history status
 python scripts/xbloom.py history list --limit 20
 ```
 
-The default catalog lives outside the installed Skill under
-`~/.xbloom-studio-brew/catalog/catalog.json`. Raw responses and credentials are not retained.
+The private catalog lives in `~/.xbloom-studio-brew/state.db` (`recipes` /
+`recipe_revisions`). Legacy `catalog/catalog.json` is import-only after migration;
+runtime never rewrites it. Raw responses and credentials are not retained.
 xPod and J20 records stay reference-only; validated Studio coffee and tea records export through
 their respective guarded YAML schemas. Ephemeral login, all five default read categories, and two
 explicitly owner-approved add-only writes were live-service verified against the China tenant on
@@ -119,8 +120,9 @@ never accepted as command arguments. `catalog push` is preview-only unless the u
 adds both `--apply` and `--confirm-write own-account-cloud-recipe`. `catalog delete` is also
 preview-only unless the user adds both `--apply` and
 `--confirm-delete own-account-cloud-recipe-delete`, and it only accepts a currently created
-`tableId`. The local brew journal defaults to `~/.xbloom-studio-brew/brew-history.jsonl`. Live
-cloud write/delete endpoints are not used by release tests. See the
+`tableId`. The local brew journal lives in `~/.xbloom-studio-brew/state.db` (`history_events`);
+legacy `brew-history.jsonl` is import-only. Live cloud write/delete endpoints are not used by
+release tests. See the
 [catalog and A/B/C guide](skills/xbloom-studio-brew/references/catalog.md).
 
 ## Install
@@ -207,13 +209,13 @@ disabled until the deployment
 owner enables their documented safety gate. See [standalone tools](skills/xbloom-studio-brew/references/standalone-tools.md)
 and [tea brewing](skills/xbloom-studio-brew/references/tea-brewing.md).
 
-Prefer the persistent bridge for device work. It supports coffee, tea, scale, grinder, FreeSolo
-water, presets, settings, and tuning; while it runs, direct BLE commands refuse to race its
-connection. Live FreeSolo temperature and
-pattern targets are also protocol-implemented behind a separate owner gate. A running
-`center → spiral` pattern change is hardware-verified on firmware `V12.0D.500`; live temperature
-command encoding and its completed BLE write are verified, while physical outlet response remains
-unmeasured. They do not change mid-run volume/flow or edit coffee recipe steps.
+Prefer the persistent bridge for device work. It is the sole BLE owner: top-level active commands
+(probe, load, start, tea, scale, grind, water, settings, cancel, save-slots, …) use typed bridge
+RPC through the daemon; only passive `scan` / `doctor --scan` discover BLE directly. Live FreeSolo
+temperature and pattern targets are also protocol-implemented behind a separate owner gate. A
+running `center → spiral` pattern change is hardware-verified on firmware `V12.0D.500`; live
+temperature command encoding and its completed BLE write are verified, while physical outlet
+response remains unmeasured. They do not change mid-run volume/flow or edit coffee recipe steps.
 
 A/B/C programming is an atomic three-recipe operation. Run `validate <recipe.yaml> --slot` on
 each input first. AUTO slots store pours, grind, ratio, and scale behavior; the machine measures
@@ -224,20 +226,26 @@ Optional `--scale on off on` configures the three on-brew scale flags in A/B/C o
 
 ## Safety model
 
-- `load` sends guarded recipe frames and stops at `armed`; it does not start brewing.
-- `tea-load` uploads a dedicated tea recipe but never executes it; `scale` reports its auto-zero
-  baseline and always exits its mode.
+- `load` sends guarded recipe frames and stops at `armed`; it does not start brewing. It returns a
+  durable `workflow_id` and stores an immutable snapshot in `state.db` (source paths are provenance
+  only after load).
+- `tea-load` uploads a dedicated tea recipe but never executes it; the same durable snapshot
+  contract applies. `scale` reports its auto-zero baseline and always exits its mode.
 - Firmware/state preflight runs before recipe or preset writes.
-- Remote start requires an owner opt-in, current physical-readiness confirmation, the same recipe
-  hash and machine, and an armed state less than five minutes old.
-- Brew telemetry is aggregated to one progress update per second. Workflow state is cleared only
-  after a terminal machine notification; a monitor timeout preserves recovery state for reattach
-  or cancel, using the already-recorded machine instead of scanning.
+- Remote start requires an owner opt-in, current physical-readiness confirmation, and the durable
+  `workflow_id` from load on the same machine (immutable snapshot; not a re-hash of source YAML).
+  Loaded recipes wait indefinitely for explicit start or cancel (no five-minute loaded expiry);
+  the daemon holds BLE until confirmed terminal or cancel.
+- Brew telemetry is aggregated to one progress update per second. Durable workflow ownership is
+  terminalized only after confirmed terminal telemetry, then BLE is released; a monitor timeout
+  preserves recovery state for reattach or cancel. Monitor is observation-only.
 - The tested firmware allowlist currently contains `V12.0D.500`; other firmware requires an explicit
   owner-level compatibility override.
 - Every external or generated recipe must pass the same validator.
-- Grinder runs are limited to 30 seconds with a persisted 60-second rest lock; stop/quit cleanup is
-  attempted even on ordinary interruption.
+- Grinder runs are limited to 30 seconds with a durable SQLite 60-second cooldown/recovery guard
+  (`state.db` / `grinder_guard`); stop/quit cleanup is attempted even on ordinary interruption.
+  Unconfirmed STOP retains recovery and the BLE link until a confirmed terminal; legacy
+  `*-state.json` is import-only.
 - The persistent bridge binds only to loopback, authenticates local requests with a random token,
   owns one BLE connection, and serializes writes. Starting it alone does not connect or actuate.
 - Interactive grinder control fails closed to STOP/QUIT on missing ACKs. Interactive water has a
@@ -258,11 +266,108 @@ separates what is available directly or through the bundled bridge, what remains
 what is deliberately excluded, and
 what is not a Studio device feature.
 
+## Project layout
+
+```
+packages/core/                          # xbloom-studio-core: shared library
+  xbloom_paths.py, xbloom_safety.py,    # BLE protocol, recipe validation, catalog,
+  xbloom_catalog.py, xbloom_history.py  # history, paths, knowledge validation
+  xbloom_knowledge.py                   #   knowledge bundle manifest/hash checks
+  xbloom_ble/                           #   (bridge.py is the BLE owner state machine)
+  pyproject.toml                        #   console entry: xbloom-bridge
+skills/xbloom-studio-brew/              # the Agent Skill (CLI client of core)
+  scripts/xbloom.py                     #   CLI entry point
+  scripts/bootstrap.py                  #   runtime venv setup (stdlib-only until install)
+  assets/, references/, agents/, tests/
+tools/build_release.py                  # GitHub Release artifacts (not PyPI)
+tools/update_runtime_lock.py            # universal hashed non-core lock (uv 0.11.28)
+skills/.../requirements-runtime.lock    # committed universal runtime lock
+```
+
+`packages/core` is the shared foundation imported by both the Skill CLI and the
+Web UI backend. The Skill stays at `skills/xbloom-studio-brew/` and depends on
+core via its `requirements.txt` (`-e ../../packages/core` in development). The
+Web UI lives in a sibling repo (`xbloom-studio-web`) and its backend depends on
+core the same way. The BLE bridge daemon (`xbloom_ble.bridge`) is a
+single-instance loopback process shared by all clients; installable as
+`xbloom-bridge` from the core wheel.
+
 ## Development
 
 ```text
 cd skills/xbloom-studio-brew
 python scripts/bootstrap.py --dev
+```
+
+Repository checkouts install core in editable mode from `../../packages/core`.
+Release Skill bundles instead vendor the exact core wheel under `vendor/wheels/`
+and bootstrap installs that path with `pip install --no-deps --no-index <wheel>` after
+checking `vendor/release.json` (`core_wheel` + `core_wheel_sha256`, fail-closed), then
+installs non-core runtime deps only via
+`pip install --only-binary :all: --require-hashes -r requirements-runtime.lock`
+(also integrity-bound by `runtime_lock` + `runtime_lock_sha256` in `vendor/release.json`).
+
+### Universal runtime lock
+
+Non-core dependencies (bleak, PyYAML, and platform transitive wheels: Linux `dbus-fast`,
+macOS PyObjC, Windows WinRT) are locked in one committed universal hashed file:
+
+`skills/xbloom-studio-brew/requirements-runtime.lock`
+
+Generated with **uv 0.11.28** from `packages/core/pyproject.toml` (core itself is excluded;
+releases install the vendored wheel). Maintain with:
+
+```text
+python tools/update_runtime_lock.py --update   # refresh the tracked lock
+python tools/update_runtime_lock.py --check    # temp compile + byte-compare (CI)
+```
+
+## Build / release artifacts
+
+Artifacts are built for **GitHub Releases** (not PyPI). Tag-driven publish is implemented in
+`.github/workflows/release.yml` (push `v*` tags, or `workflow_dispatch` with an explicit version
+tag). This document does not claim a Release has been published yet.
+
+From the repository root:
+
+```text
+python tools/build_release.py
+# or: python tools/build_release.py --out dist
+```
+
+Builds require the committed runtime lock, set a stable `SOURCE_DATE_EPOCH`, pin setuptools to an
+exact build requirement, and write ZIPs with normalized timestamps/modes so consecutive builds
+produce matching SHA-256 for the wheel and both ZIPs. A `release-manifest.json` records
+name/version/size/SHA-256 for each publishable artifact and is verified before the build finishes.
+
+This writes to `dist/` (gitignored):
+
+| Artifact | Contents |
+| --- | --- |
+| `xbloom_studio_core-<ver>-*.whl` | Installable core library + `xbloom-bridge` |
+| `knowledge-<ver>/` + `.zip` | `SKILL.md` + `references/` + `assets/` with `manifest.json` (per-file SHA-256 + aggregate content hash) |
+| `skill-xbloom-studio-brew-<ver>/` + `.zip` | Self-contained Skill: vendored core wheel, `requirements-runtime.lock`, `vendor/release.json` |
+| `release-manifest.json` | Deterministic name/version/size/SHA-256 for every publishable wheel/ZIP |
+
+Verify a built wheel:
+
+```text
+python -m venv .venv-wheel
+.venv-wheel/Scripts/python -m pip install dist/xbloom_studio_core-*.whl   # Windows
+# .venv-wheel/bin/python -m pip install dist/xbloom_studio_core-*.whl    # Unix
+.venv-wheel/Scripts/xbloom-bridge --help
+```
+
+Verify an extracted Skill **ZIP** in a fresh directory outside the checkout (do not use the
+`dist/skill-.../` tree as a substitute for the published archive):
+
+```text
+# Unix example; on Windows extract to %TEMP%\xbloom-skill-clean similarly
+python -c "import zipfile; zipfile.ZipFile('dist/skill-xbloom-studio-brew-<ver>.zip').extractall('/tmp/xbloom-skill-clean')"
+cd /tmp/xbloom-skill-clean
+python scripts/bootstrap.py
+python scripts/xbloom.py doctor
+python scripts/xbloom.py validate assets/hot-template.yaml
 ```
 
 Release tests use scripted BLE and never activate the grinder or dispense water. The scale
