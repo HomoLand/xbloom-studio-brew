@@ -197,6 +197,9 @@ STATE_NAMES: dict[int, str] = {
     0x41: "complete",
     0x43: "saving_slots",
     0x25: "slots_saved",
+    # Omni Tea Brewer inter-steep / soak wait (Web SPA and hardware logs).
+    # Named here so consumers do not surface raw status_0x45.
+    0x45: "tea_soaking",
 }
 
 # Full report identifiers for live liquid telemetry. Dispatch must use these

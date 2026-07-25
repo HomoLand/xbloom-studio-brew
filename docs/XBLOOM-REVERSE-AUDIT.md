@@ -343,6 +343,20 @@ Legend: **Avail** full guarded path · **Partial** subset / alternate path · **
 
 ---
 
+## Appendix C — Follow-up implementation notes (2026-07-25+)
+
+| Item | Status |
+| --- | --- |
+| Core `STATE_NAMES[0x45]=tea_soaking` | Aligned with Web (was Web-only) |
+| FreeSolo live pattern/temp (`8016`/`4510`) | Web Tools builders + UI |
+| Pour radius / vibration amplitude | Web Tools advanced R/W (D/T frames) |
+| Recipes Bridge brew | Button enabled; local recipes upserted to host SQLite then `coffee/tea.load` |
+| `8104` coffee geometry | Still fixed `110/90`; documented in `load.ts` + matrix — A/B not done |
+
+**8104 research remaining:** supervised capture comparing App Omni/xPod tables vs current goldens on target firmware before changing `COFFEE_CUP_GEOMETRY_COMPAT`.
+
+---
+
 ## Appendix A — File index used
 
 | Area | Paths |
