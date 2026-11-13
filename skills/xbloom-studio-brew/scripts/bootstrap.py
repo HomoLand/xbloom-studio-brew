@@ -380,18 +380,20 @@ def _normalize_state_root(path: Path | str) -> Path:
         return candidate.absolute()
 
 
-def _skill_state_dir() -> Path:
-    configured = os.environ.get(STATE_DIR_ENV) or os.environ.get(LEGACY_STATE_DIR_ENV)
+def _skill_state_dir(environ: dict[str, str] | None = None) -> Path:
+    env = os.environ if environ is None else environ
+    configured = env.get(STATE_DIR_ENV) or env.get(LEGACY_STATE_DIR_ENV)
     if configured:
         return _normalize_state_root(configured)
     return _normalize_state_root(Path.home() / DEFAULT_STATE_DIRNAME)
 
 
-def _skill_runtime_dir() -> Path:
-    configured = os.environ.get(RUNTIME_DIR_ENV)
+def _skill_runtime_dir(environ: dict[str, str] | None = None) -> Path:
+    env = os.environ if environ is None else environ
+    configured = env.get(RUNTIME_DIR_ENV)
     if configured:
         return _normalize_state_root(configured)
-    return _skill_state_dir() / "runtime"
+    return _skill_state_dir(env) / "runtime"
 
 
 def _runtime_python_path(runtime_dir: Path) -> Path:

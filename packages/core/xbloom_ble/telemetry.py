@@ -219,6 +219,8 @@ REPORT_NAMES: dict[int, str] = {
     8023: "machine_activity",
     8105: "grinder_size",
     8106: "grinder_speed",
+    8107: "brewer_pattern",
+    8108: "brewer_temperature",
     8111: "easy_mode_begin",
     8113: "tea_soak_time_changed",
     8203: "abnormal_gear_position",
@@ -235,6 +237,8 @@ REPORT_NAMES: dict[int, str] = {
     9010: "brewer_paused",
     9011: "tea_restarted",
     9012: "tea_soaking",
+    10507: "scale_weight",
+    20501: "cup_weight",
     40501: "xpod_detected",
     40502: "coffee_brewer_started",
     40505: "gear_position",
@@ -509,6 +513,7 @@ def parse_notification(
             coffee_g=g,
             cup_weight_g=g,
             scale_g=g,
+            report_name=REPORT_NAMES.get(command_code),
         )
     if command_code == SCALE_WEIGHT_COMMAND:
         g = _decode_float_measurement(data, scale=1.0, allow_negative=True)
@@ -518,6 +523,7 @@ def parse_notification(
             raw=data,
             command_code=command_code,
             scale_g=g,
+            report_name=REPORT_NAMES.get(command_code),
         )
 
     marker = _marker_idx(data)

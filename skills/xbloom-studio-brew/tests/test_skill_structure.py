@@ -90,3 +90,67 @@ def test_xbloom_cli_inlines_path_helpers_for_clean_launch():
     assert "from xbloom_paths" not in source
     assert "import xbloom_paths" not in source
     assert getattr(xbloom_paths, "RUNTIME_DIR_ENV", None) == "XBLOOM_SKILL_RUNTIME_DIR"
+
+
+def test_inlined_launcher_helpers_and_safety_constants_match_core(tmp_path):
+    """Guard against drift between stdlib-only launcher helpers/constants and core."""
+    import importlib.util
+    import xbloom_paths
+    from xbloom_ble import bridge
+
+    def _load(name: str, rel: str):
+        import sys
+
+        path = ROOT / rel
+        spec = importlib.util.spec_from_file_location(name, path)
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        try:
+            spec.loader.exec_module(mod)
+        finally:
+            sys.modules.pop(name, None)
+        return mod
+
+    cli_mod = _load("xbloom_cli_contract_check", "scripts/xbloom.py")
+    boot_mod = _load("xbloom_boot_contract_check", "scripts/bootstrap.py")
+
+    for attr in (
+        "STATE_DIR_ENV",
+        "LEGACY_STATE_DIR_ENV",
+        "RUNTIME_DIR_ENV",
+        "DEFAULT_STATE_DIRNAME",
+    ):
+        assert getattr(cli_mod, attr) == getattr(xbloom_paths, attr)
+        assert getattr(boot_mod, attr) == getattr(xbloom_paths, attr)
+
+    sample_env = {
+        "XBLOOM_STATE_DIR": str(tmp_path / "custom-state"),
+        "XBLOOM_SKILL_RUNTIME_DIR": str(tmp_path / "custom-runtime"),
+    }
+    assert cli_mod.skill_state_dir(sample_env) == xbloom_paths.skill_state_dir(sample_env)
+    assert boot_mod._skill_state_dir(sample_env) == xbloom_paths.skill_state_dir(sample_env)
+    assert cli_mod.skill_runtime_dir(sample_env) == xbloom_paths.skill_runtime_dir(sample_env)
+    assert boot_mod._skill_runtime_dir(sample_env) == xbloom_paths.skill_runtime_dir(sample_env)
+
+    for sentinel_attr in (
+        "REMOTE_START_ENV",
+        "REMOTE_START_SENTINEL",
+        "REMOTE_GRINDER_ENV",
+        "REMOTE_GRINDER_SENTINEL",
+        "LIVE_ADJUST_ENV",
+        "LIVE_ADJUST_SENTINEL",
+        "SETTINGS_WRITE_ENV",
+        "SETTINGS_WRITE_SENTINEL",
+        "SETTINGS_CONFIRM_SENTINEL",
+        "ADVANCED_CONFIRM_SENTINEL",
+        "READY_SENTINEL",
+        "WATER_READY_SENTINEL",
+        "GRINDER_READY_SENTINEL",
+        "TEA_READY_SENTINEL",
+        "SUPPORTED_FIRMWARE",
+        "UNTESTED_FIRMWARE_ENV",
+        "UNTESTED_FIRMWARE_SENTINEL",
+    ):
+        assert getattr(cli_mod, sentinel_attr) == getattr(bridge, sentinel_attr), sentinel_attr
+

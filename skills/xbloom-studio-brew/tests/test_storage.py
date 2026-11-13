@@ -38,6 +38,28 @@ def test_schema_init_wal_and_version(tmp_path):
     store.close()
 
 
+def test_workflow_page_decodes_only_requested_rows(tmp_path, monkeypatch):
+    store = storage.StateStore(tmp_path)
+    wf = store.create_workflow(kind="coffee", state="ready", source="test")
+    wid = wf["workflow_id"]
+    for i in range(7):
+        store.append_workflow_event(wid, "machine", {"sample": i})
+    original = json.loads
+    decoded = []
+    def counted(value, *args, **kwargs):
+        decoded.append(value)
+        return original(value, *args, **kwargs)
+    monkeypatch.setattr(storage.json, "loads", counted)
+    page = store.list_workflow_events_page(wid, limit=2)
+    assert [e["seq"] for e in page["events"]] == [1, 2]
+    assert len(decoded) == 2
+    assert page["max_seq"] == 7 and not page["gap_detected"]
+    remaining = store.list_workflow_events_page(wid, since_seq=page["next_since"], limit=5)
+    assert [e["seq"] for e in remaining["events"]] == [3, 4, 5, 6, 7]
+    assert store.list_workflow_events_page(wid, limit=0)["events"] == []
+    store.close()
+
+
 def test_recipe_workflow_event_idempotency_primitives(tmp_path):
     store = storage.StateStore(tmp_path)
     recipe = store.upsert_recipe(kind="coffee", name="Demo", source="test")

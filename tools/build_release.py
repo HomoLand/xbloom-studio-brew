@@ -131,21 +131,28 @@ def build_core_wheel(out_dir: Path, *, epoch: int) -> Path:
     env.setdefault("PYTHONHASHSEED", "0")
     # Force a clean, isolated build so the pinned setuptools from pyproject.toml
     # is used rather than whatever happens to be installed in the outer env.
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "wheel",
-            "--no-deps",
-            "--wheel-dir",
-            str(out_dir),
-            str(CORE_DIR),
-        ],
-        check=True,
-        cwd=str(REPO_ROOT),
-        env=env,
-    )
+    core_build_dir = CORE_DIR / "build"
+    if core_build_dir.exists():
+        shutil.rmtree(core_build_dir, ignore_errors=True)
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "wheel",
+                "--no-deps",
+                "--wheel-dir",
+                str(out_dir),
+                str(CORE_DIR),
+            ],
+            check=True,
+            cwd=str(REPO_ROOT),
+            env=env,
+        )
+    finally:
+        if core_build_dir.exists():
+            shutil.rmtree(core_build_dir, ignore_errors=True)
     matching = sorted(out_dir.glob(f"xbloom_studio_core-{version}-*.whl"))
     if not matching:
         raise RuntimeError(
@@ -611,9 +618,27 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_OUT,
         help="output directory for release artifacts (default: dist/)",
     )
+    parser.add_argument(
+        "--update-hub-pin",
+        dest="update_hub_pin",
+        action="store_true",
+        default=None,
+        help="explicitly update skills/xbloom-studio-brew/vendor/hub-pin.json",
+    )
+    parser.add_argument(
+        "--no-update-hub-pin",
+        dest="update_hub_pin",
+        action="store_false",
+        help="do not modify skills/xbloom-studio-brew/vendor/hub-pin.json in the source tree",
+    )
     args = parser.parse_args(argv)
     out_dir = args.out.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    should_update_hub_pin = (
+        args.update_hub_pin
+        if args.update_hub_pin is not None
+        else (out_dir == DEFAULT_OUT.resolve())
+    )
 
     epoch = source_date_epoch()
     # Ensure child processes and this process agree even if the env was empty.
@@ -633,9 +658,12 @@ def main(argv: list[str] | None = None) -> int:
     wheel = build_core_wheel(out_dir, epoch=epoch)
     print(f"  core wheel: {wheel.name}")
 
-    # Keep monorepo/Hermes hub installs pinned to this release's wheel hash.
-    hub_pin = write_hub_pin(SKILL_DIR, version, wheel, runtime_lock)
-    print(f"  hub-pin:    {hub_pin.relative_to(REPO_ROOT).as_posix()}")
+    # Keep monorepo/Hermes hub installs pinned to this release's wheel hash
+    # when building to the canonical dist/ directory (or when explicitly asked),
+    # without dirtying the working tree during temporary/test --out builds.
+    if should_update_hub_pin:
+        hub_pin = write_hub_pin(SKILL_DIR, version, wheel, runtime_lock)
+        print(f"  hub-pin:    {hub_pin.relative_to(REPO_ROOT).as_posix()}")
 
     knowledge_dir = build_knowledge_bundle(out_dir, version, knowledge, epoch=epoch)
     print(f"  knowledge:  {knowledge_dir.name}/ and knowledge-{version}.zip")

@@ -116,7 +116,7 @@ Evidence column: **D** decoded APK · **T** deterministic tests · **H** hardwar
 | Web mirror | `xbloom-studio-web/frontend/src/ble/telemetry.ts` — same names + **extra** state/report rows |
 | Outbound inventory | `skills/xbloom-studio-brew/references/apk-capability-matrix.md` § Studio outbound / incoming |
 
-Inventory run (2026-07-25): **core 14 states, 42 REPORT_NAMES**; Web **15 states, 46 REPORT_NAMES**.
+Inventory run (2026-07-25, aligned): **core 15 states, 46 REPORT_NAMES**; Web **15 states, 46 REPORT_NAMES**.
 
 ### 2.2 Machine state bytes (`STATUS_COMMAND` 8023 / `0x57` envelope, marker `0xC1`)
 
@@ -371,10 +371,10 @@ Legend: **Avail** full guarded path · **Partial** subset / alternate path · **
 ## Appendix B — Inventory counts (reproducible)
 
 ```
-core STATE_NAMES: 14
-web  STATE_NAMES: 15  (+0x45 tea_soaking)
-core REPORT_NAMES: 42
-web  REPORT_NAMES: 46  (+8107,8108,10507,20501)
+core STATE_NAMES: 15  (aligned with Web, including 0x45 tea_soaking)
+web  STATE_NAMES: 15
+core REPORT_NAMES: 46 (aligned with Web, including 8107,8108,10507,20501)
+web  REPORT_NAMES: 46
 matrix numeric ids: 58
 web ble builders (export function build*): 32
 skill protocol build_* functions: 46

@@ -56,3 +56,47 @@ def test_audit_covers_required_gap_and_error_rows():
         "8104",
     ):
         assert needle in text, f"required audit content missing: {needle}"
+
+
+def test_core_and_sibling_web_telemetry_dictionaries_stay_aligned():
+    """Ensure core STATE_NAMES / REPORT_NAMES stay aligned with Web telemetry.ts when present."""
+    import re
+
+    assert len(STATE_NAMES) == 15
+    assert len(REPORT_NAMES) == 46
+    for code in (8107, 8108, 10507, 20501):
+        assert code in REPORT_NAMES
+
+    web_telemetry = (
+        REPO_ROOT.parent
+        / "xbloom-studio-web"
+        / "frontend"
+        / "src"
+        / "ble"
+        / "telemetry.ts"
+    )
+    if not web_telemetry.is_file():
+        return
+    ts_text = web_telemetry.read_text(encoding="utf-8")
+    state_block = re.search(
+        r"export const STATE_NAMES:\s*Record<number,\s*string>\s*=\s*\{(.*?)\};",
+        ts_text,
+        re.DOTALL,
+    )
+    report_block = re.search(
+        r"export const REPORT_NAMES:\s*Record<number,\s*string>\s*=\s*\{(.*?)\};",
+        ts_text,
+        re.DOTALL,
+    )
+    assert state_block and report_block
+    ts_states = {
+        int(k, 0): v
+        for k, v in re.findall(r"(0x[0-9a-fA-F]+|\d+):\s*\"([^\"]+)\"", state_block.group(1))
+    }
+    ts_reports = {
+        int(k, 0): v
+        for k, v in re.findall(r"(0x[0-9a-fA-F]+|\d+):\s*\"([^\"]+)\"", report_block.group(1))
+    }
+    assert ts_states == STATE_NAMES
+    assert ts_reports == REPORT_NAMES
+

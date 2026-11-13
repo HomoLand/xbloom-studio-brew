@@ -492,9 +492,11 @@ def test_probe_auto_releases_and_redacts(tmp_path):
         assert core.connection_scope is None
         assert "connect" in fake.calls
         assert "disconnect" in fake.calls
+        assert "read_machine_info" not in fake.calls
         # Explicit debug link retained across probe.
         await core.rpc("connect", {})
         await core.rpc("probe", {})
+        assert "read_machine_info" in fake.calls
         assert core.connection_scope == "explicit"
         assert core.connected is True
         await core.rpc("disconnect")

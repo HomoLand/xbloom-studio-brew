@@ -121,8 +121,9 @@ class FakeBleak:
         if self._disconnected_callback is not None:
             self._disconnected_callback(self)
 
-    async def start_notify(self, char, cb):
+    async def start_notify(self, char, cb, **kwargs):
         if char == CHAR_STATUS:
+            assert kwargs.get("bluez") == {"use_start_notify": False}
             self._cb = cb
         else:
             self._aux_cb = cb
@@ -928,6 +929,25 @@ def test_start_notify_drains_stale_backlog():
     c._notif_queue.put_nowait(StatusEvent(state=0x99, state_name="stale", raw=b""))
     run(c._start_notify())
     assert c._notif_queue.empty() and c._consuming is True
+
+
+def test_open_session_waits_after_subscribing_before_handshake(monkeypatch):
+    fake = FakeBleak()
+    c = _client(fake)
+    waits = []
+
+    async def sleep(delay):
+        waits.append(delay)
+        assert fake._cb is not None
+        if len(waits) == 1:
+            assert not fake.writes
+            assert delay == 0.5
+        else:
+            assert fake.writes[0][3] == 0xA4
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    run(c.open_session(settle=0))
+    assert waits == [0.5, 0]
 
 
 def test_disconnect_resets_session():

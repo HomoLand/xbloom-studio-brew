@@ -10,3 +10,5 @@ dist/
 build/
 *.whl
 .xbloom-studio-brew-state/
+/tmp/
+

@@ -838,6 +838,59 @@ def test_scale_runs_in_background_supports_retare_and_cancel(tmp_path):
     assert "scale_tare" in fake.calls
 
 
+@pytest.mark.parametrize("method", ["probe", "settings.read", "advanced.read"])
+def test_one_shot_reads_use_only_this_connections_handshake(tmp_path, method):
+    core, fake = _core(tmp_path)
+
+    async def open_session():
+        fake.emit(_event(command=40521, machine_info=dict(fake.machine_info)))
+
+    async def request_status():
+        fake.emit(_event(state=0x01, name="idle"))
+
+    async def no_repeated_info():
+        raise RuntimeError("firmware reports machine info only at session open")
+
+    fake.open_session = open_session
+    fake.request_status = request_status
+    fake.read_machine_info = no_repeated_info
+
+    async def go():
+        core.machine_info["old_connection_only"] = "stale"
+        for _ in range(2):
+            result = await core.rpc(method)
+            assert result["firmware"] == "V12.0D.500"
+            assert core.connected is False
+            assert "old_connection_only" not in core.machine_info
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
+def test_new_connection_without_info_does_not_reuse_previous_report(tmp_path):
+    core, fake = _core(tmp_path)
+
+    async def request_status():
+        fake.emit(_event(state=0x01, name="idle"))
+
+    async def missing_info():
+        raise RuntimeError("no fresh machine info")
+
+    fake.request_status = request_status
+    fake.read_machine_info = missing_info
+
+    async def go():
+        core.machine_info.update(fake.machine_info)
+        core._machine_info_ready.set()
+        with pytest.raises(RuntimeError, match="no fresh machine info"):
+            await core.rpc("settings.read")
+        assert core.connected is False
+        assert not core.machine_info
+        await core.shutdown()
+
+    asyncio.run(go())
+
+
 def test_settings_advanced_and_presets_share_bridge_owner(tmp_path):
     core, fake = _core(tmp_path, settings_write=True)
     recipes = [
@@ -1983,6 +2036,46 @@ def test_preflight_failure_releases_auto_connect_keeps_explicit(tmp_path):
 
     asyncio.run(auto_connect_cleanup())
     asyncio.run(explicit_kept())
+
+
+@pytest.mark.parametrize("second_report", ["V12.0D.500", "UNSUPPORTED.1", None])
+def test_missing_handshake_retries_metadata_only_before_load(tmp_path, second_report):
+    core, fake = _core(tmp_path)
+    recipe = _recipe(tmp_path / "recipe.yaml")
+    attempts = 0
+
+    async def open_session():
+        nonlocal attempts
+        attempts += 1
+        fake.calls.append("open_session")
+        if attempts == 2 and second_report:
+            fake.emit(_event(command=40521, machine_info={"firmware": second_report}))
+
+    async def request_status():
+        fake.calls.append("request_status")
+        fake.emit(_event(state=0x01, name="idle"))
+
+    fake.open_session = open_session
+    fake.request_status = request_status
+
+    async def go():
+        if second_report == "V12.0D.500":
+            result = await core.rpc("coffee.load", _with_ids({"recipe": str(recipe)}))
+            assert result["firmware"] == second_report
+            assert sum(isinstance(c, tuple) and c[0] == "load_recipe" for c in fake.calls) == 1
+            await core.rpc("cancel", _with_ids(workflow_id=result["workflow_id"]))
+        else:
+            message = "not in the tested set" if second_report else "firmware version was not received"
+            with pytest.raises(BridgeError, match=message):
+                await core.rpc("coffee.load", _with_ids({"recipe": str(recipe)}))
+            assert not any(isinstance(c, tuple) and c[0] == "load_recipe" for c in fake.calls)
+            assert core.connected is False
+        assert fake.calls.count("connect") == 1
+        assert attempts == 2
+        assert "coffee_start" not in fake.calls
+        await core.shutdown()
+
+    asyncio.run(go())
 
 
 def test_terminal_during_control_does_not_deadlock_and_releases(tmp_path):

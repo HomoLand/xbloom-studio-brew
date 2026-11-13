@@ -414,6 +414,8 @@ class XBloomClient:
             raise XBloomError("not connected")
         self._session_active = True
         await self._ensure_subscribed()
+        # Cached BlueZ discovery can finish before Studio accepts the handshake.
+        await asyncio.sleep(0.5)
         log.info("→ a4 (open session — machine shows connected)")
         await self._client.write_gatt_char(CHAR_COMMAND, build_session_start(), response=False)
         await asyncio.sleep(settle)
@@ -592,7 +594,10 @@ class XBloomClient:
             raise self._link_lost_error or XBloomError("not connected")
         if self._subscribed:
             return
-        await self._client.start_notify(CHAR_STATUS, self._on_notify)
+        # BlueZ's acquired socket preserves the initial session report on Linux.
+        await self._client.start_notify(
+            CHAR_STATUS, self._on_notify, bluez={"use_start_notify": False}
+        )
         self._subscribed = True
 
     async def _start_notify(self) -> None:
