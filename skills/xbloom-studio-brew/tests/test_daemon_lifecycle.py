@@ -7,6 +7,7 @@ import json
 import threading
 import time
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -1006,63 +1007,37 @@ def test_live_lockless_record_not_deleted(tmp_path):
     asyncio.run(go())
 
 
-def test_live_same_token_different_instance_not_clobbered(tmp_path):
+def test_live_same_token_different_instance_not_clobbered(tmp_path, monkeypatch):
     """Token collision must not skip the live probe when instance_id differs."""
 
     record = tmp_path / "bridge.json"
     shared_token = "shared-token-collision"
+    payload = {
+        "host": "127.0.0.1",
+        "port": 12345,
+        "token": shared_token,
+        "instance_id": "live-instance-A",
+        "protocol_version": 2,
+    }
+    record.write_text(json.dumps(payload), encoding="utf-8")
 
-    async def handle(reader, writer):
-        try:
-            line = await asyncio.wait_for(reader.readline(), timeout=5.0)
-            request = json.loads(line.decode("utf-8"))
-            if str(request.get("token") or "") != shared_token:
-                resp = {"id": request.get("id"), "ok": False, "error": "auth"}
-            else:
-                resp = {
-                    "id": request.get("id"),
-                    "ok": True,
-                    "result": {"pong": True, "running": True},
-                }
-            writer.write((json.dumps(resp) + "\n").encode("utf-8"))
-            await writer.drain()
-        finally:
-            writer.close()
-            await writer.wait_closed()
+    # The lockless-peer test above covers the real TCP probe. Control its
+    # result here to exercise the identity check regardless of runner timing.
+    live_probe = Mock(return_value=True)
+    monkeypatch.setattr("xbloom_ble._bridge_daemon._probe_record_responsive", live_probe)
 
-    async def go():
-        srv = await asyncio.start_server(handle, "127.0.0.1", 0)
-        port = srv.sockets[0].getsockname()[1]
-        payload = {
-            "host": "127.0.0.1",
-            "port": port,
-            "token": shared_token,
-            "instance_id": "live-instance-A",
-            "protocol_version": 2,
-        }
-        record.write_text(json.dumps(payload), encoding="utf-8")
-        assert await asyncio.to_thread(_probe_record_responsive, payload, 0.5) is True
+    core = BridgeCore(state_dir=tmp_path, environ={})
+    new_server = BridgeServer(core, record_path=record, token=shared_token)
+    assert core.instance_id != payload["instance_id"]
+    with pytest.raises(BridgeError, match="live bridge record"):
+        asyncio.run(asyncio.wait_for(new_server.run(), timeout=5.0))
 
-        core = BridgeCore(state_dir=tmp_path, environ={})
-        # Same token as the live peer, different instance_id — must refuse.
-        new_server = BridgeServer(
-            core, record_path=record, token=shared_token
-        )
-        assert core.instance_id != "live-instance-A"
-        with pytest.raises(BridgeError, match="live bridge record"):
-            await new_server.run()
-        assert record.exists()
-        data = json.loads(record.read_text(encoding="utf-8"))
-        assert data["token"] == shared_token
-        assert data["instance_id"] == "live-instance-A"
-        assert data == payload
-        probe = BridgeLock(tmp_path)
-        assert probe.acquire(blocking=False) is True
-        probe.release()
-        srv.close()
-        await srv.wait_closed()
-
-    asyncio.run(go())
+    live_probe.assert_called_once()
+    assert live_probe.call_args.args[0] == payload
+    assert json.loads(record.read_text(encoding="utf-8")) == payload
+    lock = BridgeLock(tmp_path)
+    assert lock.acquire(blocking=False) is True
+    lock.release()
 
 
 def test_config_fingerprint_effective_address_only(tmp_path, monkeypatch):
